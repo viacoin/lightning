@@ -42,6 +42,7 @@ $(LIGHTNINGD_CLOSING_OBJS): $(LIGHTNINGD_HEADERS)
 
 # Common source we use.
 CLOSINGD_COMMON_OBJS :=				\
+	common/base32.o				\
 	common/close_tx.o			\
 	common/crypto_state.o			\
 	common/crypto_sync.o			\
@@ -60,6 +61,7 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/permute_tx.o			\
 	common/ping.o				\
 	common/read_peer_msg.o			\
+	common/socket_close.o			\
 	common/status.o				\
 	common/status_wire.o			\
 	common/subdaemon.o			\
