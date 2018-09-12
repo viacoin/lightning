@@ -2,7 +2,7 @@
 
 c-lightning is a [standard compliant][std] implementation of the Lightning
 Network protocol.
-The Lightning Network is a scalability solution for Bitcoin, enabling
+The Lightning Network is a scalability solution for Viacoin, enabling
 secure and instant transfer of funds between any two parties for any
 amount.
 
@@ -13,16 +13,7 @@ http://lightning.network.
 
 ## Project Status
 
-[![Build Status][travis-ci]][travis-ci-link]
-[![Pull Requests Welcome][prs]][prs-link]
-[![Irc][IRC]][IRC-link]
-
-[travis-ci]: https://travis-ci.org/ElementsProject/lightning.svg?branch=master
-[travis-ci-link]: https://travis-ci.org/ElementsProject/lightning
-[prs]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat
-[prs-link]: http://makeapullrequest.com
-[IRC]: https://img.shields.io/badge/chat-on%20freenode-brightgreen.svg
-[IRC-link]: https://webchat.freenode.net/?channels=c-lightning
+[![Build Status](https://travis-ci.com/viacoin/lightning.svg?branch=master)](https://travis-ci.com/viacoin/lightning)
 
 This implementation is still very much a work in progress.
 It can be used for testing, but __it should not be used for real funds__.
@@ -31,23 +22,13 @@ features.
 
 Any help testing the implementation, reporting bugs, or helping with
 outstanding issues is very welcome.
-Don't hesitate to reach out to us on IRC at
-[#lightning-dev @ freenode.net][irc1], [#c-lightning @
-freenode.net][irc2], or on the implementation-specific mailing list
-[c-lightning@lists.ozlabs.org][ml1], or on the Lightning Network-wide
-mailing list [lightning-dev@lists.linuxfoundation.org][ml2].
-
-[irc1]: http://webchat.freenode.net/?channels=%23lightning-dev
-[irc2]: http://webchat.freenode.net/?channels=%23c-lightning
-[ml1]: https://lists.ozlabs.org/listinfo/c-lightning
-[ml2]: https://lists.linuxfoundation.org/mailman/listinfo/lightning-dev
 
 ## Getting Started
 
 c-lightning currently only works on Linux (and possibly Mac OS with some
-tweaking), and requires a locally (or remotely) running `bitcoind` (version 0.15 or
+tweaking), and requires a locally (or remotely) running `viacoind` (version 0.15 or
 above) that is fully caught up with the network you're testing on.
-Pruning (prune=n option in bitcoin.conf) is not currently supported.
+Pruning (prune=n option in viacoin.conf) is not currently supported.
 
 ### Installation
 
@@ -73,7 +54,7 @@ It has the following environment variable:
 
 * `EXPOSE_TCP` default to false, if true, use expose c-lightning RPC on port 9835. (Use this only for testing)
 
-Here is an example of a docker-compose file with bitcoind and c-lightning on `testnet` which expose bitcoind's rpc interface on default ports `18332` and c-lightning API on port `9735`:
+Here is an example of a docker-compose file with viacoind and c-lightning on `testnet` which expose viacoind's rpc interface on default ports `18332` and c-lightning API on port `9735`:
 
 ```
 version: "3"
@@ -124,15 +105,15 @@ volumes:
 
 ### Starting `lightningd`
 
-In order to start `lightningd` you will need to have a local `bitcoind`
+In order to start `lightningd` you will need to have a local `viacoind`
 node running in either testnet or regtest mode:
 
-    bitcoind -daemon -testnet
+    viacoind -daemon -testnet
 
-Wait until `bitcoind` has synchronized with the testnet network.
+Wait until `viacoind` has synchronized with the testnet network.
 
 Make sure that you do not have `walletbroadcast=0` in your
-`~/.bitcoin/bitcoin.conf`, or you may run into trouble.
+`~/.viacoin/viacoin.conf`, or you may run into trouble.
 Notice that currently pruned nodes are not supported and may result in
 `lightningd` being unable to synchronize with the blockchain.
 
@@ -153,7 +134,7 @@ open a channel:
     cli/lightning-cli newaddr
 
     # Returns a transaction id <txid>
-    bitcoin-cli -testnet sendtoaddress <address> <amount_in_bitcoins>
+    viacoin-cli -testnet sendtoaddress <address> <amount_in_viacoins>
 
 `lightningd` will register the funds once the transaction is confirmed.
 
