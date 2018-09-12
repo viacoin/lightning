@@ -21,6 +21,7 @@ type2size = {
     'struct sha256': 32,
     'struct bitcoin_blkid': 32,
     'struct bitcoin_txid': 32,
+    'struct secret': 32,
     'u64': 8,
     'u32': 4,
     'u16': 2,
@@ -30,6 +31,7 @@ type2size = {
 
 # These struct array helpers require a context to allocate from.
 varlen_structs = [
+    'peer_features',
     'gossip_getnodes_entry',
     'failed_htlc',
     'utxo',
@@ -75,7 +77,9 @@ typemap = {
     ('node_announcement', 'ipv6'): FieldType('struct ipv6'),
     ('announcement_signatures', 'short_channel_id'): FieldType('struct short_channel_id'),
     ('channel_announcement', 'short_channel_id'): FieldType('struct short_channel_id'),
-    ('channel_update', 'short_channel_id'): FieldType('struct short_channel_id')
+    ('channel_update', 'short_channel_id'): FieldType('struct short_channel_id'),
+    ('revoke_and_ack', 'per_commitment_secret'): FieldType('struct secret'),
+    ('channel_reestablish_option_data_loss_protect', 'your_last_per_commitment_secret'): FieldType('struct secret')
 }
 
 # Partial names that map to a datatype
@@ -115,9 +119,14 @@ class Field(object):
         self.is_len_var = False
         self.lenvar = None
         self.num_elems = 1
+        self.optional = False
 
+        # ? means optional field (not supported for arrays)
+        if size.startswith('?'):
+            self.optional = True
+            size = size[1:]
         # If it's an arraysize, swallow prefix.
-        if '*' in size:
+        elif '*' in size:
             number = size.split('*')[0]
             if number == prevname:
                 self.lenvar = number
@@ -164,8 +173,11 @@ class Field(object):
     def is_variable_size(self):
         return self.lenvar is not None
 
+    def needs_ptr_to_ptr(self):
+        return self.is_variable_size() or self.optional
+
     def is_assignable(self):
-        if self.is_array() or self.is_variable_size():
+        if self.is_array() or self.needs_ptr_to_ptr():
             return False
         return self.fieldtype.is_assignable()
 
@@ -194,13 +206,13 @@ class Field(object):
 fromwire_impl_templ = """bool fromwire_{name}({ctx}const void *p{args})
 {{
 {fields}
-        const u8 *cursor = p;
-        size_t plen = tal_len(p);
+\tconst u8 *cursor = p;
+\tsize_t plen = tal_count(p);
 
-        if (fromwire_u16(&cursor, &plen) != {enum.name})
-                return false;
+\tif (fromwire_u16(&cursor, &plen) != {enum.name})
+\t\treturn false;
 {subcalls}
-        return cursor != NULL;
+\treturn cursor != NULL;
 }}
 """
 
@@ -212,31 +224,68 @@ towire_header_templ = """u8 *towire_{name}(const tal_t *ctx{args});
 towire_impl_templ = """u8 *towire_{name}(const tal_t *ctx{args})
 {{
 {field_decls}
-        u8 *p = tal_arr(ctx, u8, 0);
-        towire_u16(&p, {enumname});
+\tu8 *p = tal_arr(ctx, u8, 0);
+\ttowire_u16(&p, {enumname});
 {subcalls}
 
-        return memcheck(p, tal_count(p));
+\treturn memcheck(p, tal_count(p));
 }}
 """
 
-printwire_header_templ = """void printwire_{name}(const u8 *cursor);
+printwire_header_templ = """void printwire_{name}(const char *fieldname, const u8 *cursor);
 """
-printwire_impl_templ = """void printwire_{name}(const u8 *cursor)
+printwire_impl_templ = """void printwire_{name}(const char *fieldname, const u8 *cursor)
 {{
-        size_t plen = tal_len(cursor);
+\tsize_t plen = tal_count(cursor);
 
-        if (fromwire_u16(&cursor, &plen) != {enum.name}) {{
-                printf("WRONG TYPE?!\\n");
-                return;
-        }}
+\tif (fromwire_u16(&cursor, &plen) != {enum.name}) {{
+\t\tprintf("WRONG TYPE?!\\n");
+\t\treturn;
+\t}}
 
 {subcalls}
 
-        if (plen != 0)
-                printf("EXTRA: %s\\n", tal_hexstr(NULL, cursor, plen));
+\tif (plen != 0)
+\t\tprintf("EXTRA: %s\\n", tal_hexstr(NULL, cursor, plen));
 }}
 """
+
+
+class CCode(object):
+    """Simple class to create indented C code"""
+    def __init__(self):
+        self.indent = 1
+        self.single_indent = False
+        self.code = []
+
+    def append(self, lines):
+        for line in lines.split('\n'):
+            # Let us to the indenting please!
+            assert '\t' not in line
+
+            # Special case: } by itself is pre-unindented.
+            if line == '}':
+                self.indent -= 1
+                self.code.append("\t" * self.indent + line)
+                continue
+
+            self.code.append("\t" * self.indent + line)
+            if self.single_indent:
+                self.indent -= 1
+                self.single_indent = False
+
+            if line.endswith('{'):
+                self.indent += 1
+            elif line.endswith('}'):
+                self.indent -= 1
+            elif line.startswith('for') or line.startswith('if'):
+                self.indent += 1
+                self.single_indent = True
+
+    def __str__(self):
+        assert self.indent == 1
+        assert not self.single_indent
+        return '\n'.join(self.code)
 
 
 class Message(object):
@@ -248,13 +297,16 @@ class Message(object):
         self.has_variable_fields = False
 
     def checkLenField(self, field):
+        # Optional fields don't have a len.
+        if field.optional:
+            return
         for f in self.fields:
             if f.name == field.lenvar:
                 if f.fieldtype.name != 'u16':
                     raise ValueError('Field {} has non-u16 length variable {} (type {})'
                                      .format(field.name, field.lenvar, f.fieldtype.name))
 
-                if f.is_array() or f.is_variable_size():
+                if f.is_array() or f.needs_ptr_to_ptr():
                     raise ValueError('Field {} has non-simple length variable {}'
                                      .format(field.name, field.lenvar))
                 f.is_len_var = True
@@ -269,25 +321,25 @@ class Message(object):
         if field.is_variable_size():
             self.checkLenField(field)
             self.has_variable_fields = True
-        elif field.basetype() in varlen_structs:
+        elif field.basetype() in varlen_structs or field.optional:
             self.has_variable_fields = True
         self.fields.append(field)
 
     def print_fromwire_array(self, subcalls, basetype, f, name, num_elems):
         if f.has_array_helper():
-            subcalls.append('\tfromwire_{}_array(&cursor, &plen, {}, {});'
+            subcalls.append('fromwire_{}_array(&cursor, &plen, {}, {});'
                             .format(basetype, name, num_elems))
         else:
-            subcalls.append('\tfor (size_t i = 0; i < {}; i++)'
+            subcalls.append('for (size_t i = 0; i < {}; i++)'
                             .format(num_elems))
             if f.fieldtype.is_assignable():
-                subcalls.append('\t\t({})[i] = fromwire_{}(&cursor, &plen);'
+                subcalls.append('({})[i] = fromwire_{}(&cursor, &plen);'
                                 .format(name, basetype))
             elif basetype in varlen_structs:
-                subcalls.append('\t\t({})[i] = fromwire_{}(ctx, &cursor, &plen);'
+                subcalls.append('({})[i] = fromwire_{}(ctx, &cursor, &plen);'
                                 .format(name, basetype))
             else:
-                subcalls.append('\t\tfromwire_{}(&cursor, &plen, {} + i);'
+                subcalls.append('fromwire_{}(&cursor, &plen, {} + i);'
                                 .format(basetype, name))
 
     def print_fromwire(self, is_header):
@@ -303,7 +355,7 @@ class Message(object):
             else:
                 ptrs = '*'
                 # If we're handing a variable array, we need a ptr-to-ptr.
-                if f.is_variable_size():
+                if f.needs_ptr_to_ptr():
                     ptrs += '*'
                 # If each type is a variable length, we need a ptr to that.
                 if f.basetype() in varlen_structs:
@@ -314,44 +366,54 @@ class Message(object):
         template = fromwire_header_templ if is_header else fromwire_impl_templ
         fields = ['\t{} {};\n'.format(f.fieldtype.name, f.name) for f in self.fields if f.is_len_var]
 
-        subcalls = []
+        subcalls = CCode()
         for f in self.fields:
             basetype = f.basetype()
 
             for c in f.comments:
-                subcalls.append('\t/*{} */'.format(c))
+                subcalls.append('/*{} */'.format(c))
 
             if f.is_padding():
-                subcalls.append('\tfromwire_pad(&cursor, &plen, {});'
+                subcalls.append('fromwire_pad(&cursor, &plen, {});'
                                 .format(f.num_elems))
             elif f.is_array():
                 self.print_fromwire_array(subcalls, basetype, f, f.name,
                                           f.num_elems)
             elif f.is_variable_size():
-                subcalls.append("\t//2nd case {name}".format(name=f.name))
+                subcalls.append("//2nd case {name}".format(name=f.name))
                 typename = f.fieldtype.name
                 # If structs are varlen, need array of ptrs to them.
                 if basetype in varlen_structs:
                     typename += ' *'
-                subcalls.append('\t*{} = {} ? tal_arr(ctx, {}, {}) : NULL;'
+                subcalls.append('*{} = {} ? tal_arr(ctx, {}, {}) : NULL;'
                                 .format(f.name, f.lenvar, typename, f.lenvar))
 
                 self.print_fromwire_array(subcalls, basetype, f, '*' + f.name,
                                           f.lenvar)
-            elif f.is_assignable():
-                subcalls.append("\t//3th case {name}".format(name=f.name))
-                if f.is_len_var:
-                    subcalls.append('\t{} = fromwire_{}(&cursor, &plen);'
+            else:
+                if f.optional:
+                    subcalls.append("if (!fromwire_bool(&cursor, &plen))\n"
+                                    "*{} = NULL;\n"
+                                    "else {{\n"
+                                    "*{} = tal(ctx, {});\n"
+                                    "fromwire_{}(&cursor, &plen, *{});\n"
+                                    "}}"
+                                    .format(f.name, f.name, f.fieldtype.name,
+                                            basetype, f.name))
+                elif f.is_assignable():
+                    subcalls.append("//3th case {name}".format(name=f.name))
+                    if f.is_len_var:
+                        subcalls.append('{} = fromwire_{}(&cursor, &plen);'
+                                        .format(f.name, basetype))
+                    else:
+                        subcalls.append('*{} = fromwire_{}(&cursor, &plen);'
+                                        .format(f.name, basetype))
+                elif basetype in varlen_structs:
+                    subcalls.append('*{} = fromwire_{}(ctx, &cursor, &plen);'
                                     .format(f.name, basetype))
                 else:
-                    subcalls.append('\t*{} = fromwire_{}(&cursor, &plen);'
-                                    .format(f.name, basetype))
-            elif basetype in varlen_structs:
-                subcalls.append('\t*{} = fromwire_{}(ctx, &cursor, &plen);'
-                                .format(f.name, basetype))
-            else:
-                subcalls.append('\tfromwire_{}(&cursor, &plen, {});'
-                                .format(basetype, f.name))
+                    subcalls.append('fromwire_{}(&cursor, &plen, {});'
+                                    .format(basetype, f.name))
 
         return template.format(
             name=self.name,
@@ -359,21 +421,21 @@ class Message(object):
             args=''.join(args),
             fields=''.join(fields),
             enum=self.enum,
-            subcalls='\n'.join(subcalls)
+            subcalls=str(subcalls)
         )
 
     def print_towire_array(self, subcalls, basetype, f, num_elems):
         if f.has_array_helper():
-            subcalls.append('\ttowire_{}_array(&p, {}, {});'
+            subcalls.append('towire_{}_array(&p, {}, {});'
                             .format(basetype, f.name, num_elems))
         else:
-            subcalls.append('\tfor (size_t i = 0; i < {}; i++)\n'
+            subcalls.append('for (size_t i = 0; i < {}; i++)'
                             .format(num_elems))
             if f.fieldtype.is_assignable() or basetype in varlen_structs:
-                subcalls.append('\t\ttowire_{}(&p, {}[i]);'
+                subcalls.append('towire_{}(&p, {}[i]);'
                                 .format(basetype, f.name))
             else:
-                subcalls.append('\t\ttowire_{}(&p, {} + i);'
+                subcalls.append('towire_{}(&p, {} + i);'
                                 .format(basetype, f.name))
 
     def print_towire(self, is_header):
@@ -398,7 +460,7 @@ class Message(object):
                     f.fieldtype.name, f.name, f.lenvar_for.name
                 ))
 
-        subcalls = []
+        subcalls = CCode()
         for f in self.fields:
             basetype = f.fieldtype.name
             if basetype.startswith('struct '):
@@ -407,80 +469,89 @@ class Message(object):
                 basetype = basetype[5:]
 
             for c in f.comments:
-                subcalls.append('\t/*{} */'.format(c))
+                subcalls.append('/*{} */'.format(c))
 
             if f.is_padding():
-                subcalls.append('\ttowire_pad(&p, {});'
+                subcalls.append('towire_pad(&p, {});'
                                 .format(f.num_elems))
             elif f.is_array():
                 self.print_towire_array(subcalls, basetype, f, f.num_elems)
             elif f.is_variable_size():
                 self.print_towire_array(subcalls, basetype, f, f.lenvar)
             else:
-                subcalls.append('\ttowire_{}(&p, {});'
-                                .format(basetype, f.name))
+                if f.optional:
+                    subcalls.append("if (!{})\n"
+                                    "towire_bool(&p, false);\n"
+                                    "else {{\n"
+                                    "towire_bool(&p, true);\n"
+                                    "towire_{}(&p, {});\n"
+                                    "}}".format(f.name, basetype, f.name))
+                else:
+                    subcalls.append('towire_{}(&p, {});'
+                                    .format(basetype, f.name))
 
         return template.format(
             name=self.name,
             args=''.join(args),
             enumname=self.enum.name,
             field_decls='\n'.join(field_decls),
-            subcalls='\n'.join(subcalls),
+            subcalls=str(subcalls),
         )
 
-    def add_truncate_check(self, subcalls, indent='\t'):
+    def add_truncate_check(self, subcalls):
         # Report if truncated, otherwise print.
-        subcalls.append(indent + 'if (!cursor) {')
-        subcalls.append(indent + '\tprintf("**TRUNCATED**\\n");')
-        subcalls.append(indent + '\treturn;')
-        subcalls.append(indent + '}')
+        subcalls.append('if (!cursor) {\n'
+                        'printf("**TRUNCATED**\\n");\n'
+                        'return;\n'
+                        '}')
 
     def print_printwire_array(self, subcalls, basetype, f, num_elems):
         if f.has_array_helper():
-            subcalls.append('\tprintwire_{}_array(&cursor, &plen, {});'
-                            .format(basetype, num_elems))
+            subcalls.append('printwire_{}_array(tal_fmt(NULL, "%s.{}", fieldname), &cursor, &plen, {});'
+                            .format(basetype, f.name, num_elems))
         else:
-            subcalls.append('\tprintf("[");')
-            subcalls.append('\tfor (size_t i = 0; i < {}; i++) {{'
+            subcalls.append('printf("[");')
+            subcalls.append('for (size_t i = 0; i < {}; i++) {{'
                             .format(num_elems))
-            subcalls.append('\t\t{} v;'.format(f.fieldtype.name))
+            subcalls.append('{} v;'.format(f.fieldtype.name))
             if f.fieldtype.is_assignable():
-                subcalls.append('\t\tv = fromwire_{}(&cursor, plen);'
+                subcalls.append('v = fromwire_{}(&cursor, plen);'
                                 .format(f.fieldtype.name, basetype))
             else:
                 # We don't handle this yet!
                 assert(basetype not in varlen_structs)
 
-                subcalls.append('\t\tfromwire_{}(&cursor, &plen, &v);'
+                subcalls.append('fromwire_{}(&cursor, &plen, &v);'
                                 .format(basetype))
 
-            self.add_truncate_check(subcalls, indent='\t\t')
+            self.add_truncate_check(subcalls)
 
-            subcalls.append('\t\tprintwire_{}(&v);'.format(basetype))
-            subcalls.append('\t}')
-            subcalls.append('\tprintf("]");')
+            subcalls.append('printwire_{}(tal_fmt(NULL, "%s.{}", fieldname), &v);'
+                            .format(basetype, f.name))
+            subcalls.append('}')
+            subcalls.append('printf("]");')
 
     def print_printwire(self, is_header):
         template = printwire_header_templ if is_header else printwire_impl_templ
         fields = ['\t{} {};\n'.format(f.fieldtype.name, f.name) for f in self.fields if f.is_len_var]
 
-        subcalls = []
+        subcalls = CCode()
         for f in self.fields:
             basetype = f.basetype()
 
             for c in f.comments:
-                subcalls.append('\t/*{} */'.format(c))
+                subcalls.append('/*{} */'.format(c))
 
             if f.is_len_var:
-                subcalls.append('\t{} {} = fromwire_{}(&cursor, &plen);'
+                subcalls.append('{} {} = fromwire_{}(&cursor, &plen);'
                                 .format(f.fieldtype.name, f.name, basetype))
                 self.add_truncate_check(subcalls)
                 continue
 
-            subcalls.append('\tprintf("{}=");'.format(f.name))
+            subcalls.append('printf("{}=");'.format(f.name))
             if f.is_padding():
-                subcalls.append('\tprintwire_pad(&cursor, &plen, {});'
-                                .format(f.num_elems))
+                subcalls.append('printwire_pad(tal_fmt(NULL, "%s.{}", fieldname), &cursor, &plen, {});'
+                                .format(f.name, f.num_elems))
                 self.add_truncate_check(subcalls)
             elif f.is_array():
                 self.print_printwire_array(subcalls, basetype, f, f.num_elems)
@@ -489,26 +560,33 @@ class Message(object):
                 self.print_printwire_array(subcalls, basetype, f, f.lenvar)
                 self.add_truncate_check(subcalls)
             else:
+                if f.optional:
+                    subcalls.append("if (fromwire_bool(&cursor, &plen)) {")
+
                 if f.is_assignable():
-                    subcalls.append('\t{} {} = fromwire_{}(&cursor, &plen);'
+                    subcalls.append('{} {} = fromwire_{}(&cursor, &plen);'
                                     .format(f.fieldtype.name, f.name, basetype))
                 else:
                     # Don't handle these yet.
                     assert(basetype not in varlen_structs)
-                    subcalls.append('\t{} {};'.
+                    subcalls.append('{} {};'.
                                     format(f.fieldtype.name, f.name))
-                    subcalls.append('\tfromwire_{}(&cursor, &plen, &{});'
+                    subcalls.append('fromwire_{}(&cursor, &plen, &{});'
                                     .format(basetype, f.name))
 
                 self.add_truncate_check(subcalls)
-                subcalls.append('\tprintwire_{}(&{});'
-                                .format(basetype, f.name))
+                subcalls.append('printwire_{}(tal_fmt(NULL, "%s.{}", fieldname), &{});'
+                                .format(basetype, f.name, f.name))
+                if f.optional:
+                    subcalls.append("} else {")
+                    self.add_truncate_check(subcalls)
+                    subcalls.append("}")
 
         return template.format(
             name=self.name,
             fields=''.join(fields),
             enum=self.enum,
-            subcalls='\n'.join(subcalls)
+            subcalls=str(subcalls)
         )
 
 
@@ -620,14 +698,14 @@ impl_template = """/* This file was generated by generate-wire.py */
 
 const char *{enumname}_name(int e)
 {{
-        static char invalidbuf[sizeof("INVALID ") + STR_MAX_CHARS(e)];
+\tstatic char invalidbuf[sizeof("INVALID ") + STR_MAX_CHARS(e)];
 
-        switch ((enum {enumname})e) {{
-        {cases}
-        }}
+\tswitch ((enum {enumname})e) {{
+\t{cases}
+\t}}
 
-        sprintf(invalidbuf, "INVALID %i", e);
-        return invalidbuf;
+\tsnprintf(invalidbuf, sizeof(invalidbuf), "INVALID %i", e);
+\treturn invalidbuf;
 }}
 
 {func_decls}
@@ -641,7 +719,7 @@ print_header_template = """/* This file was generated by generate-wire.py */
 #include <devtools/print_wire.h>
 {includes}
 
-void print_message(const u8 *msg);
+void print{enumname}_message(const u8 *msg);
 
 {func_decls}
 #endif /* LIGHTNING_{idem} */
@@ -655,13 +733,13 @@ print_template = """/* This file was generated by generate-wire.py */
 #include <common/utils.h>
 #include <stdio.h>
 
-void print_message(const u8 *msg)
+void print{enumname}_message(const u8 *msg)
 {{
-        switch ((enum {enumname})fromwire_peektype(msg)) {{
-        {printcases}
-        }}
+\tswitch ((enum {enumname})fromwire_peektype(msg)) {{
+\t{printcases}
+\t}}
 
-        printf("UNKNOWN: %s\\n", tal_hex(msg, msg));
+\tprintf("UNKNOWN: %s\\n", tal_hex(msg, msg));
 }}
 
 {func_decls}
@@ -686,7 +764,7 @@ for m in messages:
     enums += '\t{} = {},\n'.format(m.enum.name, m.enum.value)
 includes = '\n'.join(includes)
 cases = ['case {enum.name}: return "{enum.name}";'.format(enum=m.enum) for m in messages]
-printcases = ['case {enum.name}: printf("{enum.name}:\\n"); printwire_{name}(msg); return;'.format(enum=m.enum, name=m.name) for m in messages]
+printcases = ['case {enum.name}: printf("{enum.name}:\\n"); printwire_{name}("{name}", msg); return;'.format(enum=m.enum, name=m.name) for m in messages]
 
 if options.printwire:
     decls = [m.print_printwire(options.header) for m in messages + messages_with_option]

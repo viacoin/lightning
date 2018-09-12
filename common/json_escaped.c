@@ -6,16 +6,16 @@ struct json_escaped *json_escaped_string_(const tal_t *ctx,
 {
 	struct json_escaped *esc;
 
-	esc = tal_alloc_arr_(ctx, 1, len + 1, false, true,
-			     TAL_LABEL(struct json_escaped, ""));
+	esc = (void *)tal_arr_label(ctx, char, len + 1,
+				    TAL_LABEL(struct json_escaped, ""));
 	memcpy(esc->s, bytes, len);
 	esc->s[len] = '\0';
 	return esc;
 }
 
-struct json_escaped *json_tok_escaped_string(const tal_t *ctx,
-					     const char *buffer,
-					     const jsmntok_t *tok)
+struct json_escaped *json_to_escaped_string(const tal_t *ctx,
+					    const char *buffer,
+					    const jsmntok_t *tok)
 {
 	if (tok->type != JSMN_STRING)
 		return NULL;
@@ -89,7 +89,7 @@ static struct json_escaped *escape(const tal_t *ctx,
 			break;
 		default:
 			if ((unsigned)str[i] < ' ' || str[i] == 127) {
-				sprintf(esc->s + n, "\\u%04X", str[i]);
+				snprintf(esc->s + n, 7, "\\u%04X", str[i]);
 				n += 5;
 				continue;
 			}

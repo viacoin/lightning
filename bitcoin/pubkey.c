@@ -3,7 +3,6 @@
 #include <assert.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
-#include <ccan/structeq/structeq.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
 
@@ -29,14 +28,18 @@ void pubkey_to_der(u8 der[PUBKEY_DER_LEN], const struct pubkey *key)
 	assert(outlen == PUBKEY_DER_LEN);
 }
 
-/* Pubkey from privkey */
+bool pubkey_from_secret(const struct secret *secret, struct pubkey *key)
+{
+	if (!secp256k1_ec_pubkey_create(secp256k1_ctx,
+					&key->pubkey, secret->data))
+		return false;
+	return true;
+}
+
 bool pubkey_from_privkey(const struct privkey *privkey,
 			 struct pubkey *key)
 {
-	if (!secp256k1_ec_pubkey_create(secp256k1_ctx,
-					&key->pubkey, privkey->secret.data))
-		return false;
-	return true;
+	return pubkey_from_secret(&privkey->secret, key);
 }
 
 bool pubkey_from_hexstr(const char *derstr, size_t slen, struct pubkey *key)
@@ -61,6 +64,7 @@ char *pubkey_to_hexstr(const tal_t *ctx, const struct pubkey *key)
 	pubkey_to_der(der, key);
 	return tal_hexstr(ctx, der, sizeof(der));
 }
+REGISTER_TYPE_TO_STRING(pubkey, pubkey_to_hexstr);
 
 char *secp256k1_pubkey_to_hexstr(const tal_t *ctx, const secp256k1_pubkey *key)
 {
@@ -74,13 +78,6 @@ char *secp256k1_pubkey_to_hexstr(const tal_t *ctx, const secp256k1_pubkey *key)
 }
 REGISTER_TYPE_TO_STRING(secp256k1_pubkey, secp256k1_pubkey_to_hexstr);
 
-bool pubkey_eq(const struct pubkey *a, const struct pubkey *b)
-{
-	return structeq(&a->pubkey, &b->pubkey);
-}
-
-REGISTER_TYPE_TO_STRING(pubkey, pubkey_to_hexstr);
-
 int pubkey_cmp(const struct pubkey *a, const struct pubkey *b)
 {
 	u8 keya[33], keyb[33];
@@ -88,17 +85,6 @@ int pubkey_cmp(const struct pubkey *a, const struct pubkey *b)
 	pubkey_to_der(keyb, b);
 	return memcmp(keya, keyb, sizeof(keya));
 }
-
-static char *privkey_to_hexstr(const tal_t *ctx, const struct privkey *secret)
-{
-	/* Bitcoin appends "01" to indicate the pubkey is compressed. */
-	char *str = tal_arr(ctx, char, hex_str_size(sizeof(*secret) + 1));
-	hex_encode(secret, sizeof(*secret), str, hex_str_size(sizeof(*secret)));
-	strcat(str, "01");
-	return str;
-}
-REGISTER_TYPE_TO_STRING(privkey, privkey_to_hexstr);
-REGISTER_TYPE_TO_HEXSTR(secret);
 
 void pubkey_to_hash160(const struct pubkey *pk, struct ripemd160 *hash)
 {

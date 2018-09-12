@@ -10,6 +10,7 @@
 #include <common/crypto_state.h>
 #include <common/gen_peer_status_wire.h>
 #include <common/gen_status_wire.h>
+#include <common/memleak.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <lightningd/lightningd.h>
@@ -91,7 +92,7 @@ static void add_req(const tal_t *ctx,
 	 * case where ctx is freed between request and reply.  Hence this
 	 * trick. */
 	if (ctx) {
-		sr->disabler = tal(ctx, char);
+		sr->disabler = notleak(tal(ctx, char));
 		tal_add_destructor2(sr->disabler, disable_cb, sr);
 	} else
 		sr->disabler = NULL;
@@ -135,7 +136,6 @@ static void close_taken_fds(va_list *ap)
 /* We use sockets, not pipes, because fds are bidir. */
 static int subd(const char *dir, const char *name,
 		const char *debug_subdaemon,
-		const char *debug_subdaemon_io,
 		int *msgfd, int dev_disconnect_fd, va_list *ap)
 {
 	int childmsg[2], execfail[2];
@@ -160,7 +160,7 @@ static int subd(const char *dir, const char *name,
 		int fdnum = 3, i, stdin_is_now = STDIN_FILENO;
 		long max;
 		size_t num_args;
-		char *args[] = { NULL, NULL, NULL, NULL, NULL };
+		char *args[] = { NULL, NULL, NULL, NULL };
 
 		close(childmsg[0]);
 		close(execfail[0]);
@@ -181,16 +181,14 @@ static int subd(const char *dir, const char *name,
 		}
 
 		/* Dup any extra fds up first. */
-		if (ap) {
-			while ((fd = va_arg(*ap, int *)) != NULL) {
-				int actual_fd = *fd;
-				/* If this were stdin, we moved it above! */
-				if (actual_fd == STDIN_FILENO)
-					actual_fd = stdin_is_now;
-				if (!move_fd(actual_fd, fdnum))
-					goto child_errno_fail;
-				fdnum++;
-			}
+		while ((fd = va_arg(*ap, int *)) != NULL) {
+			int actual_fd = *fd;
+			/* If this were stdin, we moved it above! */
+			if (actual_fd == STDIN_FILENO)
+				actual_fd = stdin_is_now;
+			if (!move_fd(actual_fd, fdnum))
+				goto child_errno_fail;
+			fdnum++;
 		}
 
 		/* Make (fairly!) sure all other fds are closed. */
@@ -207,8 +205,6 @@ static int subd(const char *dir, const char *name,
 		if (debug_subdaemon && strends(name, debug_subdaemon))
 			args[num_args++] = "--debugger";
 #endif
-		if (debug_subdaemon_io && strends(name, debug_subdaemon_io))
-			args[num_args++] = "--log-io";
 		execv(args[0], args);
 
 	child_errno_fail:
@@ -247,30 +243,6 @@ fail:
 	if (ap)
 		close_taken_fds(ap);
 	return -1;
-}
-
-int subd_raw(struct lightningd *ld, const char *name)
-{
-	pid_t pid;
-	int msg_fd;
-	const char *debug_subd = NULL;
-	int disconnect_fd = -1;
-
-#if DEVELOPER
-	debug_subd = ld->dev_debug_subdaemon;
-	disconnect_fd = ld->dev_disconnect_fd;
-#endif /* DEVELOPER */
-
-	pid = subd(ld->daemon_dir, name, debug_subd, ld->debug_subdaemon_io,
-		   &msg_fd, disconnect_fd,
-		   NULL);
-	if (pid == (pid_t)-1) {
-		log_unusual(ld->log, "subd %s failed: %s",
-			    name, strerror(errno));
-		return -1;
-	}
-
-	return msg_fd;
 }
 
 static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd);
@@ -350,7 +322,7 @@ static void subdaemon_malformed_msg(struct subd *sd, const u8 *msg)
 
 #if DEVELOPER
 	if (sd->ld->dev_subdaemon_fail)
-		fatal("Subdaemon %s sent malformed message", sd->name);
+		exit(1);
 #endif
 }
 
@@ -385,7 +357,7 @@ static bool log_status_fail(struct subd *sd, const u8 *msg)
 
 #if DEVELOPER
 	if (sd->ld->dev_subdaemon_fail)
-		fatal("Subdaemon %s hit error", sd->name);
+		exit(1);
 #endif
 	return true;
 }
@@ -562,9 +534,11 @@ static void destroy_subd(struct subd *sd)
 		break;
 	}
 
-	if (fail_if_subd_fails && WIFSIGNALED(status))
-		fatal("Subdaemon %s killed with signal %i",
-		      sd->name, WTERMSIG(status));
+	if (fail_if_subd_fails && WIFSIGNALED(status)) {
+		log_broken(sd->log, "Subdaemon %s killed with signal %i",
+			   sd->name, WTERMSIG(status));
+		exit(1);
+	}
 
 	/* In case we're freed manually, such as channel_fail_permanent */
 	if (sd->conn)
@@ -658,7 +632,7 @@ static struct subd *new_subd(struct lightningd *ld,
 	disconnect_fd = ld->dev_disconnect_fd;
 #endif /* DEVELOPER */
 
-	sd->pid = subd(ld->daemon_dir, name, debug_subd, ld->debug_subdaemon_io,
+	sd->pid = subd(ld->daemon_dir, name, debug_subd,
 		       &msg_fd, disconnect_fd, ap);
 	if (sd->pid == (pid_t)-1) {
 		log_unusual(ld->log, "subd %s failed: %s",
@@ -848,3 +822,53 @@ bool dev_disconnect_permanent(struct lightningd *ld)
 	return false;
 }
 #endif /* DEVELOPER */
+
+/* Ugly helper to get full pathname of the current binary. */
+const char *find_my_abspath(const tal_t *ctx, const char *argv0)
+{
+	char *me;
+
+	/* A command containing / is run relative to the current directory,
+	 * not searched through the path.  The shell sets argv0 to the command
+	 * run, though something else could set it to a arbitrary value and
+	 * this logic would be wrong. */
+	if (strchr(argv0, PATH_SEP)) {
+		const char *path;
+		/* Absolute paths are easy. */
+		if (strstarts(argv0, PATH_SEP_STR))
+			path = argv0;
+		/* It contains a '/', it's relative to current dir. */
+		else
+			path = path_join(tmpctx, path_cwd(tmpctx), argv0);
+
+		me = path_canon(ctx, path);
+		if (!me || access(me, X_OK) != 0)
+			errx(1, "I cannot find myself at %s based on my name %s",
+			     path, argv0);
+	} else {
+		/* No /, search path */
+		char **pathdirs;
+		const char *pathenv = getenv("PATH");
+		size_t i;
+
+		/* This replicates the standard shell path search algorithm */
+		if (!pathenv)
+			errx(1, "Cannot find myself: no $PATH set");
+
+		pathdirs = tal_strsplit(tmpctx, pathenv, ":", STR_NO_EMPTY);
+		me = NULL;
+		for (i = 0; pathdirs[i]; i++) {
+			/* This returns NULL if it doesn't exist. */
+			me = path_canon(ctx,
+					path_join(tmpctx, pathdirs[i], argv0));
+			if (me && access(me, X_OK) == 0)
+				break;
+			/* Nope, try again. */
+			me = tal_free(me);
+		}
+		if (!me)
+			errx(1, "Cannot find %s in $PATH", argv0);
+	}
+
+	return me;
+}

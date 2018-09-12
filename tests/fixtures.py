@@ -1,18 +1,26 @@
 from concurrent import futures
-from test_lightningd import NodeFactory
+from utils import NodeFactory
 
 import logging
 import os
 import pytest
 import re
+import shutil
+import sys
 import tempfile
 import utils
 
 
-TEST_DIR = tempfile.mkdtemp(prefix='ltests-')
-VALGRIND = os.getenv("NO_VALGRIND", "0") == "0"
-DEVELOPER = os.getenv("DEVELOPER", "0") == "1"
+with open('config.vars') as configfile:
+    config = dict([(line.rstrip().split('=', 1)) for line in configfile])
+
+VALGRIND = os.getenv("VALGRIND", config['VALGRIND']) == "1"
+DEVELOPER = os.getenv("DEVELOPER", config['DEVELOPER']) == "1"
 TEST_DEBUG = os.getenv("TEST_DEBUG", "0") == "1"
+
+
+if TEST_DEBUG:
+    logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
 
 
 # A dict in which we count how often a particular test has run so far. Used to
@@ -20,17 +28,37 @@ TEST_DEBUG = os.getenv("TEST_DEBUG", "0") == "1"
 __attempts = {}
 
 
+@pytest.fixture(scope="session")
+def test_base_dir():
+    directory = tempfile.mkdtemp(prefix='ltests-')
+    print("Running tests in {}".format(directory))
+
+    yield directory
+
+    if os.listdir(directory) == []:
+        shutil.rmtree(directory)
+
+
 @pytest.fixture
-def directory(test_name):
+def directory(request, test_base_dir, test_name):
     """Return a per-test specific directory.
 
     This makes a unique test-directory even if a test is rerun multiple times.
 
     """
-    global TEST_DIR, __attempts
+    global __attempts
     # Auto set value if it isn't in the dict yet
     __attempts[test_name] = __attempts.get(test_name, 0) + 1
-    yield os.path.join(TEST_DIR, "{}_{}".format(test_name, __attempts[test_name]))
+    directory = os.path.join(test_base_dir, "{}_{}".format(test_name, __attempts[test_name]))
+
+    yield directory
+
+    # This uses the status set in conftest.pytest_runtest_makereport to
+    # determine whether we succeeded or failed.
+    if request.node.rep_call.outcome == 'passed':
+        shutil.rmtree(directory)
+    else:
+        logging.debug("Test execution failed, leaving the test directory {} intact.".format(directory))
 
 
 @pytest.fixture
@@ -91,6 +119,15 @@ def node_factory(directory, test_name, bitcoind, executor):
         err_count += checkReconnect(node)
     if err_count:
         raise ValueError("{} nodes had unexpected reconnections".format(err_count))
+    for node in nf.nodes:
+        err_count += checkBadGossipOrder(node)
+    if err_count:
+        raise ValueError("{} nodes had bad gossip order".format(err_count))
+
+    for node in nf.nodes:
+        err_count += checkBadReestablish(node)
+    if err_count:
+        raise ValueError("{} nodes had bad reestablish".format(err_count))
 
     if not ok:
         raise Exception("At least one lightning exited with unexpected non-zero return code")
@@ -132,8 +169,7 @@ def printCrashLog(node):
     errors, fname = getCrashLog(node)
     if errors:
         print("-" * 10, "{} (last 50 lines)".format(fname), "-" * 10)
-        for l in errors[-50:]:
-            print(l, end='')
+        print("".join(errors[-50:]))
         print("-" * 80)
     return 1 if errors else 0
 
@@ -143,6 +179,18 @@ def checkReconnect(node):
     if node.may_reconnect or not DEVELOPER:
         return 0
     if node.daemon.is_in_log('Peer has reconnected'):
+        return 1
+    return 0
+
+
+def checkBadGossipOrder(node):
+    if node.daemon.is_in_log('Bad gossip order from (?!error)') and not node.daemon.is_in_log('Deleting channel'):
+        return 1
+    return 0
+
+
+def checkBadReestablish(node):
+    if node.daemon.is_in_log('Bad reestablish'):
         return 1
     return 0
 

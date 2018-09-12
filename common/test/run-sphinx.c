@@ -148,37 +148,28 @@ static void run_unit_tests(void)
 		printf("input_packet %s\n", tal_hex(tmpctx, reply));
 		reply = wrap_onionreply(tmpctx, &ss[i], reply);
 		printf("obfuscated_packet %s\n", tal_hex(tmpctx, reply));
-		assert(memcmp(reply, intermediates[i], tal_len(reply)) == 0);
+		assert(memcmp(reply, intermediates[i], tal_count(reply)) == 0);
 	}
 
 	oreply = unwrap_onionreply(tmpctx, ss, 5, reply);
 	printf("unwrapped %s\n", tal_hex(tmpctx, oreply->msg));
-	assert(memcmp(raw, oreply->msg, tal_len(raw)) == 0);
+	assert(memcmp(raw, oreply->msg, tal_bytelen(raw)) == 0);
 }
 
 int main(int argc, char **argv)
 {
 	setup_locale();
 
-	bool generate = false, decode = false, unit = false;
-	u8 assocdata[32];
-	memset(assocdata, 'B', sizeof(assocdata));
+	bool unit = false;
 
 	secp256k1_ctx = secp256k1_context_create(
 		SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
 	setup_tmpctx();
 
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
-			   "--generate <pubkey1> <pubkey2>... OR\n"
-			   "--decode <privkey>\n"
-			   "Either create an onion message, or decode one step",
+			   "--unit\n"
+			   "Run unit tests against test vectors",
 			   "Print this message.");
-	opt_register_noarg("--generate",
-			   opt_set_bool, &generate,
-			   "Generate onion through the given hex pubkeys");
-	opt_register_noarg("--decode",
-			   opt_set_bool, &decode,
-			   "Decode onion from stdin given the private key");
 	opt_register_noarg("--unit",
 			   opt_set_bool, &unit,
 			   "Run unit tests against test vectors");
@@ -187,9 +178,6 @@ int main(int argc, char **argv)
 
 	if (unit) {
 		run_unit_tests();
-	} else if (generate) {
-
-	} else if (decode) {
 	}
 	secp256k1_context_destroy(secp256k1_ctx);
 	opt_free_table();

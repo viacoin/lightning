@@ -25,22 +25,22 @@ int json_tok_len(const jsmntok_t *t);
 bool json_tok_streq(const char *buffer, const jsmntok_t *tok, const char *str);
 
 /* Extract number from this (may be a string, or a number literal) */
-bool json_tok_number(const char *buffer, const jsmntok_t *tok,
-		     unsigned int *num);
+bool json_to_number(const char *buffer, const jsmntok_t *tok,
+		    unsigned int *num);
 
 /* Extract number from this (may be a string, or a number literal) */
-bool json_tok_u64(const char *buffer, const jsmntok_t *tok,
-		  uint64_t *num);
+bool json_to_u64(const char *buffer, const jsmntok_t *tok,
+		 uint64_t *num);
 
 /* Extract double from this (must be a number literal) */
-bool json_tok_double(const char *buffer, const jsmntok_t *tok, double *num);
+bool json_to_double(const char *buffer, const jsmntok_t *tok, double *num);
 
 /* Extract satoshis from this (may be a string, or a decimal number literal) */
 bool json_tok_bitcoin_amount(const char *buffer, const jsmntok_t *tok,
 			     uint64_t *satoshi);
 
-/* Extract boolean this (must be a true or false) */
-bool json_tok_bool(const char *buffer, const jsmntok_t *tok, bool *b);
+/* Is this a number? [0..9]+ */
+bool json_tok_is_num(const char *buffer, const jsmntok_t *tok);
 
 /* Is this the null primitive? */
 bool json_tok_is_null(const char *buffer, const jsmntok_t *tok);
@@ -100,6 +100,10 @@ void json_add_bool(struct json_result *result, const char *fieldname,
 /* '"fieldname" : "0189abcdef..."' or "0189abcdef..." if fieldname is NULL */
 void json_add_hex(struct json_result *result, const char *fieldname,
 		  const void *data, size_t len);
+/* '"fieldname" : "0189abcdef..."' or "0189abcdef..." if fieldname is NULL */
+void json_add_hex_talarr(struct json_result *result,
+			 const char *fieldname,
+			 const tal_t *data);
 void json_add_object(struct json_result *result, ...);
 
 const char *json_result_string(const struct json_result *result);

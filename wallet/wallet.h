@@ -5,6 +5,7 @@
 #include "db.h"
 #include <bitcoin/chainparams.h>
 #include <bitcoin/tx.h>
+#include <ccan/build_assert/build_assert.h>
 #include <ccan/crypto/shachain/shachain.h>
 #include <ccan/list/list.h>
 #include <ccan/tal/tal.h>
@@ -13,6 +14,7 @@
 #include <lightningd/chaintopology.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/invoice.h>
+#include <lightningd/log.h>
 #include <onchaind/onchain_wire.h>
 #include <wally_bip32.h>
 
@@ -46,6 +48,8 @@ struct wallet {
 /* Possible states for tracked outputs in the database. Not sure yet
  * whether we really want to have reservations reflected in the
  * database, it would simplify queries at the cost of some IO ops */
+/* /!\ This is a DB ENUM, please do not change the numbering of any
+ * already defined elements (adding is ok) /!\ */
 enum output_status {
 	output_state_available= 0,
 	output_state_reserved = 1,
@@ -55,10 +59,31 @@ enum output_status {
 	output_state_any = 255
 };
 
+static inline enum output_status output_status_in_db(enum output_status s)
+{
+	switch (s) {
+	case output_state_available:
+		BUILD_ASSERT(output_state_available == 0);
+		return s;
+	case output_state_reserved:
+		BUILD_ASSERT(output_state_reserved == 1);
+		return s;
+	case output_state_spent:
+		BUILD_ASSERT(output_state_spent == 2);
+		return s;
+	/* This one doesn't go into db */
+	case output_state_any:
+		break;
+	}
+	fatal("%s: %u is invalid", __func__, s);
+}
+
 /* Enumeration of all known output types. These include all types that
  * could ever end up on-chain and we may need to react upon. Notice
  * that `to_local`, `htlc_offer`, and `htlc_recv` may need immediate
  * action since they are encumbered with a CSV. */
+/* /!\ This is a DB ENUM, please do not change the numbering of any
+ * already defined elements (adding is ok) /!\ */
 enum wallet_output_type {
 	p2sh_wpkh = 0,
 	to_local = 1,
@@ -67,6 +92,31 @@ enum wallet_output_type {
 	our_change = 5,
 	p2wpkh = 6
 };
+
+static inline enum wallet_output_type wallet_output_type_in_db(enum wallet_output_type w)
+{
+	switch (w) {
+	case p2sh_wpkh:
+		BUILD_ASSERT(p2sh_wpkh == 0);
+		return w;
+	case to_local:
+		BUILD_ASSERT(to_local == 1);
+		return w;
+	case htlc_offer:
+		BUILD_ASSERT(htlc_offer == 3);
+		return w;
+	case htlc_recv:
+		BUILD_ASSERT(htlc_recv == 4);
+		return w;
+	case our_change:
+		BUILD_ASSERT(our_change == 5);
+		return w;
+	case p2wpkh:
+		BUILD_ASSERT(p2wpkh == 6);
+		return w;
+	}
+	fatal("%s: %u is invalid", __func__, w);
+}
 
 /* A database backed shachain struct. The datastructure is
  * writethrough, reads are performed from an in-memory version, all
@@ -81,12 +131,29 @@ struct wallet_shachain {
  * get the preimage matching the rhash, or to
  * `PAYMENT_FAILED`. */
 /* /!\ This is a DB ENUM, please do not change the numbering of any
- * already defined elements (adding is ok) /!\ */
+ * already defined elements (adding is ok but you should append the
+ * test case test_wallet_payment_status_enum() ) /!\ */
 enum wallet_payment_status {
 	PAYMENT_PENDING = 0,
 	PAYMENT_COMPLETE = 1,
 	PAYMENT_FAILED = 2
 };
+
+static inline enum wallet_payment_status wallet_payment_status_in_db(enum wallet_payment_status w)
+{
+	switch (w) {
+	case PAYMENT_PENDING:
+		BUILD_ASSERT(PAYMENT_PENDING == 0);
+		return w;
+	case PAYMENT_COMPLETE:
+		BUILD_ASSERT(PAYMENT_COMPLETE == 1);
+		return w;
+	case PAYMENT_FAILED:
+		BUILD_ASSERT(PAYMENT_FAILED == 2);
+		return w;
+	}
+	fatal("%s: %u is invalid", __func__, w);
+}
 
 /* Outgoing payments. A simple persisted representation
  * of a payment we initiated. This can be used by
@@ -108,6 +175,9 @@ struct wallet_payment {
 	struct secret *path_secrets;
 	struct pubkey *route_nodes;
 	struct short_channel_id *route_channels;
+
+	/* The description of the payment. Must support `tal_len` */
+	const char *description;
 };
 
 struct outpoint {
@@ -156,6 +226,13 @@ bool wallet_add_utxo(struct wallet *w, struct utxo *utxo,
 		     enum wallet_output_type type);
 
 /**
+ * wallet_confirm_tx - Confirm a tx which contains a UTXO.
+ */
+void wallet_confirm_tx(struct wallet *w,
+		       const struct bitcoin_txid *txid,
+		       const u32 confirmation_height);
+
+/**
  * wallet_update_output_status - Perform an output state transition
  *
  * Change the current status of an output we are tracking in the
@@ -178,6 +255,16 @@ bool wallet_update_output_status(struct wallet *w,
  */
 struct utxo **wallet_get_utxos(const tal_t *ctx, struct wallet *w,
 			      const enum output_status state);
+
+
+/**
+ * wallet_get_unconfirmed_closeinfo_utxos - Retrieve any unconfirmed utxos w/ closeinfo
+ *
+ * Returns a `tal_arr` of `utxo` structs. Double indirection in order
+ * to be able to steal individual elements onto something else.
+ */
+struct utxo **wallet_get_unconfirmed_closeinfo_utxos(const tal_t *ctx,
+						     struct wallet *w);
 
 const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
 					const u64 value,
@@ -228,7 +315,7 @@ s64 wallet_get_newindex(struct lightningd *ld);
 bool wallet_shachain_add_hash(struct wallet *wallet,
 			      struct wallet_shachain *chain,
 			      uint64_t index,
-			      const struct sha256 *hash);
+			      const struct secret *hash);
 
 /**
  * wallet_shachain_load -- Load an existing shachain from the wallet.
@@ -316,13 +403,15 @@ void wallet_channel_stats_load(struct wallet *w, u64 cdbid, struct channel_stats
 /**
  * Retrieve the blockheight of the last block processed by lightningd.
  *
- * Will return either the maximal blockheight or the default value if the wallet
- * was never used before.
+ * Will set min/max either the minimal/maximal blockheight or the default value
+ * if the wallet was never used before.
  *
  * @w: wallet to load from.
  * @def: the default value to return if we've never used the wallet before
+ * @min(out): height of the first block we track
+ * @max(out): height of the last block we added
  */
-u32 wallet_blocks_height(struct wallet *w, u32 def);
+void wallet_blocks_heights(struct wallet *w, u32 def, u32 *min, u32 *max);
 
 /**
  * wallet_extract_owned_outputs - given a tx, extract all of our outputs
@@ -391,7 +480,7 @@ void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
  * may not have been loaded yet. In the latter case the pay_command
  * does not exist anymore since we restarted.
  *
- * Use `wallet_htlcs_reconnect` to wire htlc_out instances to the
+ * Use `htlcs_reconnect` to wire htlc_out instances to the
  * corresponding htlc_in after loading all channels.
  */
 bool wallet_htlcs_load_for_channel(struct wallet *wallet,
@@ -399,16 +488,6 @@ bool wallet_htlcs_load_for_channel(struct wallet *wallet,
 				   struct htlc_in_map *htlcs_in,
 				   struct htlc_out_map *htlcs_out);
 
-/**
- * wallet_htlcs_reconnect -- Link outgoing HTLCs to their origins
- *
- * For each outgoing HTLC find the incoming HTLC that triggered it. If
- * we are the origin of the transfer then we cannot resolve the
- * incoming HTLC in which case we just leave it `NULL`.
- */
-bool wallet_htlcs_reconnect(struct wallet *wallet,
-			    struct htlc_in_map *htlcs_in,
-			    struct htlc_out_map *htlcs_out);
 
 /* /!\ This is a DB ENUM, please do not change the numbering of any
  * already defined elements (adding is ok) /!\ */
@@ -417,6 +496,22 @@ enum invoice_status {
 	PAID,
 	EXPIRED,
 };
+
+static inline enum invoice_status invoice_status_in_db(enum invoice_status s)
+{
+	switch (s) {
+	case UNPAID:
+		BUILD_ASSERT(UNPAID == 0);
+		return s;
+	case PAID:
+		BUILD_ASSERT(PAID == 1);
+		return s;
+	case EXPIRED:
+		BUILD_ASSERT(EXPIRED == 2);
+		return s;
+	}
+	fatal("%s: %u is invalid", __func__, s);
+}
 
 /* The information about an invoice */
 struct invoice_details {
@@ -440,6 +535,9 @@ struct invoice_details {
 	u64 paid_timestamp;
 	/* BOLT11 encoding for this invoice */
 	const char *bolt11;
+
+	/* The description of the payment. */
+	char *description;
 };
 
 /* An object that handles iteration over the set of invoices */
@@ -456,20 +554,6 @@ struct invoice {
 };
 
 #define INVOICE_MAX_LABEL_LEN 128
-
-/**
- * wallet_invoice_load - Load the invoices from the database
- *
- * @wallet - the wallet whose invoices are to be loaded.
- *
- * All other wallet_invoice_* functions cannot be called
- * until this function is called.
- * As a database operation it must be called within
- * db_begin_transaction .. db_commit_transaction
- * (all other invoice functions also have this requirement).
- * Returns true if loaded successfully.
- */
-bool wallet_invoice_load(struct wallet *wallet);
 
 /**
  * wallet_invoice_create - Create a new invoice.
@@ -493,6 +577,7 @@ bool wallet_invoice_create(struct wallet *wallet,
 			   const struct json_escaped *label TAKES,
 			   u64 expiry,
 			   const char *b11enc,
+			   const char *description,
 			   const struct preimage *r,
 			   const struct sha256 *rhash);
 
@@ -596,13 +681,11 @@ bool wallet_invoice_iterate(struct wallet *wallet,
  * @ctx - the owner of the label and msatoshi fields returned.
  * @wallet - the wallet whose invoices are to be iterated over.
  * @iterator - the iterator object to use.
- * @details - pointer to details object to load.
- *
+ * @return pointer to the invoice details allocated off of `ctx`.
  */
-void wallet_invoice_iterator_deref(const tal_t *ctx,
-				   struct wallet *wallet,
-				   const struct invoice_iterator *it,
-				   struct invoice_details *details);
+const struct invoice_details *
+wallet_invoice_iterator_deref(const tal_t *ctx, struct wallet *wallet,
+			      const struct invoice_iterator *it);
 
 /**
  * wallet_invoice_resolve - Mark an invoice as paid
@@ -667,12 +750,11 @@ void wallet_invoice_waitone(const tal_t *ctx,
  * @ctx - the owner of the label and msatoshi fields returned.
  * @wallet - the wallet to query.
  * @invoice - the invoice to get details on.
- * @details - pointer to details object to load.
+ * @return pointer to the invoice details allocated off of `ctx`.
  */
-void wallet_invoice_details(const tal_t *ctx,
-			    struct wallet *wallet,
-			    struct invoice invoice,
-			    struct invoice_details *details);
+const struct invoice_details *wallet_invoice_details(const tal_t *ctx,
+						     struct wallet *wallet,
+						     struct invoice invoice);
 
 /**
  * wallet_htlc_stubs - Retrieve HTLC stubs for the given channel

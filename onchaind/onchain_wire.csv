@@ -1,7 +1,8 @@
+#include <common/derive_basepoints.h>
 #include <common/htlc_wire.h>
+
 # Begin!  Here's the onchain tx which spends funding tx, followed by all HTLCs.
 onchain_init,5001
-onchain_init,,seed,struct privkey
 onchain_init,,shachain,struct shachain
 onchain_init,,funding_amount_satoshi,u64
 # Remote per commit point for committed tx.
@@ -12,7 +13,6 @@ onchain_init,,local_to_self_delay,u32
 onchain_init,,remote_to_self_delay,u32
 onchain_init,,feerate_per_kw,u32
 onchain_init,,local_dust_limit_satoshi,u64
-onchain_init,,remote_revocation_basepoint,struct pubkey
 # Gives an easy way to tell if it's our unilateral close or theirs...
 onchain_init,,our_broadcast_txid,struct bitcoin_txid
 onchain_init,,local_scriptpubkey_len,u16
@@ -22,9 +22,8 @@ onchain_init,,remote_scriptpubkey,remote_scriptpubkey_len*u8
 onchain_init,,ourwallet_pubkey,struct pubkey
 # We need these two for commit number obscurer
 onchain_init,,funder,enum side
-onchain_init,,remote_payment_basepoint,struct pubkey
-onchain_init,,remote_htlc_basepoint,struct pubkey
-onchain_init,,remote_delayed_payment_basepoint,struct pubkey
+onchain_init,,local_basepoints,struct basepoints
+onchain_init,,remote_basepoints,struct basepoints
 onchain_init,,tx,struct bitcoin_tx
 onchain_init,,tx_blockheight,u32
 onchain_init,,reasonable_depth,u32
@@ -33,6 +32,7 @@ onchain_init,,htlc_signature,num_htlc_sigs*secp256k1_ecdsa_signature
 onchain_init,,num_htlcs,u64
 onchain_init,,min_possible_feerate,u32
 onchain_init,,max_possible_feerate,u32
+onchain_init,,possible_remote_per_commit_point,?struct pubkey
 
 #include <onchaind/onchain_wire.h>
 # This is all the HTLCs: one per message

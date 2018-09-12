@@ -24,43 +24,13 @@
 #include <lightningd/hsm_control.h>
 #include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/log.h>
+#include <lightningd/param.h>
 #include <sodium/randombytes.h>
 #include <string.h>
 #include <wire/gen_peer_wire.h>
 #include <wire/wire_sync.h>
-
-static void peer_nongossip(struct subd *gossip, const u8 *msg,
-			   int peer_fd, int gossip_fd)
-{
-	struct pubkey id;
-	struct crypto_state cs;
-	struct wireaddr_internal addr;
-	u8 *gfeatures, *lfeatures, *in_pkt;
-
-	if (!fromwire_gossip_peer_nongossip(msg, msg,
-					    &id, &addr, &cs,
-					    &gfeatures,
-					    &lfeatures,
-					    &in_pkt))
-		fatal("Gossip gave bad GOSSIP_PEER_NONGOSSIP message %s",
-		      tal_hex(msg, msg));
-
-	/* We already checked the features when it first connected. */
-	if (!features_supported(gfeatures, lfeatures)) {
-		log_unusual(gossip->log,
-			    "Gossip gave unsupported features %s/%s",
-			    tal_hex(msg, gfeatures),
-			    tal_hex(msg, lfeatures));
-		close(peer_fd);
-		close(gossip_fd);
-		return;
-	}
-
-	peer_sent_nongossip(gossip->ld, &id, &addr, &cs,
-			    gfeatures, lfeatures,
-			    peer_fd, gossip_fd, in_pkt);
-}
 
 static void got_txout(struct bitcoind *bitcoind,
 		      const struct bitcoin_tx_output *output,
@@ -88,12 +58,15 @@ static void get_txout(struct subd *gossip, const u8 *msg)
 {
 	struct short_channel_id *scid = tal(gossip, struct short_channel_id);
 	struct outpoint *op;
+	u32 blockheight;
+	struct chain_topology *topo = gossip->ld->topology;
 
 	if (!fromwire_gossip_get_txout(msg, scid))
 		fatal("Gossip gave bad GOSSIP_GET_TXOUT message %s",
 		      tal_hex(msg, msg));
 
 	/* FIXME: Block less than 6 deep? */
+	blockheight = short_channel_id_blocknum(scid);
 
 	op = wallet_outpoint_for_scid(gossip->ld->wallet, scid, scid);
 
@@ -102,8 +75,17 @@ static void get_txout(struct subd *gossip, const u8 *msg)
 			      towire_gossip_get_txout_reply(
 				  scid, scid, op->satoshis, op->scriptpubkey));
 		tal_free(scid);
+	} else if (blockheight >= topo->min_blockheight &&
+		   blockheight <= topo->max_blockheight) {
+		/* We should have known about this outpoint since it is included
+		 * in the range in the DB. The fact that we don't means that
+		 * this is either a spent outpoint or an invalid one. Return a
+		 * failure. */
+		subd_send_msg(gossip, take(towire_gossip_get_txout_reply(
+					  NULL, scid, 0, NULL)));
+		tal_free(scid);
 	} else {
-		bitcoind_getoutput(gossip->ld->topology->bitcoind,
+		bitcoind_getoutput(topo->bitcoind,
 				   short_channel_id_blocknum(scid),
 				   short_channel_id_txnum(scid),
 				   short_channel_id_outnum(scid),
@@ -118,59 +100,39 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 	switch (t) {
 	/* These are messages we send, not them. */
 	case WIRE_GOSSIPCTL_INIT:
-	case WIRE_GOSSIPCTL_ACTIVATE:
 	case WIRE_GOSSIP_GETNODES_REQUEST:
 	case WIRE_GOSSIP_GETROUTE_REQUEST:
 	case WIRE_GOSSIP_GETCHANNELS_REQUEST:
-	case WIRE_GOSSIP_GETPEERS_REQUEST:
 	case WIRE_GOSSIP_PING:
 	case WIRE_GOSSIP_RESOLVE_CHANNEL_REQUEST:
-	case WIRE_GOSSIPCTL_CONNECT_TO_PEER:
-	case WIRE_GOSSIPCTL_HAND_BACK_PEER:
-	case WIRE_GOSSIPCTL_RELEASE_PEER:
-	case WIRE_GOSSIPCTL_PEER_ADDRHINT:
 	case WIRE_GOSSIP_GET_UPDATE:
 	case WIRE_GOSSIP_SEND_GOSSIP:
 	case WIRE_GOSSIP_GET_TXOUT_REPLY:
-	case WIRE_GOSSIP_DISABLE_CHANNEL:
 	case WIRE_GOSSIP_OUTPOINT_SPENT:
 	case WIRE_GOSSIP_ROUTING_FAILURE:
 	case WIRE_GOSSIP_MARK_CHANNEL_UNROUTABLE:
-	case WIRE_GOSSIPCTL_PEER_DISCONNECT:
-	case WIRE_GOSSIPCTL_PEER_IMPORTANT:
-	case WIRE_GOSSIPCTL_PEER_DISCONNECTED:
+	case WIRE_GOSSIP_QUERY_SCIDS:
+	case WIRE_GOSSIP_QUERY_CHANNEL_RANGE:
+	case WIRE_GOSSIP_SEND_TIMESTAMP_FILTER:
+	case WIRE_GOSSIP_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
+	case WIRE_GOSSIP_DEV_SUPPRESS:
 	/* This is a reply, so never gets through to here. */
-	case WIRE_GOSSIPCTL_ACTIVATE_REPLY:
 	case WIRE_GOSSIP_GET_UPDATE_REPLY:
 	case WIRE_GOSSIP_GETNODES_REPLY:
 	case WIRE_GOSSIP_GETROUTE_REPLY:
 	case WIRE_GOSSIP_GETCHANNELS_REPLY:
-	case WIRE_GOSSIP_GETPEERS_REPLY:
 	case WIRE_GOSSIP_PING_REPLY:
+	case WIRE_GOSSIP_SCIDS_REPLY:
+	case WIRE_GOSSIP_QUERY_CHANNEL_RANGE_REPLY:
 	case WIRE_GOSSIP_RESOLVE_CHANNEL_REPLY:
-	case WIRE_GOSSIPCTL_RELEASE_PEER_REPLY:
-	case WIRE_GOSSIPCTL_RELEASE_PEER_REPLYFAIL:
-	case WIRE_GOSSIPCTL_PEER_DISCONNECT_REPLY:
-	case WIRE_GOSSIPCTL_PEER_DISCONNECT_REPLYFAIL:
 	/* These are inter-daemon messages, not received by us */
 	case WIRE_GOSSIP_LOCAL_ADD_CHANNEL:
+	case WIRE_GOSSIP_LOCAL_CHANNEL_UPDATE:
+	case WIRE_GOSSIP_LOCAL_CHANNEL_CLOSE:
 		break;
 
-	case WIRE_GOSSIP_PEER_CONNECTED:
-		if (tal_count(fds) != 2)
-			return 2;
-		peer_connected(gossip->ld, msg, fds[0], fds[1]);
-		break;
-	case WIRE_GOSSIP_PEER_NONGOSSIP:
-		if (tal_count(fds) != 2)
-			return 2;
-		peer_nongossip(gossip, msg, fds[0], fds[1]);
-		break;
 	case WIRE_GOSSIP_GET_TXOUT:
 		get_txout(gossip, msg);
-		break;
-	case WIRE_GOSSIPCTL_CONNECT_TO_PEER_RESULT:
-		gossip_connect_result(gossip->ld, msg);
 		break;
 	}
 	return 0;
@@ -178,24 +140,17 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 
 /* Create the `gossipd` subdaemon and send the initialization
  * message */
-void gossip_init(struct lightningd *ld)
+void gossip_init(struct lightningd *ld, int connectd_fd)
 {
 	u8 *msg;
 	int hsmfd;
-	u64 capabilities = HSM_CAP_ECDH | HSM_CAP_SIGN_GOSSIP;
-	struct wireaddr_internal *wireaddrs = ld->proposed_wireaddr;
-	enum addr_listen_announce *listen_announce = ld->proposed_listen_announce;
-	bool allow_localhost = false;
-#if DEVELOPER
-	if (ld->dev_allow_localhost)
-		allow_localhost = true;
-#endif
+	u64 capabilities = HSM_CAP_SIGN_GOSSIP;
 
-	msg = towire_hsm_client_hsmfd(tmpctx, &ld->id, capabilities);
+	msg = towire_hsm_client_hsmfd(tmpctx, &ld->id, 0, capabilities);
 	if (!wire_sync_write(ld->hsm_fd, msg))
 		fatal("Could not write to HSM: %s", strerror(errno));
 
-	msg = hsm_sync_read(tmpctx, ld);
+	msg = wire_sync_read(tmpctx, ld->hsm_fd);
 	if (!fromwire_hsm_client_hsmfd_reply(msg))
 		fatal("Malformed hsmfd response: %s", tal_hex(msg, msg));
 
@@ -205,57 +160,18 @@ void gossip_init(struct lightningd *ld)
 
 	ld->gossip = new_global_subd(ld, "lightning_gossipd",
 				     gossip_wire_type_name, gossip_msg,
-				     take(&hsmfd), NULL);
+				     take(&hsmfd), take(&connectd_fd), NULL);
 	if (!ld->gossip)
 		err(1, "Could not subdaemon gossip");
-
-	/* If no addr specified, hand wildcard to gossipd */
-	if (tal_count(wireaddrs) == 0 && ld->autolisten) {
-		wireaddrs = tal_arrz(tmpctx, struct wireaddr_internal, 1);
-		listen_announce = tal_arr(tmpctx, enum addr_listen_announce, 1);
-		wireaddrs->itype = ADDR_INTERNAL_ALLPROTO;
-		wireaddrs->u.port = ld->portnum;
-		*listen_announce = ADDR_LISTEN_AND_ANNOUNCE;
-	}
 
 	msg = towire_gossipctl_init(
 	    tmpctx, ld->config.broadcast_interval,
 	    &get_chainparams(ld)->genesis_blockhash, &ld->id,
 	    get_offered_global_features(tmpctx),
-	    get_offered_local_features(tmpctx), wireaddrs,
-	    listen_announce, ld->rgb,
-	    ld->alias, ld->config.channel_update_interval, ld->reconnect,
-	    ld->proxyaddr, ld->use_proxy_always || ld->pure_tor_setup,
-	    allow_localhost,
-	    ld->tor_service_password ? ld->tor_service_password : "");
+	    ld->rgb,
+	    ld->alias, ld->config.channel_update_interval,
+	    ld->announcable);
 	subd_send_msg(ld->gossip, msg);
-}
-
-static void gossip_activate_done(struct subd *gossip UNUSED,
-				 const u8 *reply,
-				 const int *fds UNUSED,
-				 void *unused UNUSED)
-{
-	struct lightningd *ld = gossip->ld;
-
-	if (!fromwire_gossipctl_activate_reply(gossip->ld, reply,
-					       &ld->binding,
-					       &ld->announcable))
-		fatal("Bad gossipctl_activate_reply: %s",
-		      tal_hex(reply, reply));
-
-	/* Break out of loop, so we can begin */
-	io_break(gossip);
-}
-
-void gossip_activate(struct lightningd *ld)
-{
-	const u8 *msg = towire_gossipctl_activate(NULL, ld->listen);
-	subd_req(ld->gossip, ld->gossip, take(msg), -1, 0,
-		 gossip_activate_done, NULL);
-
-	/* Wait for activate done */
-	io_loop(NULL, NULL);
 }
 
 void gossipd_notify_spend(struct lightningd *ld,
@@ -274,7 +190,7 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 	size_t i, j;
 
 	if (!fromwire_gossip_getnodes_reply(reply, reply, &nodes)) {
-		command_fail(cmd, "Malformed gossip_getnodes response");
+		command_fail(cmd, LIGHTNINGD, "Malformed gossip_getnodes response");
 		return;
 	}
 
@@ -296,6 +212,8 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 			     nodes[i]->color, ARRAY_SIZE(nodes[i]->color));
 		json_add_u64(response, "last_timestamp",
 			     nodes[i]->last_timestamp);
+		json_add_hex_talarr(response, "global_features",
+				    nodes[i]->global_features);
 		json_array_start(response, "addresses");
 		for (j=0; j<tal_count(nodes[i]->addresses); j++) {
 			json_add_address(response, NULL, &nodes[i]->addresses[j]);
@@ -312,22 +230,12 @@ static void json_listnodes(struct command *cmd, const char *buffer,
 			  const jsmntok_t *params)
 {
 	u8 *req;
-	jsmntok_t *idtok = NULL;
-	struct pubkey *id = NULL;
+	struct pubkey *id;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "?id", &idtok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt("id", json_tok_pubkey, &id),
+		   NULL))
 		return;
-	}
-
-	if (idtok) {
-		id = tal_arr(cmd, struct pubkey, 1);
-		if (!json_tok_pubkey(buffer, idtok, id)) {
-			command_fail(cmd, "Invalid id");
-			return;
-		}
-	}
 
 	req = towire_gossip_getnodes_request(cmd, id);
 	subd_req(cmd, cmd->ld->gossip, req, -1, 0, json_getnodes_reply, cmd);
@@ -350,7 +258,7 @@ static void json_getroute_reply(struct subd *gossip UNUSED, const u8 *reply, con
 	fromwire_gossip_getroute_reply(reply, reply, &hops);
 
 	if (tal_count(hops) == 0) {
-		command_fail(cmd, "Could not find a route");
+		command_fail(cmd, LIGHTNINGD, "Could not find a route");
 		return;
 	}
 
@@ -364,81 +272,37 @@ static void json_getroute_reply(struct subd *gossip UNUSED, const u8 *reply, con
 static void json_getroute(struct command *cmd, const char *buffer, const jsmntok_t *params)
 {
 	struct lightningd *ld = cmd->ld;
-	struct pubkey source = ld->id, destination;
-	jsmntok_t *idtok, *msatoshitok, *riskfactortok, *cltvtok, *fromidtok;
-	jsmntok_t *fuzztok;
-	jsmntok_t *seedtok;
-	u64 msatoshi;
-	unsigned cltv = 9;
-	double riskfactor;
+	struct pubkey *destination;
+	struct pubkey *source;
+	const jsmntok_t *seedtok;
+	u64 *msatoshi;
+	unsigned *cltv;
+	double *riskfactor;
 	/* Higher fuzz means that some high-fee paths can be discounted
 	 * for an even larger value, increasing the scope for route
 	 * randomization (the higher-fee paths become more likely to
 	 * be selected) at the cost of increasing the probability of
 	 * selecting the higher-fee paths. */
-	double fuzz = 75.0;
+	double *fuzz;
 	struct siphash_seed seed;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "id", &idtok,
-			     "msatoshi", &msatoshitok,
-			     "riskfactor", &riskfactortok,
-			     "?cltv", &cltvtok,
-			     "?fromid", &fromidtok,
-			     "?fuzzpercent", &fuzztok,
-			     "?seed", &seedtok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_req("id", json_tok_pubkey, &destination),
+		   p_req("msatoshi", json_tok_u64, &msatoshi),
+		   p_req("riskfactor", json_tok_double, &riskfactor),
+		   p_opt_def("cltv", json_tok_number, &cltv, 9),
+		   p_opt_def("fromid", json_tok_pubkey, &source, ld->id),
+		   p_opt("seed", json_tok_tok, &seedtok),
+		   p_opt_def("fuzzpercent", json_tok_percent, &fuzz, 75.0),
+		   NULL))
 		return;
-	}
 
-	if (!json_tok_pubkey(buffer, idtok, &destination)) {
-		command_fail(cmd, "Invalid id");
-		return;
-	}
-
-	if (cltvtok && !json_tok_number(buffer, cltvtok, &cltv)) {
-		command_fail(cmd, "Invalid cltv");
-		return;
-	}
-
-	if (!json_tok_u64(buffer, msatoshitok, &msatoshi)) {
-		command_fail(cmd, "'%.*s' is not a valid number",
-			     msatoshitok->end - msatoshitok->start,
-			     buffer + msatoshitok->start);
-		return;
-	}
-
-	if (!json_tok_double(buffer, riskfactortok, &riskfactor)) {
-		command_fail(cmd, "'%.*s' is not a valid double",
-			     riskfactortok->end - riskfactortok->start,
-			     buffer + riskfactortok->start);
-		return;
-	}
-
-	if (fromidtok && !json_tok_pubkey(buffer, fromidtok, &source)) {
-		command_fail(cmd, "Invalid from id");
-		return;
-	}
-
-	if (fuzztok &&
-	    !json_tok_double(buffer, fuzztok, &fuzz)) {
-		command_fail(cmd, "'%.*s' is not a valid double",
-			     fuzztok->end - fuzztok->start,
-			     buffer + fuzztok->start);
-		return;
-	}
-	if (!(0.0 <= fuzz && fuzz <= 100.0)) {
-		command_fail(cmd,
-			     "fuzz must be in range 0.0 <= %f <= 100.0",
-			     fuzz);
-		return;
-	}
 	/* Convert from percentage */
-	fuzz = fuzz / 100.0;
+	*fuzz = *fuzz / 100.0;
 
 	if (seedtok) {
 		if (seedtok->end - seedtok->start > sizeof(seed))
-			command_fail(cmd,
+			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				     "seed must be < %zu bytes", sizeof(seed));
 
 		memset(&seed, 0, sizeof(seed));
@@ -447,7 +311,9 @@ static void json_getroute(struct command *cmd, const char *buffer, const jsmntok
 	} else
 		randombytes_buf(&seed, sizeof(seed));
 
-	u8 *req = towire_gossip_getroute_request(cmd, &source, &destination, msatoshi, riskfactor*1000, cltv, &fuzz, &seed);
+	u8 *req = towire_gossip_getroute_request(cmd, source, destination,
+						 *msatoshi, *riskfactor * 1000,
+						 *cltv, fuzz, &seed);
 	subd_req(ld->gossip, ld->gossip, req, -1, 0, json_getroute_reply, cmd);
 	command_still_pending(cmd);
 }
@@ -471,7 +337,7 @@ static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 	struct json_result *response = new_json_result(cmd);
 
 	if (!fromwire_gossip_getchannels_reply(reply, reply, &entries)) {
-		command_fail(cmd, "Invalid reply from gossipd");
+		command_fail(cmd, LIGHTNINGD, "Invalid reply from gossipd");
 		return;
 	}
 
@@ -489,7 +355,8 @@ static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 		json_add_u64(response, "satoshis", entries[i].satoshis);
 		json_add_num(response, "flags", entries[i].flags);
 		json_add_bool(response, "active",
-			      !(entries[i].flags & ROUTING_FLAGS_DISABLED));
+			      !(entries[i].flags & ROUTING_FLAGS_DISABLED)
+			      && !entries[i].local_disabled);
 		json_add_num(response, "last_update",
 			     entries[i].last_update_timestamp);
 		json_add_num(response, "base_fee_millisatoshi",
@@ -508,22 +375,11 @@ static void json_listchannels(struct command *cmd, const char *buffer,
 			     const jsmntok_t *params)
 {
 	u8 *req;
-	jsmntok_t *idtok;
-	struct short_channel_id *id = NULL;
-
-	if (!json_get_params(cmd, buffer, params,
-			     "?short_channel_id", &idtok,
-			     NULL)) {
+	struct short_channel_id *id;
+	if (!param(cmd, buffer, params,
+		   p_opt("short_channel_id", json_tok_short_channel_id, &id),
+		   NULL))
 		return;
-	}
-
-	if (idtok) {
-		id = tal_arr(cmd, struct short_channel_id, 1);
-		if (!json_tok_short_channel_id(buffer, idtok, id)) {
-			command_fail(cmd, "Invalid short_channel_id");
-			return;
-		}
-	}
 
 	req = towire_gossip_getchannels_request(cmd, id);
 	subd_req(cmd->ld->gossip, cmd->ld->gossip,
@@ -537,3 +393,212 @@ static const struct json_command listchannels_command = {
 	"Show channel {short_channel_id} (or all known channels, if no {short_channel_id})"
 };
 AUTODATA(json_command, &listchannels_command);
+
+#if DEVELOPER
+static void json_scids_reply(struct subd *gossip UNUSED, const u8 *reply,
+			     const int *fds UNUSED, struct command *cmd)
+{
+	bool ok, complete;
+	struct json_result *response = new_json_result(cmd);
+
+	if (!fromwire_gossip_scids_reply(reply, &ok, &complete)) {
+		command_fail(cmd, LIGHTNINGD,
+			     "Gossip gave bad gossip_scids_reply");
+		return;
+	}
+
+	if (!ok) {
+		command_fail(cmd, LIGHTNINGD,
+			     "Gossip refused to query peer");
+		return;
+	}
+
+	json_object_start(response, NULL);
+	json_add_bool(response, "complete", complete);
+	json_object_end(response);
+	command_success(cmd, response);
+}
+
+static void json_dev_query_scids(struct command *cmd,
+				 const char *buffer, const jsmntok_t *params)
+{
+	u8 *msg;
+	const jsmntok_t *scidstok;
+	const jsmntok_t *t, *end;
+	struct pubkey *id;
+	struct short_channel_id *scids;
+	size_t i;
+
+	if (!param(cmd, buffer, params,
+		   p_req("id", json_tok_pubkey, &id),
+		   p_req("scids", json_tok_array, &scidstok),
+		   NULL))
+		return;
+
+	scids = tal_arr(cmd, struct short_channel_id, scidstok->size);
+	end = json_next(scidstok);
+	for (i = 0, t = scidstok + 1; t < end; t = json_next(t), i++) {
+		if (!json_to_short_channel_id(buffer, t, &scids[i])) {
+			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				     "scid %zu '%.*s' is not an scid",
+				     i, t->end - t->start,
+				     buffer + t->start);
+			return;
+		}
+	}
+
+	/* Tell gossipd, since this is a gossip query. */
+	msg = towire_gossip_query_scids(cmd, id, scids);
+	subd_req(cmd->ld->gossip, cmd->ld->gossip,
+		 take(msg), -1, 0, json_scids_reply, cmd);
+	command_still_pending(cmd);
+}
+
+static const struct json_command dev_query_scids_command = {
+	"dev-query-scids",
+	json_dev_query_scids,
+	"Query peer {id} for [scids]"
+};
+AUTODATA(json_command, &dev_query_scids_command);
+
+static void json_dev_send_timestamp_filter(struct command *cmd,
+					   const char *buffer,
+					   const jsmntok_t *params)
+{
+	u8 *msg;
+	struct pubkey *id;
+	u32 *first, *range;
+
+	if (!param(cmd, buffer, params,
+		   p_req("id", json_tok_pubkey, &id),
+		   p_req("first", json_tok_number, &first),
+		   p_req("range", json_tok_number, &range),
+		   NULL))
+		return;
+
+	log_debug(cmd->ld->log, "Setting timestamp range %u+%u", *first, *range);
+	/* Tell gossipd, since this is a gossip query. */
+	msg = towire_gossip_send_timestamp_filter(NULL, id, *first, *range);
+	subd_send_msg(cmd->ld->gossip, take(msg));
+
+	command_success(cmd, null_response(cmd));
+}
+
+static const struct json_command dev_send_timestamp_filter = {
+	"dev-send-timestamp-filter",
+	json_dev_send_timestamp_filter,
+	"Send peer {id} the timestamp filter {first} {range}"
+};
+AUTODATA(json_command, &dev_send_timestamp_filter);
+
+static void json_channel_range_reply(struct subd *gossip UNUSED, const u8 *reply,
+				     const int *fds UNUSED, struct command *cmd)
+{
+	struct json_result *response = new_json_result(cmd);
+	u32 final_first_block, final_num_blocks;
+	bool final_complete;
+	struct short_channel_id *scids;
+
+	if (!fromwire_gossip_query_channel_range_reply(tmpctx, reply,
+						       &final_first_block,
+						       &final_num_blocks,
+						       &final_complete,
+						       &scids)) {
+		command_fail(cmd, LIGHTNINGD,
+			     "Gossip gave bad gossip_query_channel_range_reply");
+		return;
+	}
+
+	if (final_num_blocks == 0 && final_num_blocks == 0 && !final_complete) {
+		command_fail(cmd, LIGHTNINGD,
+			     "Gossip refused to query peer");
+		return;
+	}
+
+	json_object_start(response, NULL);
+	/* As this is a dev interface, we don't bother saving and
+	 * returning all the replies, just the final one. */
+	json_add_num(response, "final_first_block", final_first_block);
+	json_add_num(response, "final_num_blocks", final_num_blocks);
+	json_add_bool(response, "final_complete", final_complete);
+	json_array_start(response, "short_channel_ids");
+	for (size_t i = 0; i < tal_count(scids); i++)
+		json_add_short_channel_id(response, NULL, &scids[i]);
+	json_array_end(response);
+	json_object_end(response);
+	command_success(cmd, response);
+}
+
+static void json_dev_query_channel_range(struct command *cmd,
+					 const char *buffer,
+					 const jsmntok_t *params)
+{
+	u8 *msg;
+	struct pubkey *id;
+	u32 *first, *num;
+
+	if (!param(cmd, buffer, params,
+		   p_req("id", json_tok_pubkey, &id),
+		   p_req("first", json_tok_number, &first),
+		   p_req("num", json_tok_number, &num),
+		   NULL))
+		return;
+
+	/* Tell gossipd, since this is a gossip query. */
+	msg = towire_gossip_query_channel_range(cmd, id, *first, *num);
+	subd_req(cmd->ld->gossip, cmd->ld->gossip,
+		 take(msg), -1, 0, json_channel_range_reply, cmd);
+	command_still_pending(cmd);
+}
+
+static const struct json_command dev_query_channel_range_command = {
+	"dev-query-channel-range",
+	json_dev_query_channel_range,
+	"Query peer {id} for short_channel_ids for {first} block + {num} blocks"
+};
+AUTODATA(json_command, &dev_query_channel_range_command);
+
+static void json_dev_set_max_scids_encode_size(struct command *cmd,
+					       const char *buffer,
+					       const jsmntok_t *params)
+{
+	u8 *msg;
+	u32 *max;
+
+	if (!param(cmd, buffer, params,
+		   p_req("max", json_tok_number, &max),
+		   NULL))
+		return;
+
+	msg = towire_gossip_dev_set_max_scids_encode_size(NULL, *max);
+	subd_send_msg(cmd->ld->gossip, take(msg));
+
+	command_success(cmd, null_response(cmd));
+}
+
+static const struct json_command dev_set_max_scids_encode_size = {
+	"dev-set-max-scids-encode-size",
+	json_dev_set_max_scids_encode_size,
+	"Set {max} bytes of short_channel_ids per reply_channel_range"
+};
+AUTODATA(json_command, &dev_set_max_scids_encode_size);
+
+static void json_dev_suppress_gossip(struct command *cmd,
+				     const char *buffer,
+				     const jsmntok_t *params)
+{
+	if (!param(cmd, buffer, params, NULL))
+		return;
+
+	subd_send_msg(cmd->ld->gossip, take(towire_gossip_dev_suppress(NULL)));
+
+	command_success(cmd, null_response(cmd));
+}
+
+static const struct json_command dev_suppress_gossip = {
+	"dev-suppress-gossip",
+	json_dev_suppress_gossip,
+	"Stop this node from sending any more gossip."
+};
+AUTODATA(json_command, &dev_suppress_gossip);
+#endif /* DEVELOPER */

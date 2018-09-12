@@ -43,7 +43,7 @@ bool json_tok_streq(const char *buffer, const jsmntok_t *tok, const char *str)
 	return strncmp(buffer + tok->start, str, tok->end - tok->start) == 0;
 }
 
-bool json_tok_u64(const char *buffer, const jsmntok_t *tok,
+bool json_to_u64(const char *buffer, const jsmntok_t *tok,
 		  uint64_t *num)
 {
 	char *end;
@@ -66,7 +66,7 @@ bool json_tok_u64(const char *buffer, const jsmntok_t *tok,
 	return true;
 }
 
-bool json_tok_double(const char *buffer, const jsmntok_t *tok, double *num)
+bool json_to_double(const char *buffer, const jsmntok_t *tok, double *num)
 {
 	char *end;
 
@@ -76,12 +76,12 @@ bool json_tok_double(const char *buffer, const jsmntok_t *tok, double *num)
 	return true;
 }
 
-bool json_tok_number(const char *buffer, const jsmntok_t *tok,
-		     unsigned int *num)
+bool json_to_number(const char *buffer, const jsmntok_t *tok,
+		    unsigned int *num)
 {
 	uint64_t u64;
 
-	if (!json_tok_u64(buffer, tok, &u64))
+	if (!json_to_u64(buffer, tok, &u64))
 		return false;
 	*num = u64;
 
@@ -119,28 +119,22 @@ bool json_tok_bitcoin_amount(const char *buffer, const jsmntok_t *tok,
 	return true;
 }
 
+bool json_tok_is_num(const char *buffer, const jsmntok_t *tok)
+{
+	if (tok->type != JSMN_PRIMITIVE)
+		return false;
+
+	for (int i = tok->start; i < tok->end; i++)
+		if (!cisdigit(buffer[i]))
+			return false;
+	return true;
+}
+
 bool json_tok_is_null(const char *buffer, const jsmntok_t *tok)
 {
 	if (tok->type != JSMN_PRIMITIVE)
 		return false;
 	return buffer[tok->start] == 'n';
-}
-
-bool json_tok_bool(const char *buffer, const jsmntok_t *tok, bool *b)
-{
-	if (tok->type != JSMN_PRIMITIVE)
-		return false;
-	if (tok->end - tok->start == strlen("true")
-	    && memcmp(buffer + tok->start, "true", strlen("true")) == 0) {
-		*b = true;
-		return true;
-	}
-	if (tok->end - tok->start == strlen("false")
-	    && memcmp(buffer + tok->start, "false", strlen("false")) == 0) {
-		*b = false;
-		return true;
-	}
-	return false;
 }
 
 const jsmntok_t *json_next(const jsmntok_t *tok)
@@ -395,6 +389,13 @@ void json_add_hex(struct json_result *result, const char *fieldname,
 	hex_encode(data, len, hex, hex_str_size(len));
 	json_add_string(result, fieldname, hex);
 	tal_free(hex);
+}
+
+void json_add_hex_talarr(struct json_result *result,
+			 const char *fieldname,
+			 const tal_t *data)
+{
+	json_add_hex(result, fieldname, data, tal_bytelen(data));
 }
 
 void json_add_object(struct json_result *result, ...)

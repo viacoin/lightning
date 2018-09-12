@@ -7,7 +7,6 @@
 #include <common/status.h>
 #include <common/utils.h>
 #include <common/version.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,8 +14,9 @@
 #include <unistd.h>
 #include <wally_core.h>
 
+struct backtrace_state *backtrace_state;
+
 #if BACKTRACE_SUPPORTED
-static struct backtrace_state *backtrace_state;
 static void (*bt_print)(const char *fmt, ...) PRINTF_FMT(1,2);
 static void (*bt_exit)(void);
 
@@ -32,12 +32,12 @@ static int backtrace_status(void *unused UNUSED, uintptr_t pc,
 static void crashdump(int sig)
 {
 	/* We do stderr first, since it's most reliable. */
-	warnx("Fatal signal %d", sig);
+	warnx("Fatal signal %d (version %s)", sig, version());
 	if (backtrace_state)
 		backtrace_print(backtrace_state, 0, stderr);
 
 	/* Now send to parent. */
-	bt_print("FATAL SIGNAL %d", sig);
+	bt_print("FATAL SIGNAL %d (version %s)", sig, version());
 	if (backtrace_state)
 		backtrace_full(backtrace_state, 0, backtrace_status, NULL, NULL);
 
@@ -65,7 +65,7 @@ static void crashlog_activate(void)
 }
 #endif
 
-static int daemon_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+int daemon_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
 	const char *t;
 

@@ -5,6 +5,7 @@ BITCOIN_SRC :=					\
 	bitcoin/block.c				\
 	bitcoin/chainparams.c			\
 	bitcoin/locktime.c			\
+	bitcoin/privkey.c			\
 	bitcoin/pubkey.c			\
 	bitcoin/pullpush.c			\
 	bitcoin/script.c			\
@@ -20,6 +21,7 @@ BITCOIN_HEADERS := bitcoin/address.h		\
 	bitcoin/base58.h			\
 	bitcoin/block.h				\
 	bitcoin/chainparams.h			\
+	bitcoin/feerate.h			\
 	bitcoin/locktime.h			\
 	bitcoin/preimage.h			\
 	bitcoin/privkey.h			\

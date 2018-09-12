@@ -24,8 +24,7 @@
 /* Tal wrappers for opt. */
 static void *opt_allocfn(size_t size)
 {
-	return tal_alloc_(NULL, size, false, false,
-			  TAL_LABEL("opt_allocfn", ""));
+	return tal_arr_label(NULL, char, size, TAL_LABEL("opt_allocfn", ""));
 }
 
 static void *tal_reallocfn(void *ptr, size_t size)
@@ -103,6 +102,8 @@ static void human_help(const char *buffer, const jsmntok_t *result) {
 		/* advance to next command */
 		curr++;
 	}
+
+	printf("---\nrun `lightning-cli help <command>` for more information on a specific command\n");
 }
 
 enum format {
@@ -144,6 +145,9 @@ static char *opt_set_ordered(enum input *input)
 static bool is_literal(const char *arg)
 {
 	size_t arglen = strlen(arg);
+	if (arglen == 0) {
+		return false;
+	}
 	return strspn(arg, "0123456789") == arglen
 		|| streq(arg, "true")
 		|| streq(arg, "false")
@@ -164,6 +168,12 @@ static void add_input(char **cmd, const char *input,
 		tal_append_fmt(cmd, "\"%s\"", input);
 	if (i != argc - 1)
 		tal_append_fmt(cmd, ", ");
+}
+
+static void
+exec_man (const char *page) {
+	execlp("man", "man", page, (char *)NULL);
+	err(1, "Running man command");
 }
 
 int main(int argc, char *argv[])
@@ -219,6 +229,14 @@ int main(int argc, char *argv[])
 			format = HUMAN;
 		else
 			format = JSON;
+	}
+
+	/* Launch a manpage if we have a help command with an argument. We do
+	 * not need to have lightningd running in this case. */
+	if (streq(method, "help") && format == HUMAN && argc >= 3) {
+		char command[strlen(argv[2]) + sizeof("lightning-")];
+		snprintf(command, sizeof(command), "lightning-%s", argv[2]);
+		exec_man(command);
 	}
 
 	if (chdir(lightning_dir) != 0)

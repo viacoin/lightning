@@ -16,8 +16,10 @@
 #include <lightningd/hsm_control.h>
 #include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/param.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
 #include <wally_bip32.h>
@@ -70,7 +72,8 @@ static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind UNUSED,
 		json_object_end(response);
 		command_success(cmd, response);
 	} else {
-		command_fail(cmd, "Error broadcasting transaction: %s", output);
+		command_fail(cmd, LIGHTNINGD,
+			     "Error broadcasting transaction: %s", output);
 	}
 }
 
@@ -84,22 +87,29 @@ static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind UNUSED,
 static void json_withdraw(struct command *cmd,
 			  const char *buffer, const jsmntok_t *params)
 {
-	jsmntok_t *desttok, *sattok;
+	const jsmntok_t *desttok, *sattok;
 	struct withdrawal *withdraw = tal(cmd, struct withdrawal);
-
-	u32 feerate_per_kw = get_feerate(cmd->ld->topology, FEERATE_NORMAL);
+	u32 *feerate_per_kw;
 	struct bitcoin_tx *tx;
-
 	enum address_parse_result addr_parse;
 
 	withdraw->cmd = cmd;
 	wtx_init(cmd, &withdraw->wtx);
-	if (!json_get_params(withdraw->cmd, buffer, params,
-			     "destination", &desttok,
-			     "satoshi", &sattok, NULL))
+
+	if (!param(cmd, buffer, params,
+		   p_req("destination", json_tok_tok, &desttok),
+		   p_req("satoshi", json_tok_tok, &sattok),
+		   p_opt("feerate", json_tok_feerate, &feerate_per_kw),
+		   NULL))
 		return;
-	if (!json_tok_wtx(&withdraw->wtx, buffer, sattok))
+
+	if (!json_tok_wtx(&withdraw->wtx, buffer, sattok, -1ULL))
 		return;
+
+	if (!feerate_per_kw) {
+		if (!json_feerate_estimate(cmd, &feerate_per_kw, FEERATE_NORMAL))
+			return;
+	}
 
 	/* Parse address. */
 	addr_parse = json_tok_address_scriptpubkey(cmd,
@@ -109,20 +119,20 @@ static void json_withdraw(struct command *cmd,
 
 	/* Check that destination address could be understood. */
 	if (addr_parse == ADDRESS_PARSE_UNRECOGNIZED) {
-		command_fail(cmd, "Could not parse destination address");
+		command_fail(cmd, LIGHTNINGD, "Could not parse destination address");
 		return;
 	}
 
 	/* Check address given is compatible with the chain we are on. */
 	if (addr_parse == ADDRESS_PARSE_WRONG_NETWORK) {
-		command_fail(cmd,
+		command_fail(cmd, LIGHTNINGD,
 			     "Destination address is not on network %s",
 			     get_chainparams(cmd->ld)->network_name);
 		return;
 	}
 
-	if (!wtx_select_utxos(&withdraw->wtx, feerate_per_kw,
-			      tal_len(withdraw->destination)))
+	if (!wtx_select_utxos(&withdraw->wtx, *feerate_per_kw,
+			      tal_count(withdraw->destination)))
 		return;
 
 	u8 *msg = towire_hsm_sign_withdrawal(cmd,
@@ -136,7 +146,7 @@ static void json_withdraw(struct command *cmd,
 		fatal("Could not write sign_withdrawal to HSM: %s",
 		      strerror(errno));
 
-	msg = hsm_sync_read(cmd, cmd->ld);
+	msg = wire_sync_read(cmd, cmd->ld->hsm_fd);
 
 	if (!fromwire_hsm_sign_withdrawal_reply(msg, msg, &tx))
 		fatal("HSM gave bad sign_withdrawal_reply %s",
@@ -152,7 +162,7 @@ static void json_withdraw(struct command *cmd,
 static const struct json_command withdraw_command = {
 	"withdraw",
 	json_withdraw,
-	"Send to {destination} address {satoshi} (or 'all') amount via Bitcoin transaction",
+	"Send to {destination} address {satoshi} (or 'all') amount via Bitcoin transaction, at optional {feerate}",
 	false, "Send funds from the internal wallet to the specified address. Either specify a number of satoshis to send or 'all' to sweep all funds in the internal wallet to the address."
 };
 AUTODATA(json_command, &withdraw_command);
@@ -209,58 +219,67 @@ encode_pubkey_to_addr(const tal_t *ctx,
 	return out;
 }
 
+/* Extract a bool indicating "p2sh-segwit" or "bech32" */
+static bool json_tok_newaddr(struct command *cmd, const char *name,
+			     const char *buffer, const jsmntok_t *tok,
+			     bool **is_p2wpkh)
+{
+	*is_p2wpkh = tal(cmd, bool);
+	if (json_tok_streq(buffer, tok, "p2sh-segwit")) {
+		**is_p2wpkh = false;
+		return true;
+	}
+	if (json_tok_streq(buffer, tok, "bech32")) {
+		**is_p2wpkh = true;
+		return true;
+	}
+	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+		     "'%s' should be 'bech32' or 'p2sh-segwit', not '%.*s'",
+		     name, tok->end - tok->start, buffer + tok->start);
+	return false;
+}
+
 static void json_newaddr(struct command *cmd, const char *buffer UNUSED,
 			 const jsmntok_t *params UNUSED)
 {
 	struct json_result *response = new_json_result(cmd);
 	struct ext_key ext;
 	struct pubkey pubkey;
-	jsmntok_t *addrtype;
-	bool is_p2wpkh;
+	bool *is_p2wpkh;
 	s64 keyidx;
 	char *out;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "?addresstype", &addrtype, NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt_def("addresstype", json_tok_newaddr, &is_p2wpkh, true),
+		   NULL))
 		return;
-	}
-
-	if (!addrtype || json_tok_streq(buffer, addrtype, "p2sh-segwit"))
-		is_p2wpkh = false;
-	else if (json_tok_streq(buffer, addrtype, "bech32"))
-		is_p2wpkh = true;
-	else {
-		command_fail(cmd,
-			     "Invalid address type "
-			     "(expected bech32 or p2sh-segwit)");
-		return;
-	}
 
 	keyidx = wallet_get_newindex(cmd->ld);
 	if (keyidx < 0) {
-		command_fail(cmd, "Keys exhausted ");
+		command_fail(cmd, LIGHTNINGD, "Keys exhausted ");
 		return;
 	}
 
 	if (bip32_key_from_parent(cmd->ld->wallet->bip32_base, keyidx,
 				  BIP32_FLAG_KEY_PUBLIC, &ext) != WALLY_OK) {
-		command_fail(cmd, "Keys generation failure");
+		command_fail(cmd, LIGHTNINGD, "Keys generation failure");
 		return;
 	}
 
 	if (!secp256k1_ec_pubkey_parse(secp256k1_ctx, &pubkey.pubkey,
 				       ext.pub_key, sizeof(ext.pub_key))) {
-		command_fail(cmd, "Key parsing failure");
+		command_fail(cmd, LIGHTNINGD, "Key parsing failure");
 		return;
 	}
 
 	txfilter_add_derkey(cmd->ld->owned_txfilter, ext.pub_key);
 
 	out = encode_pubkey_to_addr(cmd, cmd->ld,
-				    &pubkey, !is_p2wpkh,
+				    &pubkey, !*is_p2wpkh,
 				    NULL);
 	if (!out) {
-		command_fail(cmd, "p2wpkh address encoding failure.");
+		command_fail(cmd, LIGHTNINGD,
+			     "p2wpkh address encoding failure.");
 		return;
 	}
 
@@ -273,7 +292,7 @@ static void json_newaddr(struct command *cmd, const char *buffer UNUSED,
 static const struct json_command newaddr_command = {
 	"newaddr",
 	json_newaddr,
-	"Get a new {bech32, p2sh-segwit} address to fund a channel", false,
+	"Get a new {bech32, p2sh-segwit} address to fund a channel (default is bech32)", false,
 	"Generates a new address that belongs to the internal wallet. Funds sent to these addresses will be managed by lightningd. Use `withdraw` to withdraw funds to an external wallet."
 };
 AUTODATA(json_command, &newaddr_command);
@@ -284,22 +303,19 @@ static void json_listaddrs(struct command *cmd,
 	struct json_result *response = new_json_result(cmd);
 	struct ext_key ext;
 	struct pubkey pubkey;
-	jsmntok_t *bip32tok;
-	u64 bip32_max_index;
+	u64 *bip32_max_index;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "?bip32_max_index", &bip32tok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt_def("bip32_max_index", json_tok_u64, &bip32_max_index,
+				 db_get_intvar(cmd->ld->wallet->db,
+				 "bip32_max_index", 0)),
+		   NULL))
 		return;
-	}
 
-	if (!bip32tok || !json_tok_u64(buffer, bip32tok, &bip32_max_index)) {
-		bip32_max_index = db_get_intvar(cmd->ld->wallet->db, "bip32_max_index", 0);
-	}
 	json_object_start(response, NULL);
 	json_array_start(response, "addresses");
 
-	for (s64 keyidx = 0; keyidx <= bip32_max_index; keyidx++) {
+	for (s64 keyidx = 0; keyidx <= *bip32_max_index; keyidx++) {
 
 		if(keyidx == BIP32_INITIAL_HARDENED_CHILD){
 			break;
@@ -307,13 +323,14 @@ static void json_listaddrs(struct command *cmd,
 
 		if (bip32_key_from_parent(cmd->ld->wallet->bip32_base, keyidx,
 					  BIP32_FLAG_KEY_PUBLIC, &ext) != WALLY_OK) {
-			command_fail(cmd, "Keys generation failure");
+			command_fail(cmd, LIGHTNINGD,
+				     "Keys generation failure");
 			return;
 		}
 
 		if (!secp256k1_ec_pubkey_parse(secp256k1_ctx, &pubkey.pubkey,
 					       ext.pub_key, sizeof(ext.pub_key))) {
-			command_fail(cmd, "Key parsing failure");
+			command_fail(cmd, LIGHTNINGD, "Key parsing failure");
 			return;
 		}
 
@@ -331,7 +348,8 @@ static void json_listaddrs(struct command *cmd,
 							 false,
 							 &redeemscript_p2wpkh);
 		if (!out_p2wpkh) {
-			command_fail(cmd, "p2wpkh address encoding failure.");
+			command_fail(cmd, LIGHTNINGD,
+				     "p2wpkh address encoding failure.");
 			return;
 		}
 
@@ -340,11 +358,11 @@ static void json_listaddrs(struct command *cmd,
 		json_add_u64(response, "keyidx", keyidx);
 		json_add_pubkey(response, "pubkey", &pubkey);
 		json_add_string(response, "p2sh", out_p2sh);
-		json_add_hex(response, "p2sh_redeemscript",
-			     redeemscript_p2sh, tal_count(redeemscript_p2sh));
+		json_add_hex_talarr(response, "p2sh_redeemscript",
+				    redeemscript_p2sh);
 		json_add_string(response, "bech32", out_p2wpkh);
-		json_add_hex(response, "bech32_redeemscript",
-			     redeemscript_p2wpkh, tal_count(redeemscript_p2wpkh));
+		json_add_hex_talarr(response, "bech32_redeemscript",
+				    redeemscript_p2wpkh);
 		json_object_end(response);
 	}
 	json_array_end(response);
@@ -387,7 +405,8 @@ static void json_listfunds(struct command *cmd, const char *buffer UNUSED,
 						    utxos[i]->is_p2sh,
 						    NULL);
 			if (!out) {
-				command_fail(cmd, "p2wpkh address encoding failure.");
+				command_fail(cmd, LIGHTNINGD,
+					     "p2wpkh address encoding failure.");
 				return;
 			}
 		        json_add_string(response, "address", out);

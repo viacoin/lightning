@@ -70,6 +70,9 @@ struct channel {
 	u64 msatoshi_to_us_min;
 	u64 msatoshi_to_us_max;
 
+	/* Timer we use in case they don't add an HTLC in a timely manner. */
+	struct oneshot *htlc_timeout;
+
 	/* Last tx they gave us. */
 	struct bitcoin_tx *last_tx;
 	secp256k1_ecdsa_signature last_sig;
@@ -78,8 +81,11 @@ struct channel {
 	/* Keys for channel */
 	struct channel_info channel_info;
 
-	/* Secret seed (FIXME: Move to hsm!) */
-	struct privkey seed;
+	/* Our local basepoints */
+	struct basepoints local_basepoints;
+
+	/* Our funding tx pubkey. */
+	struct pubkey local_funding_pubkey;
 
 	/* Their scriptpubkey if they sent shutdown. */
 	u8 *remote_shutdown_scriptpubkey;
@@ -92,13 +98,17 @@ struct channel {
 
 	/* Blockheight at creation, scans for funding confirmations
 	 * will start here */
-	u64 first_blocknum;
+	u32 first_blocknum;
 
 	/* Feerate range */
 	u32 min_possible_feerate, max_possible_feerate;
 
 	/* Does gossipd need to know if the owner dies? (ie. not onchaind) */
 	bool connected;
+
+	/* Do we have an "impossible" future per_commitment_point from
+	 * peer via option_data_loss_protect? */
+	const struct pubkey *future_per_commitment_point;
 };
 
 struct channel *new_channel(struct peer *peer, u64 dbid,
@@ -140,14 +150,18 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    u32 first_blocknum,
 			    u32 min_possible_feerate,
 			    u32 max_possible_feerate,
-			    bool connected);
+			    bool connected,
+			    const struct basepoints *local_basepoints,
+			    const struct pubkey *local_funding_pubkey,
+			    const struct pubkey *future_per_commitment_point);
 
 void delete_channel(struct channel *channel);
 
 const char *channel_state_name(const struct channel *channel);
 const char *channel_state_str(enum channel_state state);
 
-void channel_set_owner(struct channel *channel, struct subd *owner);
+void channel_set_owner(struct channel *channel, struct subd *owner,
+		       bool reconnect);
 
 /* Channel has failed, but can try again. */
 PRINTF_FMT(2,3) void channel_fail_transient(struct channel *channel,
@@ -203,9 +217,11 @@ static inline bool channel_active(const struct channel *channel)
 		&& !channel_on_chain(channel);
 }
 
-void derive_channel_seed(struct lightningd *ld, struct privkey *seed,
-			 const struct pubkey *peer_id,
-			 const u64 dbid);
+void get_channel_basepoints(struct lightningd *ld,
+			    const struct pubkey *peer_id,
+			    const u64 dbid,
+			    struct basepoints *local_basepoints,
+			    struct pubkey *local_funding_pubkey);
 
 void channel_set_billboard(struct channel *channel, bool perm,
 			   const char *str TAKES);

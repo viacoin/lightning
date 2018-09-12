@@ -145,8 +145,8 @@ static void bcli_failure(struct bitcoind *bitcoind,
 
 	bitcoind->error_count++;
 
-	/* Retry in 1 second */
-	new_reltimer(&bitcoind->ld->timers, bcli, time_from_sec(1),
+	/* Retry in 1 second (not a leak!) */
+	new_reltimer(&bitcoind->ld->timers, notleak(bcli), time_from_sec(1),
 		     retry_bcli, bcli);
 }
 
@@ -170,7 +170,7 @@ static void bcli_finished(struct io_conn *conn UNUSED, struct bitcoin_cli *bcli)
 	if (!bcli->exitstatus) {
 		if (WEXITSTATUS(status) != 0) {
 			bcli_failure(bitcoind, bcli, WEXITSTATUS(status));
-			bitcoind->req_running = false;
+			bitcoind->current = NULL;
 			goto done;
 		}
 	} else
@@ -179,7 +179,7 @@ static void bcli_finished(struct io_conn *conn UNUSED, struct bitcoin_cli *bcli)
 	if (WEXITSTATUS(status) == 0)
 		bitcoind->error_count = 0;
 
-	bitcoind->req_running = false;
+	bitcoind->current = NULL;
 
 	/* Don't continue if were only here because we were freed for shutdown */
 	if (bitcoind->shutdown)
@@ -203,7 +203,7 @@ static void next_bcli(struct bitcoind *bitcoind)
 	struct bitcoin_cli *bcli;
 	struct io_conn *conn;
 
-	if (bitcoind->req_running)
+	if (bitcoind->current)
 		return;
 
 	bcli = list_pop(&bitcoind->pending, struct bitcoin_cli, list);
@@ -215,7 +215,7 @@ static void next_bcli(struct bitcoind *bitcoind)
 	if (bcli->pid < 0)
 		fatal("%s exec failed: %s", bcli->args[0], strerror(errno));
 
-	bitcoind->req_running = true;
+	bitcoind->current = bcli;
 	/* This lifetime is attached to bitcoind command fd */
 	conn = notleak(io_new_conn(bitcoind, bcli->fd, output_init, bcli));
 	io_set_finish(conn, bcli_finished, bcli);
@@ -280,7 +280,7 @@ start_bitcoin_cli(struct bitcoind *bitcoind,
 
 static bool extract_feerate(struct bitcoin_cli *bcli,
 			    const char *output, size_t output_bytes,
-			    double *feerate)
+			    u64 *feerate)
 {
 	const jsmntok_t *tokens, *feeratetok;
 	bool valid;
@@ -303,7 +303,7 @@ static bool extract_feerate(struct bitcoin_cli *bcli,
 	if (!feeratetok)
 		return false;
 
-	return json_tok_double(output, feeratetok, feerate);
+	return json_tok_bitcoin_amount(output, feeratetok, feerate);
 }
 
 struct estimatefee {
@@ -322,7 +322,7 @@ static void do_one_estimatefee(struct bitcoind *bitcoind,
 
 static bool process_estimatefee(struct bitcoin_cli *bcli)
 {
-	double feerate;
+	u64 feerate;
 	struct estimatefee *efee = bcli->cb_arg;
 
 	/* FIXME: We could trawl recent blocks for median fee... */
@@ -332,7 +332,8 @@ static bool process_estimatefee(struct bitcoin_cli *bcli)
 		efee->satoshi_per_kw[efee->i] = 0;
 	} else
 		/* Rate in satoshi per kw. */
-		efee->satoshi_per_kw[efee->i] = feerate * 100000000 / 4;
+		efee->satoshi_per_kw[efee->i]
+			= feerate_from_style(feerate, FEERATE_PER_KBYTE);
 
 	efee->i++;
 	if (efee->i == tal_count(efee->satoshi_per_kw)) {
@@ -350,7 +351,7 @@ static void do_one_estimatefee(struct bitcoind *bitcoind,
 {
 	char blockstr[STR_MAX_CHARS(u32)];
 
-	sprintf(blockstr, "%u", efee->blocks[efee->i]);
+	snprintf(blockstr, sizeof(blockstr), "%u", efee->blocks[efee->i]);
 	start_bitcoin_cli(bitcoind, NULL, process_estimatefee, false, NULL, efee,
 			  "estimatesmartfee", blockstr, efee->estmode[efee->i],
 			  NULL);
@@ -682,7 +683,7 @@ void bitcoind_getblockhash_(struct bitcoind *bitcoind,
 			    void *arg)
 {
 	char str[STR_MAX_CHARS(height)];
-	sprintf(str, "%u", height);
+	snprintf(str, sizeof(str), "%u", height);
 
 	start_bitcoin_cli(bitcoind, NULL, process_getblockhash, true, cb, arg,
 			  "getblockhash", str, NULL);
@@ -802,7 +803,7 @@ struct bitcoind *new_bitcoind(const tal_t *ctx,
 	bitcoind->datadir = NULL;
 	bitcoind->ld = ld;
 	bitcoind->log = log;
-	bitcoind->req_running = false;
+	bitcoind->current = NULL;
 	bitcoind->shutdown = false;
 	bitcoind->error_count = 0;
 	bitcoind->rpcuser = NULL;

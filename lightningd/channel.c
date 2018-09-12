@@ -2,22 +2,29 @@
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/tal/str/str.h>
 #include <common/wire_error.h>
-#include <gossipd/gen_gossip_wire.h>
+#include <connectd/gen_connect_wire.h>
+#include <errno.h>
+#include <hsmd/gen_hsm_client_wire.h>
 #include <inttypes.h>
 #include <lightningd/channel.h>
+#include <lightningd/connect_control.h>
 #include <lightningd/gen_channel_state_names.h>
+#include <lightningd/hsm_control.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/opening_control.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
+#include <wire/wire_sync.h>
 
 static bool connects_to_peer(struct subd *owner)
 {
 	return owner && owner->talks_to_peer;
 }
 
-void channel_set_owner(struct channel *channel, struct subd *owner)
+void channel_set_owner(struct channel *channel, struct subd *owner,
+		       bool reconnect)
 {
 	struct subd *old_owner = channel->owner;
 	channel->owner = owner;
@@ -25,10 +32,15 @@ void channel_set_owner(struct channel *channel, struct subd *owner)
 	if (old_owner) {
 		subd_release_channel(old_owner, channel);
 		if (channel->connected && !connects_to_peer(owner)) {
-			u8 *msg = towire_gossipctl_peer_disconnected(NULL,
+			u8 *msg = towire_connectctl_peer_disconnected(NULL,
 							     &channel->peer->id);
-			subd_send_msg(channel->peer->ld->gossip, take(msg));
-			channel->connected = false;
+			subd_send_msg(channel->peer->ld->connectd, take(msg));
+		}
+
+		if (reconnect) {
+			/* Reconnect after 1 second: prevents some spurious
+			 * reconnects during tests. */
+			delay_then_reconnect(channel, 1, &channel->peer->addr);
 		}
 	}
 	channel->connected = connects_to_peer(owner);
@@ -83,7 +95,7 @@ static void destroy_channel(struct channel *channel)
 		      htlc_state_name(hin->hstate));
 
 	/* Free any old owner still hanging around. */
-	channel_set_owner(channel, NULL);
+	channel_set_owner(channel, NULL, false);
 
 	list_del_from(&channel->peer->channels, &channel->list);
 }
@@ -94,40 +106,27 @@ void delete_channel(struct channel *channel)
 	wallet_channel_delete(channel->peer->ld->wallet, channel->dbid);
 	tal_free(channel);
 
-	/* Last one out frees the peer */
-	if (list_empty(&peer->channels) && !peer->uncommitted_channel)
-		delete_peer(peer);
+	maybe_delete_peer(peer);
 }
 
-/* FIXME: We have no business knowing this! */
-/**
- * derive_channel_seed - Generate a unique secret for this peer's channel
- *
- * @ld: the lightning daemon to get global secret from
- * @seed: where to store the generated secret
- * @peer_id: the id node_id of the remote peer
- * @dbid: channel DBID
- *
- * This method generates a unique secret from the given parameters. It
- * is important that this secret be unique for each channel, but it
- * must be reproducible for the same channel in case of
- * reconnection. We use the DB channel ID to guarantee unique secrets
- * per channel.
- */
-void derive_channel_seed(struct lightningd *ld, struct privkey *seed,
-			 const struct pubkey *peer_id,
-			 const u64 dbid)
+void get_channel_basepoints(struct lightningd *ld,
+			    const struct pubkey *peer_id,
+			    const u64 dbid,
+			    struct basepoints *local_basepoints,
+			    struct pubkey *local_funding_pubkey)
 {
-	u8 input[PUBKEY_DER_LEN + sizeof(dbid)];
-	char *info = "per-peer seed";
-	pubkey_to_der(input, peer_id);
-	memcpy(input + PUBKEY_DER_LEN, &dbid, sizeof(dbid));
+	u8 *msg;
 
 	assert(dbid != 0);
-	hkdf_sha256(seed, sizeof(*seed),
-		    input, sizeof(input),
-		    &ld->peer_seed, sizeof(ld->peer_seed),
-		    info, strlen(info));
+	msg = towire_hsm_get_channel_basepoints(NULL, peer_id, dbid);
+	if (!wire_sync_write(ld->hsm_fd, take(msg)))
+		fatal("Could not write to HSM: %s", strerror(errno));
+
+	msg = wire_sync_read(tmpctx, ld->hsm_fd);
+	if (!fromwire_hsm_get_channel_basepoints_reply(msg, local_basepoints,
+						       local_funding_pubkey))
+		fatal("HSM gave bad hsm_get_channel_basepoints_reply %s",
+		      tal_hex(msg, msg));
 }
 
 struct channel *new_channel(struct peer *peer, u64 dbid,
@@ -169,7 +168,10 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    u32 first_blocknum,
 			    u32 min_possible_feerate,
 			    u32 max_possible_feerate,
-			    bool connected)
+			    bool connected,
+			    const struct basepoints *local_basepoints,
+			    const struct pubkey *local_funding_pubkey,
+			    const struct pubkey *future_per_commitment_point)
 {
 	struct channel *channel = tal(peer->ld, struct channel);
 
@@ -177,6 +179,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->peer = peer;
 	channel->dbid = dbid;
 	channel->error = NULL;
+	channel->htlc_timeout = NULL;
 	if (their_shachain)
 		channel->their_shachain = *their_shachain;
 	else {
@@ -227,7 +230,10 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->min_possible_feerate = min_possible_feerate;
 	channel->max_possible_feerate = max_possible_feerate;
 	channel->connected = connected;
-	derive_channel_seed(peer->ld, &channel->seed, &peer->id, channel->dbid);
+	channel->local_basepoints = *local_basepoints;
+	channel->local_funding_pubkey = *local_funding_pubkey;
+	channel->future_per_commitment_point
+		= tal_steal(channel, future_per_commitment_point);
 
 	list_add_tail(&peer->channels, &channel->list);
 	tal_add_destructor(channel, destroy_channel);
@@ -306,6 +312,8 @@ void channel_set_state(struct channel *channel,
 		       enum channel_state old_state,
 		       enum channel_state state)
 {
+	bool was_active = channel_active(channel);
+
 	log_info(channel->log, "State changed from %s to %s",
 		 channel_state_name(channel), channel_state_str(state));
 	if (channel->state != old_state)
@@ -316,6 +324,11 @@ void channel_set_state(struct channel *channel,
 
 	/* TODO(cdecker) Selectively save updated fields to DB */
 	wallet_channel_save(channel->peer->ld->wallet, channel);
+
+	/* If openingd is running, it might want to know we're no longer
+	 * active */
+	if (was_active && !channel_active(channel))
+		opening_peer_no_active_channels(channel->peer);
 }
 
 void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
@@ -329,14 +342,6 @@ void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
 	why = tal_vfmt(channel, fmt, ap);
 	va_end(ap);
 
-	if (channel->scid) {
-		u8 *msg = towire_gossip_disable_channel(NULL,
-						    channel->scid,
-						    channel->peer->direction,
-						    false);
-		subd_send_msg(ld->gossip, take(msg));
-	}
-
 	log_unusual(channel->log, "Peer permanent failure in %s: %s",
 		    channel_state_name(channel), why);
 
@@ -348,9 +353,13 @@ void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
 		channel->error = towire_errorfmt(channel, &cid, "%s", why);
 	}
 
-	channel_set_owner(channel, NULL);
+	channel_set_owner(channel, NULL, false);
 	/* Drop non-cooperatively (unilateral) to chain. */
 	drop_to_chain(ld, channel, false);
+
+	if (channel_active(channel))
+		channel_set_state(channel, channel->state, AWAITING_UNILATERAL);
+
 	tal_free(why);
 }
 
@@ -411,5 +420,5 @@ void channel_fail_transient(struct channel *channel, const char *fmt, ...)
 	}
 #endif
 
-	channel_set_owner(channel, NULL);
+	channel_set_owner(channel, NULL, true);
 }

@@ -14,24 +14,10 @@ Getting Started
 It's in C, to encourage alternate implementations.  Patches are welcome!
 You should read our [Style Guide](STYLE.md).
 
-To read the code, you'll probably need to understand `ccan/tal`: it's a
-hierarchical memory allocator, where each allocation has a parent, and
-thus lifetimes are grouped.  eg. a `struct bitcoin_tx` has a pointer
-to an array of `struct bitcoin_tx_input`; they are allocated off the
-`struct bitcoind_tx`, so freeing the `struct bitcoind_tx` frees them all.
-Tal also supports destructors, which are usually used to remove things
-from lists, etc.
-
-Some routines use take(): take() marks a pointer as to be consumed
-(e.g. freed automatically before return) by a called function.
-It can safely accept NULL pointers.
-Functions whose prototype in headers has the macro TAKES can have the
-specific argument as a take() call.
-Use this sparingly, as it can be very confusing.
-
-The more complex daemons use async io (ccan/io): you register callbacks
-and they happen once I/O is available, then you return what to do next.
-This does not use threads, so the code flow is generally fairly simple.
+To read the code, you should start from
+[lightningd.c](../lightningd/lightningd.c) and hop your way through
+the '~' comments at the head of each daemon in the suggested
+order.
 
 The Components
 --------------
@@ -61,8 +47,13 @@ Here's a list of parts, with notes:
   - mockup.sh / update-mocks.sh: tools to generate mock functions for
     unit tests.
 
+* tests/ - blackbox tests (mainly)
+  - unit tests are in tests/ subdirectories in each other directory.
+
+* doc/ - you are here
+
 * devtools/ - tools for developers
-   - Currently just bolt11-cli for decoding bolt11
+   - Generally for decoding our formats.
 
 * contrib/ - python support and other stuff which doesn't belong :)
 
@@ -80,32 +71,36 @@ Here's a list of parts, with notes:
 * hsmd/ - daemon which looks after the cryptographic secret, and performs
   commitment signing.
 
-* gossipd/ - daemon to chat to peers which don't have any channels,
-  and maintains routing information and broadcasts gossip.
+* gossipd/ - daemon to maintain routing information and broadcast gossip.
 
-* openingd/ - daemon to open a channel for a single peer.
+* connectd/ - daemon to connect to other peers, and receive incoming.
+
+* openingd/ - daemon to open a channel for a single peer, and chat to
+  a peer which doesn't have any channels/
 
 * channeld/ - daemon to operate a single peer once channel is operating
   normally.
 
 * closingd/ - daemon to handle mutual closing negotiation with a single peer.
 
-* onchaind/ - daemon to hand a single channel which has had its funding
+* onchaind/ - daemon to handle a single channel which has had its funding
   transaction spent.
 
 Debugging
 ---------
 
+You can build c-lightning with DEVELOPER=1 to use dev commands listed in ``cli/lightning-cli help``. ``./configure --enable-developer`` will do that. You can log console messages with log_info() in lightningd and status_trace() in other subdaemons.
+
 You can debug crashing subdaemons with the argument
-`--dev-debugger=lightning_channeld`, where `channeld` is the subdaemon name.
-It will print out (to stderr) a command such as:
+`--dev-debugger=channeld`, where `channeld` is the subdaemon name.  It
+will run `gnome-terminal` by default with a gdb attached to the
+subdaemon when it starts.  You can change the terminal used by setting
+the `DEBUG_TERM` environment variable, such as `DEBUG_TERM="xterm -e"`
+or `DEBUG_TERM="konsole -e"`.
 
-    gdb -ex 'attach 22398' -ex 'p debugger_connected=1' \
-      lightningd/lightning_hsmd
-
-Run this command to start debugging.
-You may need to type `return` one more time to exit the infinite while
-loop, otherwise you can type `continue` to begin.
+It will also print out (to stderr) the gdb command for manual connection.  The
+subdaemon will be stopped (it sends itself a SIGSTOP); you'll need to
+`continue` in gdb.
 
 Database
 --------
@@ -160,31 +155,68 @@ lightning funds.
 
 Testing
 -------
+Install `valgrind` and the python dependencies for best results:
 
-There are three kinds of tests.  For best results, you should have
-valgrind installed, and build with DEVELOPER=1 (currently the default).
+```
+sudo apt install valgrind
+pip3 install -r tests/requirements.txt
+```
 
-* source tests - run by `make check-source`, looks for whitespace,
+Tests are run with: `make check [flags]` where the pertinent flags are:
+
+```
+DEVELOPER=[0|1] - developer mode increases test coverage
+VALGRIND=[0|1]  - detects memory leaks during test execution but adds a significant delay
+PYTEST_PAR=n    - runs pytests in parallel
+```
+
+A modern desktop can build and run through all the tests in a couple of minutes with:
+
+    make -j12 check PYTEST_PAR=24 DEVELOPER=1 VALGRIND=0
+
+Adjust `-j` and `PYTEST_PAR` accordingly for your hardware.
+
+There are three kinds of tests:
+
+* **source tests** - run by `make check-source`, looks for whitespace,
   header order, and checks formatted quotes from BOLTs if BOLTDIR
   exists (currently disabled, since BOLTs are being re-edited).
 
-* unit tests - run by `make check`, these are `run-*.c` files in test/
-  subdirectories which can test routines inside C source files.
-  You should insert `/* AUTOGENERATED MOCKS START */` and
-  `/* AUTOGENERATED MOCKS END */` lines, and `make update-mocks`
-  will automatically generate stub functions which will allow you to
-  link (which will conveniently crash if they're called).
+* **unit tests** - standalone programs that can be run individually.
+  They are `run-*.c` files in test/ subdirectories used to test routines
+  inside C source files.
 
-* blackbox tests - run by `make check` or directly as
-  `PYTHONPATH=contrib/pylightning DEVELOPER=1 python3
-  tests/test_lightningd.py -f`.
-  You can run these much faster by putting `NO_VALGRIND=1` after
-  DEVELOPER=1, or after `make check`, which has the added bonus of doing
-  memory leak detection.  You can also append `LightningDTests.TESTNAME`
-  to run a single test.
+  You should insert the lines when implementing a unit test:
+
+  `/* AUTOGENERATED MOCKS START */`
+
+  `/* AUTOGENERATED MOCKS END */`
+
+  and `make update-mocks` will automatically generate stub functions which will
+  allow you to link (and conveniently crash if they're called).
+
+* **blackbox tests** - These test setup a mini-regtest environment and test
+  lightningd as a whole.  They can be run individually:
+
+  `PYTHONPATH=contrib/pylightning py.test -v tests/`.
+
+  You can also append `-k TESTNAME` to run a single test.  Environment variables
+  `DEBUG_SUBD=<subdaemon>` and `TIMEOUT=<seconds>` can be useful for debugging
+  subdaemons on individual tests.
 
 Our Travis CI instance (see `.travis.yml`) runs all these for each
 pull request.
+
+Source code analysis
+--------------------
+An updated version of the NCC source code analysis tool is available at
+
+https://github.com/bitonic-cjp/ncc
+
+It can be used to analyze the lightningd source code by running
+`make clean && make ncc`. The output (which is built in parallel with the
+binaries) is stored in .nccout files. You can browse it, for instance, with
+a command like `nccnav lightningd/lightningd.nccout`.
 
 Subtleties
 ----------
@@ -192,9 +224,8 @@ Subtleties
 There are a few subtleties you should be aware of as you modify deeper
 parts of the code:
 
-* `structeq` will not work on some structures.
-  For example, it will not work with `struct short_channel_id` --- use
-  `short_channel_id_eq` for comparing those.
+* `ccan/structeq`'s STRUCTEQ_DEF will define safe comparison function foo_eq()
+  for struct foo, failing the build if the structure has implied padding.
 * `command_success`, `command_fail`, and `command_fail_detailed` will free the
   `cmd` you pass in.
   This also means that if you `tal`-allocated anything from the `cmd`, they

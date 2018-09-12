@@ -319,7 +319,7 @@ static void serialize_hop_data(tal_t *ctx, u8 *dst, const struct hop_data *data)
 	towire_u32(&buf, data->outgoing_cltv);
 	towire_pad(&buf, 12);
 	towire(&buf, data->hmac, SECURITY_PARAMETER);
-	memcpy(dst, buf, tal_len(buf));
+	memcpy(dst, buf, tal_count(buf));
 	tal_free(buf);
 }
 
@@ -456,7 +456,7 @@ struct route_step *process_onionpacket(
 u8 *create_onionreply(const tal_t *ctx, const struct secret *shared_secret,
 		      const u8 *failure_msg)
 {
-	size_t msglen = tal_len(failure_msg);
+	size_t msglen = tal_count(failure_msg);
 	size_t padlen = ONION_REPLY_SIZE - msglen;
 	u8 *reply = tal_arr(ctx, u8, 0), *payload = tal_arr(ctx, u8, 0);
 	u8 key[KEY_LEN];
@@ -464,7 +464,8 @@ u8 *create_onionreply(const tal_t *ctx, const struct secret *shared_secret,
 
 	/* BOLT #4:
 	 *
-	 * The node returning the message builds a return packet consisting of
+	 * The node generating the error message (_erring node_) builds a return
+	 * packet consisting of
 	 * the following fields:
 	 *
 	 * 1. data:
@@ -481,23 +482,25 @@ u8 *create_onionreply(const tal_t *ctx, const struct secret *shared_secret,
 
 	/* BOLT #4:
 	 *
-	 * The node SHOULD set `pad` such that the `failure_len` plus
-	 * `pad_len` is equal to 256.  This is 118 bytes longer than then the
-	 * longest currently-defined message.
+	 * The _erring node_:
+	 *   - SHOULD set `pad` such that the `failure_len` plus `pad_len` is
+	 *     equal to 256.
+	 *     - Note: this value is 118 bytes longer than the longest
+	 *       currently-defined message.
 	 */
-	assert(tal_len(payload) == ONION_REPLY_SIZE + 4);
+	assert(tal_count(payload) == ONION_REPLY_SIZE + 4);
 
 	/* BOLT #4:
 	 *
  	 * Where `hmac` is an HMAC authenticating the remainder of the packet,
-	 * with a key using the above key generation with key type `um`
+	 * with a key generated using the above process, with key type `um`
 	 */
 	generate_key(key, "um", 2, shared_secret->data);
 
-	compute_hmac(hmac, payload, tal_len(payload), key, KEY_LEN);
+	compute_hmac(hmac, payload, tal_count(payload), key, KEY_LEN);
 	towire(&reply, hmac, sizeof(hmac));
 
-	towire(&reply, payload, tal_len(payload));
+	towire(&reply, payload, tal_count(payload));
 	tal_free(payload);
 
 	return reply;
@@ -507,17 +510,17 @@ u8 *wrap_onionreply(const tal_t *ctx,
 		    const struct secret *shared_secret, const u8 *reply)
 {
 	u8 key[KEY_LEN];
-	size_t streamlen = tal_len(reply);
+	size_t streamlen = tal_count(reply);
 	u8 stream[streamlen];
 	u8 *result = tal_arr(ctx, u8, streamlen);
 
 	/* BOLT #4:
 	 *
-	 * The node then generates a new key, using the key type `ammag`.
+	 * The erring node then generates a new key, using the key type `ammag`.
 	 * This key is then used to generate a pseudo-random stream, which is
-	 * then applied to the packet using `XOR`.
+	 * in turn applied to the packet using `XOR`.
 	 *
-	 * The obfuscation step is repeated by every node on the return path.
+	 * The obfuscation step is repeated by every hop along the return path.
 	 */
 	generate_key(key, "ammag", 5, shared_secret->data);
 	generate_cipher_stream(stream, key, streamlen);
@@ -530,17 +533,17 @@ struct onionreply *unwrap_onionreply(const tal_t *ctx,
 				     const int numhops, const u8 *reply)
 {
 	struct onionreply *oreply = tal(tmpctx, struct onionreply);
-	u8 *msg = tal_arr(oreply, u8, tal_len(reply));
+	u8 *msg = tal_arr(oreply, u8, tal_count(reply));
 	u8 key[KEY_LEN], hmac[HMAC_SIZE];
 	const u8 *cursor;
 	size_t max;
 	u16 msglen;
 
-	if (tal_len(reply) != ONION_REPLY_SIZE + sizeof(hmac) + 4) {
+	if (tal_count(reply) != ONION_REPLY_SIZE + sizeof(hmac) + 4) {
 		return NULL;
 	}
 
-	memcpy(msg, reply, tal_len(reply));
+	memcpy(msg, reply, tal_count(reply));
 	oreply->origin_index = -1;
 
 	for (int i = 0; i < numhops; i++) {
@@ -552,7 +555,7 @@ struct onionreply *unwrap_onionreply(const tal_t *ctx,
 		 * the origin */
 		generate_key(key, "um", 2, shared_secrets[i].data);
 		compute_hmac(hmac, msg + sizeof(hmac),
-			     tal_len(msg) - sizeof(hmac), key, KEY_LEN);
+			     tal_count(msg) - sizeof(hmac), key, KEY_LEN);
 		if (memcmp(hmac, msg, sizeof(hmac)) == 0) {
 			oreply->origin_index = i;
 			break;
@@ -563,7 +566,7 @@ struct onionreply *unwrap_onionreply(const tal_t *ctx,
 	}
 
 	cursor = msg + sizeof(hmac);
-	max = tal_len(msg) - sizeof(hmac);
+	max = tal_count(msg) - sizeof(hmac);
 	msglen = fromwire_u16(&cursor, &max);
 
 	if (msglen > ONION_REPLY_SIZE) {

@@ -2,10 +2,11 @@
 #include <backtrace.h>
 #include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/htable/htable.h>
+#include <ccan/intmap/intmap.h>
+#include <common/daemon.h>
 #include <common/memleak.h>
 
 #if DEVELOPER
-static struct backtrace_state *backtrace_state;
 static const void **notleaks;
 static bool *notleak_children;
 
@@ -58,11 +59,6 @@ void *notleak_(const void *ptr, bool plus_children)
 	return cast_const(void *, ptr);
 }
 
-/* This only works if all objects have tal_len() */
-#ifndef CCAN_TAL_DEBUG
-#error CCAN_TAL_DEBUG must be set
-#endif
-
 static size_t hash_ptr(const void *elem, void *unused UNNEEDED)
 {
 	static struct siphash_seed seed;
@@ -82,8 +78,8 @@ static void children_into_htable(const void *exclude1, const void *exclude2,
 	for (i = tal_first(p); i; i = tal_next(i)) {
 		const char *name = tal_name(i);
 
-		if (p == exclude1 || p == exclude2)
-			continue;
+		if (i == exclude1 || i == exclude2)
+			return;
 
 		if (name) {
 			/* Don't add backtrace objects. */
@@ -96,8 +92,7 @@ static void children_into_htable(const void *exclude1, const void *exclude2,
 				continue;
 
 			/* ccan/io allocates pollfd array. */
-			if (streq(name,
-				  "ccan/ccan/io/poll.c:40:struct pollfd[]"))
+			if (strends(name, "struct pollfd[]") && !tal_parent(i))
 				continue;
 
 			/* Don't add tmpctx. */
@@ -123,25 +118,27 @@ struct htable *memleak_enter_allocations(const tal_t *ctx,
 	return memtable;
 }
 
-static void scan_for_pointers(struct htable *memtable, const tal_t *p)
+static void scan_for_pointers(struct htable *memtable,
+			      const tal_t *p, size_t bytelen)
 {
 	size_t i, n;
 
 	/* Search for (aligned) pointers. */
-	n = tal_len(p) / sizeof(void *);
+	n = bytelen / sizeof(void *);
 	for (i = 0; i < n; i++) {
 		void *ptr;
 
 		memcpy(&ptr, (char *)p + i * sizeof(void *), sizeof(ptr));
 		if (pointer_referenced(memtable, ptr))
-			scan_for_pointers(memtable, ptr);
+			scan_for_pointers(memtable, ptr, tal_bytelen(ptr));
 	}
 }
 
-void memleak_scan_region(struct htable *memtable, const void *ptr)
+void memleak_scan_region(struct htable *memtable,
+			 const void *ptr, size_t bytelen)
 {
 	pointer_referenced(memtable, ptr);
-	scan_for_pointers(memtable, ptr);
+	scan_for_pointers(memtable, ptr, bytelen);
 }
 
 static void remove_with_children(struct htable *memtable, const tal_t *p)
@@ -158,8 +155,8 @@ void memleak_remove_referenced(struct htable *memtable, const void *root)
 	size_t i;
 
 	/* Now delete the ones which are referenced. */
-	memleak_scan_region(memtable, root);
-	memleak_scan_region(memtable, notleaks);
+	memleak_scan_region(memtable, root, tal_bytelen(root));
+	memleak_scan_region(memtable, notleaks, tal_bytelen(notleaks));
 
 	/* Those who asked tal children to be removed, do so. */
 	for (i = 0; i < tal_count(notleaks); i++)
@@ -171,6 +168,26 @@ void memleak_remove_referenced(struct htable *memtable, const void *root)
 
 	/* Remove memtable itself */
 	pointer_referenced(memtable, memtable);
+}
+
+/* memleak can't see inside hash tables, so do them manually */
+void memleak_remove_htable(struct htable *memtable, const struct htable *ht)
+{
+	struct htable_iter i;
+	const void *p;
+
+	for (p = htable_first(ht, &i); p; p = htable_next(ht, &i))
+		memleak_scan_region(memtable, p, tal_bytelen(p));
+}
+
+/* FIXME: If uintmap used tal, this wouldn't be necessary! */
+void memleak_remove_intmap_(struct htable *memtable, const struct intmap *m)
+{
+	void *p;
+	intmap_index_t i;
+
+	for (p = intmap_first_(m, &i); p; p = intmap_after_(m, &i))
+		memleak_scan_region(memtable, p, tal_bytelen(p));
 }
 
 static bool ptr_match(const void *candidate, void *ptr)
@@ -224,8 +241,7 @@ static int append_bt(void *data, uintptr_t pc)
 static void add_backtrace(tal_t *parent UNUSED, enum tal_notify_type type UNNEEDED,
 			  void *child)
 {
-	uintptr_t *bt = tal_alloc_arr_(child, sizeof(uintptr_t), 32, true, true,
-				       "backtrace");
+	uintptr_t *bt = tal_arrz_label(child, uintptr_t, 32, "backtrace");
 
 	/* First serves as counter. */
 	bt[0] = 1;
@@ -233,15 +249,22 @@ static void add_backtrace(tal_t *parent UNUSED, enum tal_notify_type type UNNEED
 	tal_add_notifier(child, TAL_NOTIFY_ADD_CHILD, add_backtrace);
 }
 
-void memleak_init(const tal_t *root, struct backtrace_state *bstate)
+static void add_backtrace_notifiers(const tal_t *root)
+{
+	tal_add_notifier(root, TAL_NOTIFY_ADD_CHILD, add_backtrace);
+
+	for (tal_t *i = tal_first(root); i; i = tal_next(i))
+		add_backtrace_notifiers(i);
+}
+
+void memleak_init(void)
 {
 	assert(!notleaks);
-	backtrace_state = bstate;
 	notleaks = tal_arr(NULL, const void *, 0);
 	notleak_children = tal_arr(notleaks, bool, 0);
 
 	if (backtrace_state)
-		tal_add_notifier(root, TAL_NOTIFY_ADD_CHILD, add_backtrace);
+		add_backtrace_notifiers(NULL);
 }
 
 void memleak_cleanup(void)

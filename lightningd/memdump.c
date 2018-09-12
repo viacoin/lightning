@@ -1,10 +1,13 @@
 /* Only possible if we're in developer mode. */
+#include "config.h"
 #if DEVELOPER
 #include <backtrace.h>
 #include <ccan/tal/str/str.h>
+#include <common/daemon.h>
 #include <common/memleak.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <stdio.h>
@@ -13,7 +16,7 @@ static void json_add_ptr(struct json_result *response, const char *name,
 			 const void *ptr)
 {
 	char ptrstr[STR_MAX_CHARS(void *)];
-	sprintf(ptrstr, "%p", ptr);
+	snprintf(ptrstr, sizeof(ptrstr), "%p", ptr);
 	json_add_string(response, name, ptrstr);
 }
 
@@ -113,9 +116,10 @@ static void scan_mem(struct command *cmd,
 	memtable = memleak_enter_allocations(cmd, cmd, cmd->jcon);
 
 	/* First delete known false positives. */
-	chaintopology_mark_pointers_used(memtable, ld->topology);
-	htlc_inmap_mark_pointers_used(memtable, &ld->htlcs_in);
-	htlc_outmap_mark_pointers_used(memtable, &ld->htlcs_out);
+	memleak_remove_htable(memtable, &ld->topology->txwatches.raw);
+	memleak_remove_htable(memtable, &ld->topology->txowatches.raw);
+	memleak_remove_htable(memtable, &ld->htlcs_in.raw);
+	memleak_remove_htable(memtable, &ld->htlcs_out.raw);
 
 	/* Now delete ld and those which it has pointers to. */
 	memleak_remove_referenced(memtable, ld);
@@ -148,7 +152,7 @@ static void json_memleak(struct command *cmd,
 	struct json_result *response = new_json_result(cmd);
 
 	if (!getenv("LIGHTNINGD_DEV_MEMLEAK")) {
-		command_fail(cmd,
+		command_fail(cmd, LIGHTNINGD,
 			     "Leak detection needs $LIGHTNINGD_DEV_MEMLEAK");
 		return;
 	}

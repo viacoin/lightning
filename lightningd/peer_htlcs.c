@@ -1,5 +1,6 @@
 #include <bitcoin/tx.h>
 #include <ccan/build_assert/build_assert.h>
+#include <ccan/cast/cast.h>
 #include <ccan/crypto/ripemd160/ripemd160.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
@@ -7,12 +8,16 @@
 #include <common/json_escaped.h>
 #include <common/overflows.h>
 #include <common/sphinx.h>
+#include <common/timeout.h>
 #include <gossipd/gen_gossip_wire.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/htlc_end.h>
+#include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/param.h>
 #include <lightningd/pay.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
@@ -85,12 +90,13 @@ static void fail_in_htlc(struct htlc_in *hin,
 			 const u8 *failuremsg,
 			 const struct short_channel_id *out_channelid)
 {
+	struct failed_htlc failed_htlc;
 	assert(!hin->preimage);
 
 	assert(failcode || failuremsg);
 	hin->failcode = failcode;
 	if (failuremsg)
-		hin->failuremsg = tal_dup_arr(hin, u8, failuremsg, tal_len(failuremsg), 0);
+		hin->failuremsg = tal_dup_arr(hin, u8, failuremsg, tal_count(failuremsg), 0);
 
 	/* We need this set, since we send it to channeld. */
 	if (hin->failcode & UPDATE)
@@ -109,12 +115,15 @@ static void fail_in_htlc(struct htlc_in *hin,
 	if (channel_on_chain(hin->key.channel))
 		return;
 
+	failed_htlc.id = hin->key.id;
+	failed_htlc.failcode = hin->failcode;
+	failed_htlc.failreason = cast_const(u8 *, hin->failuremsg);
+	if (failed_htlc.failcode & UPDATE)
+		failed_htlc.scid = &hin->failoutchannel;
+	else
+		failed_htlc.scid = NULL;
 	subd_send_msg(hin->key.channel->owner,
-		      take(towire_channel_fail_htlc(hin,
-						    hin->key.id,
-						    hin->failuremsg,
-						    hin->failcode,
-						    &hin->failoutchannel)));
+		      take(towire_channel_fail_htlc(NULL, &failed_htlc)));
 }
 
 /* This is used for cases where we can immediately fail the HTLC. */
@@ -142,20 +151,21 @@ static void fail_out_htlc(struct htlc_out *hout, const char *localfail)
 
 /* BOLT #4:
  *
- * * `amt_to_forward` - The amount in milli-satoshi to forward to the next
- *    (outgoing) hop specified within the routing information.
+ * * `amt_to_forward`: The amount, in millisatoshis, to forward to the next
+ *   receiving peer specified within the routing information.
  *
- *    This value MUST factor in the computed fee for this particular hop. When
- *    processing an incoming Sphinx packet along with the HTLC message it's
- *    encapsulated within, if the following inequality doesn't hold, then the
- *    HTLC should be rejected as it indicates a prior node in the path has
- *    deviated from the specified parameters:
+ *   This value amount MUST include the origin node's computed _fee_ for the
+ *   receiving peer. When processing an incoming Sphinx packet and the HTLC
+ *   message that it is encapsulated within, if the following inequality
+ *   doesn't hold, then the HTLC should be rejected as it would indicate that
+ *   a prior hop has deviated from the specified parameters:
  *
- *       incoming_htlc_amt - fee >= amt_to_forward
+ *     incoming_htlc_amt - fee >= amt_to_forward
  *
- *    Where `fee` is calculated according to the receiving node's advertised fee
- *    schema as described in [BOLT 7](https://github.com/lightningnetwork/lightning-rfc/blob/master/07-routing-gossip.md#htlc-fees), or 0 if this node is the
- *    final hop.
+ *   Where `fee` is either calculated according to the receiving peer's
+ *   advertised fee schema (as described in [BOLT
+ *   #7](07-routing-gossip.md#htlc-fees)) or is 0, if the processing node is
+ *   the final node.
  */
 static bool check_amount(struct htlc_in *hin,
 			 u64 amt_to_forward, u64 amt_in_htlc, u64 fee)
@@ -170,21 +180,22 @@ static bool check_amount(struct htlc_in *hin,
 
 /* BOLT #4:
  *
- *  * `outgoing_cltv_value` - The CLTV value that the _outgoing_ HTLC carrying
+ *  * `outgoing_cltv_value`: The CLTV value that the _outgoing_ HTLC carrying
  *     the packet should have.
  *
  *        cltv_expiry - cltv_expiry_delta >= outgoing_cltv_value
  *
- *     Inclusion of this field allows a node to both authenticate the information
- *     specified by the original sender and the parameters of the HTLC forwarded,
- *	 and ensure the original sender is using the current `cltv_expiry_delta`  value.
- *     If there is no next hop, `cltv_expiry_delta` is zero.
- *     If the values don't correspond, then the HTLC should be failed+rejected as
- *     this indicates the incoming node has tampered with the intended HTLC
- *     values, or the origin has an obsolete `cltv_expiry_delta` value.
- *     The node MUST be consistent in responding to an unexpected
- *     `outgoing_cltv_value` whether it is the final hop or not, to avoid
- *     leaking that information.
+ *     Inclusion of this field allows a hop to both authenticate the
+ *     information specified by the origin node, and the parameters of the
+ *     HTLC forwarded, and ensure the origin node is using the current
+ *     `cltv_expiry_delta` value.  If there is no next hop,
+ *     `cltv_expiry_delta` is 0.  If the values don't correspond, then the
+ *     HTLC should be failed and rejected, as this indicates that either a
+ *     forwarding node has tampered with the intended HTLC values or that the
+ *     origin node has an obsolete `cltv_expiry_delta` value.  The hop MUST be
+ *     consistent in responding to an unexpected `outgoing_cltv_value`,
+ *     whether it is the final node or not, to avoid leaking its position in
+ *     the route.
  */
 static bool check_cltv(struct htlc_in *hin,
 		       u32 cltv_expiry, u32 outgoing_cltv_value, u32 delta)
@@ -223,7 +234,10 @@ static void fulfill_htlc(struct htlc_in *hin, const struct preimage *preimage)
 	if (channel_on_chain(channel)) {
 		msg = towire_onchain_known_preimage(hin, preimage);
 	} else {
-		msg = towire_channel_fulfill_htlc(hin, hin->key.id, preimage);
+		struct fulfilled_htlc fulfilled_htlc;
+		fulfilled_htlc.id = hin->key.id;
+		fulfilled_htlc.payment_preimage = *preimage;
+		msg = towire_channel_fulfill_htlc(hin, &fulfilled_htlc);
 	}
 	subd_send_msg(channel->owner, take(msg));
 }
@@ -236,17 +250,16 @@ static void handle_localpay(struct htlc_in *hin,
 {
 	enum onion_type failcode;
 	struct invoice invoice;
-	struct invoice_details details;
+	const struct invoice_details *details;
 	struct lightningd *ld = hin->key.channel->peer->ld;
 
 	/* BOLT #4:
 	 *
-	 * If the `amt_to_forward` is higher than `incoming_htlc_amt` of
-	 * the HTLC at the final hop:
-	 *
 	 * 1. type: 19 (`final_incorrect_htlc_amount`)
 	 * 2. data:
 	 *    * [`4`:`incoming_htlc_amt`]
+	 *
+	 * The amount in the HTLC doesn't match the value in the onion.
 	 */
 	if (!check_amount(hin, amt_to_forward, hin->msatoshi, 0)) {
 		failcode = WIRE_FINAL_INCORRECT_HTLC_AMOUNT;
@@ -255,12 +268,11 @@ static void handle_localpay(struct htlc_in *hin,
 
 	/* BOLT #4:
 	 *
-	 * If the `outgoing_cltv_value` does not match the `cltv_expiry` of
-	 * the HTLC at the final hop:
-	 *
 	 * 1. type: 18 (`final_incorrect_cltv_expiry`)
 	 * 2. data:
-	 *   * [`4`:`cltv_expiry`]
+	 *    * [`4`:`cltv_expiry`]
+	 *
+	 * The CLTV expiry in the HTLC doesn't match the value in the onion.
 	 */
 	if (!check_cltv(hin, cltv_expiry, outgoing_cltv_value, 0)) {
 		failcode = WIRE_FINAL_INCORRECT_CLTV_EXPIRY;
@@ -271,29 +283,35 @@ static void handle_localpay(struct htlc_in *hin,
 		failcode = WIRE_UNKNOWN_PAYMENT_HASH;
 		goto fail;
 	}
-	wallet_invoice_details(tmpctx, ld->wallet, invoice, &details);
+	details = wallet_invoice_details(tmpctx, ld->wallet, invoice);
 
 	/* BOLT #4:
 	 *
-	 * If the amount paid is less than the amount expected, the final node
-	 * MUST fail the HTLC.  If the amount paid is more than twice the
-	 * amount expected, the final node SHOULD fail the HTLC.  This allows
-	 * the sender to reduce information leakage by altering the amount,
-	 * without allowing accidental gross overpayment:
-	 *
-	 * 1. type: PERM|16 (`incorrect_payment_amount`)
+	 * An _intermediate hop_ MUST NOT, but the _final node_:
+	 *...
+	 *   - if the amount paid is less than the amount expected:
+	 *     - MUST fail the HTLC.
+	 *...
+	 *   - if the amount paid is more than twice the amount expected:
+	 *     - SHOULD fail the HTLC.
+	 *     - SHOULD return an `incorrect_payment_amount` error.
+	 *       - Note: this allows the origin node to reduce information
+	 *         leakage by altering the amount while not allowing for
+	 *         accidental gross overpayment.
 	 */
-	if (details.msatoshi != NULL && hin->msatoshi < *details.msatoshi) {
+	if (details->msatoshi != NULL && hin->msatoshi < *details->msatoshi) {
 		failcode = WIRE_INCORRECT_PAYMENT_AMOUNT;
 		goto fail;
-	} else if (details.msatoshi != NULL && hin->msatoshi > *details.msatoshi * 2) {
+	} else if (details->msatoshi != NULL && hin->msatoshi > *details->msatoshi * 2) {
 		failcode = WIRE_INCORRECT_PAYMENT_AMOUNT;
 		goto fail;
 	}
 
 	/* BOLT #4:
 	 *
-	 * If the `cltv_expiry` is too low, the final node MUST fail the HTLC:
+	 *   - if the `cltv_expiry` value is unreasonably near the present:
+	 *     - MUST fail the HTLC.
+	 *     - MUST return a `final_expiry_too_soon` error.
 	 */
 	if (get_block_height(ld->topology) + ld->config.cltv_final
 	    > cltv_expiry) {
@@ -307,10 +325,10 @@ static void handle_localpay(struct htlc_in *hin,
 	}
 
 	log_info(ld->log, "Resolving invoice '%s' with HTLC %"PRIu64,
-		 details.label->s, hin->key.id);
+		 details->label->s, hin->key.id);
 	log_debug(ld->log, "%s: Actual amount %"PRIu64"msat, HTLC expiry %u",
-		  details.label->s, hin->msatoshi, cltv_expiry);
-	fulfill_htlc(hin, &details.r);
+		  details->label->s, hin->msatoshi, cltv_expiry);
+	fulfill_htlc(hin, &details->r);
 	wallet_invoice_resolve(ld->wallet, invoice, hin->msatoshi);
 
 	return;
@@ -360,7 +378,7 @@ static void rcvd_htlc_reply(struct subd *subd, const u8 *msg, const int *fds UNU
 		if (!hout->in) {
 			char *localfail = tal_fmt(msg, "%s: %.*s",
 						  onion_type_name(failure_code),
-						  (int)tal_len(failurestr),
+						  (int)tal_count(failurestr),
 						  (const char *)failurestr);
 			payment_failed(ld, hout, localfail);
 		} else
@@ -386,6 +404,22 @@ static void rcvd_htlc_reply(struct subd *subd, const u8 *msg, const int *fds UNU
 	connect_htlc_out(&subd->ld->htlcs_out, hout);
 
 	/* When channeld includes it in commitment, we'll make it persistent. */
+}
+
+static void htlc_offer_timeout(struct channel *channel)
+{
+	/* Unset this in case we reconnect and start again. */
+	channel->htlc_timeout = NULL;
+
+	/* If owner died, we should already be taken care of. */
+	if (!channel->owner || channel->state != CHANNELD_NORMAL)
+		return;
+
+	log_unusual(channel->owner->log,
+		    "Adding HTLC too slow: killing channel");
+	tal_free(channel->owner);
+	channel_set_billboard(channel, false,
+			      "Adding HTLC timed out: killed channel");
 }
 
 enum onion_type send_htlc_out(struct channel *out, u64 amount, u32 cltv,
@@ -414,6 +448,12 @@ enum onion_type send_htlc_out(struct channel *out, u64 amount, u32 cltv,
 			    payment_hash, onion_routing_packet, in);
 	tal_add_destructor(hout, destroy_hout_subd_died);
 
+	/* Give channel 30 seconds to commit (first) htlc. */
+	if (!out->htlc_timeout)
+		out->htlc_timeout = new_reltimer(&out->peer->ld->timers,
+						 out, time_from_sec(30),
+						 htlc_offer_timeout,
+						 out);
 	msg = towire_channel_offer_htlc(out, amount, cltv, payment_hash,
 					onion_routing_packet);
 	subd_req(out->peer->ld, out->owner, take(msg), -1, 0, rcvd_htlc_reply, hout);
@@ -443,10 +483,9 @@ static void forward_htlc(struct htlc_in *hin,
 
 	/* BOLT #7:
 	 *
-	 * The node creating `channel_update` SHOULD accept HTLCs which pay a
-	 * fee equal or greater than:
-	 *
-	 *    fee_base_msat + amount_msat * fee_proportional_millionths / 1000000
+	 * The origin node:
+	 *   - SHOULD accept HTLCs that pay a fee equal to or greater than:
+	 *     - fee_base_msat + ( amount_msat * fee_proportional_millionths / 1000000 )
 	 */
 	if (mul_overflows_u64(amt_to_forward,
 			      ld->config.fee_per_satoshi)) {
@@ -468,9 +507,10 @@ static void forward_htlc(struct htlc_in *hin,
 
 	/* BOLT #2:
 	 *
-	 * A node MUST estimate a timeout deadline for each HTLC it offers.  A
-	 * node MUST NOT offer an HTLC with a timeout deadline before its
-	 * `cltv_expiry`
+	 * An offering node:
+	 *   - MUST estimate a timeout deadline for each HTLC it offers.
+	 *   - MUST NOT offer an HTLC with a timeout deadline before its
+	 *     `cltv_expiry`.
 	 */
 	/* In our case, G = 1, so we need to expire it one after it's expiration.
 	 * But never offer an expired HTLC; that's dumb. */
@@ -485,17 +525,16 @@ static void forward_htlc(struct htlc_in *hin,
 
 	/* BOLT #4:
 	 *
-	 * If the `cltv_expiry` is unreasonably far, we can also report an error:
-	 *
-	 * 1. type: 21 (`expiry_too_far`)
+	 *   - if the `cltv_expiry` is unreasonably far in the future:
+	 *     - return an `expiry_too_far` error.
 	 */
 	if (get_block_height(ld->topology)
-	    + ld->config.max_htlc_expiry < outgoing_cltv_value) {
+	    + ld->config.locktime_max < outgoing_cltv_value) {
 		log_debug(hin->key.channel->log,
 			  "Expiry cltv %u too far from current %u + max %u",
 			  outgoing_cltv_value,
 			  get_block_height(ld->topology),
-			  ld->config.max_htlc_expiry);
+			  ld->config.locktime_max);
 		failcode = WIRE_EXPIRY_TOO_FAR;
 		goto fail;
 	}
@@ -586,8 +625,8 @@ static bool peer_accepted_htlc(struct channel *channel,
 #endif
 	/* BOLT #2:
 	 *
-	 * A sending node SHOULD fail to route any HTLC added after it
-	 * sent `shutdown`. */
+	 *   - SHOULD fail to route any HTLC added after it has sent `shutdown`.
+	 */
 	if (channel->state == CHANNELD_SHUTTING_DOWN) {
 		*failcode = WIRE_PERMANENT_CHANNEL_FAILURE;
 		goto out;
@@ -595,9 +634,11 @@ static bool peer_accepted_htlc(struct channel *channel,
 
 	/* BOLT #2:
 	 *
-	 * A node MUST estimate a fulfillment deadline for each HTLC it is
-	 * attempting to fulfill.  A node MUST fail (and not forward) an HTLC
-	 * whose fulfillment deadline is already past
+	 * A fulfilling node:
+	 *   - for each HTLC it is attempting to fulfill:
+	 *     - MUST estimate a fulfillment deadline.
+	 *   - MUST fail (and not forward) an HTLC whose fulfillment deadline is
+	 *     already past.
 	 */
 	/* Our deadline is half the cltv_delta we insist on, so this check is
 	 * a subset of the cltv check done in handle_localpay and
@@ -733,7 +774,7 @@ void onchain_fulfilled_htlc(struct channel *channel,
 		if (hout->failcode != 0 || hout->failuremsg)
 			continue;
 
-		if (!structeq(&hout->payment_hash, &payment_hash))
+		if (!sha256_eq(&hout->payment_hash, &payment_hash))
 			continue;
 
 		/* We may have already fulfilled before going onchain, or
@@ -763,10 +804,10 @@ static bool peer_failed_our_htlc(struct channel *channel,
 	if (!htlc_out_update_state(channel, hout, RCVD_REMOVE_COMMIT))
 		return false;
 
-	hout->failcode = failed->malformed;
-	if (!failed->malformed)
+	hout->failcode = failed->failcode;
+	if (!failed->failcode)
 		hout->failuremsg = tal_dup_arr(hout, u8, failed->failreason,
-					       tal_len(failed->failreason), 0);
+					       tal_count(failed->failreason), 0);
 
 	else
 		hout->failuremsg = NULL;
@@ -795,7 +836,7 @@ struct htlc_out *find_htlc_out_by_ripemd(const struct channel *channel,
 
 		ripemd160(&hash,
 			  &hout->payment_hash, sizeof(hout->payment_hash));
-		if (structeq(&hash, ripemd))
+		if (ripemd160_eq(&hash, ripemd))
 			return hout;
 	}
 	return NULL;
@@ -993,6 +1034,8 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 	secp256k1_ecdsa_signature commit_sig;
 	secp256k1_ecdsa_signature *htlc_sigs;
 	struct lightningd *ld = channel->peer->ld;
+
+	channel->htlc_timeout = tal_free(channel->htlc_timeout);
 
 	if (!fromwire_channel_sending_commitsig(msg, msg,
 						&commitnum,
@@ -1237,16 +1280,18 @@ void update_per_commit_point(struct channel *channel,
 void peer_got_revoke(struct channel *channel, const u8 *msg)
 {
 	u64 revokenum;
-	struct sha256 per_commitment_secret;
+	struct secret per_commitment_secret;
 	struct pubkey next_per_commitment_point;
 	struct changed_htlc *changed;
 	enum onion_type *failcodes;
 	size_t i;
 	struct lightningd *ld = channel->peer->ld;
+	u32 feerate;
 
 	if (!fromwire_channel_got_revoke(msg, msg,
 					 &revokenum, &per_commitment_secret,
 					 &next_per_commitment_point,
+					 &feerate,
 					 &changed)) {
 		channel_internal_error(channel, "bad fromwire_channel_got_revoke %s",
 				    tal_hex(channel, msg));
@@ -1289,8 +1334,9 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 
 	/* BOLT #2:
 	 *
-	 * A receiving node MAY fail if the `per_commitment_secret` was not
-	 * generated by the protocol in [BOLT #3]
+	 *   - if the `per_commitment_secret` was not generated by the protocol
+	 *     in [BOLT #3](03-transactions.md#per-commitment-secret-requirements):
+	 *     - MAY fail the channel.
 	 */
 	if (!wallet_shachain_add_hash(ld->wallet,
 				      &channel->their_shachain,
@@ -1298,11 +1344,15 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 				      &per_commitment_secret)) {
 		channel_fail_permanent(channel,
 				    "Bad per_commitment_secret %s for %"PRIu64,
-				    type_to_string(msg, struct sha256,
+				    type_to_string(msg, struct secret,
 						   &per_commitment_secret),
 				    revokenum);
 		return;
 	}
+
+	/* Update feerate: if we are funder, their revoke_and_ack has set
+	 * this for local feerate. */
+	channel->channel_info.feerate_per_kw[LOCAL] = feerate;
 
 	/* FIXME: Check per_commitment_secret -> per_commit_point */
 	update_per_commit_point(channel, &next_per_commitment_point);
@@ -1329,7 +1379,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 
 static void *tal_arr_append_(void **p, size_t size)
 {
-	size_t n = tal_len(*p) / size;
+	size_t n = tal_bytelen(*p) / size;
 	tal_resize_(p, size, n+1, false);
 	return (char *)(*p) + n * size;
 }
@@ -1375,6 +1425,8 @@ static void add_fulfill(u64 id, enum side side,
 }
 
 static void add_fail(u64 id, enum side side,
+		     enum onion_type failcode,
+		     const struct short_channel_id *failing_channel,
 		     const u8 *failuremsg,
 		     const struct failed_htlc ***failed_htlcs,
 		     enum side **failed_sides)
@@ -1387,8 +1439,19 @@ static void add_fail(u64 id, enum side side,
 
 	*f = tal(*failed_htlcs, struct failed_htlc);
 	(*f)->id = id;
-	(*f)->failreason
-		= tal_dup_arr(*f, u8, failuremsg, tal_len(failuremsg), 0);
+	(*f)->failcode = failcode;
+	if (failcode & UPDATE) {
+		assert(failing_channel);
+		(*f)->scid = tal_dup(*f, struct short_channel_id,
+				     failing_channel);
+	} else
+		(*f)->scid = NULL;
+
+	if (failuremsg)
+		(*f)->failreason
+			= tal_dup_arr(*f, u8, failuremsg, tal_count(failuremsg), 0);
+	else
+		(*f)->failreason = NULL;
 	*s = side;
 }
 
@@ -1426,9 +1489,10 @@ void peer_htlcs(const tal_t *ctx,
 			 hin->cltv_expiry, hin->onion_routing_packet,
 			 hin->hstate);
 
-		if (hin->failuremsg)
-			add_fail(hin->key.id, REMOTE, hin->failuremsg,
-				 failed_htlcs, failed_sides);
+		if (hin->failuremsg || hin->failcode)
+			add_fail(hin->key.id, REMOTE, hin->failcode,
+				 &hin->failoutchannel,
+				 hin->failuremsg, failed_htlcs, failed_sides);
 		if (hin->preimage)
 			add_fulfill(hin->key.id, REMOTE, hin->preimage,
 				    fulfilled_htlcs, fulfilled_sides);
@@ -1445,9 +1509,10 @@ void peer_htlcs(const tal_t *ctx,
 			 hout->cltv_expiry, hout->onion_routing_packet,
 			 hout->hstate);
 
-		if (hout->failuremsg)
-			add_fail(hout->key.id, LOCAL, hout->failuremsg,
-				 failed_htlcs, failed_sides);
+		if (hout->failuremsg || hout->failcode)
+			add_fail(hout->key.id, LOCAL, hout->failcode,
+				 hout->key.channel->scid,
+				 hout->failuremsg, failed_htlcs, failed_sides);
 		if (hout->preimage)
 			add_fulfill(hout->key.id, LOCAL, hout->preimage,
 				    fulfilled_htlcs, fulfilled_sides);
@@ -1490,9 +1555,9 @@ void free_htlcs(struct lightningd *ld, const struct channel *channel)
 
 /* BOLT #2:
  *
- * For HTLCs we offer: the timeout deadline when we have to fail the channel
- * and time it out on-chain.  This is `G` blocks after the HTLC
- * `cltv_expiry`; 1 block is reasonable.
+ * 2. the deadline for offered HTLCs: the deadline after which the channel has
+ *    to be failed and timed out on-chain. This is `G` blocks after the HTLC's
+ *    `cltv_expiry`: 1 block is reasonable.
  */
 static u32 htlc_out_deadline(const struct htlc_out *hout)
 {
@@ -1501,10 +1566,10 @@ static u32 htlc_out_deadline(const struct htlc_out *hout)
 
 /* BOLT #2:
  *
- * For HTLCs we accept and have a preimage: the fulfillment deadline when we
- * have to fail the channel and fulfill the HTLC onchain before its
- * `cltv_expiry`.  This is steps 4-7 above, which means a deadline of `2R+G+S`
- * blocks before `cltv_expiry`; 7 blocks is reasonable.
+ * 3. the deadline for received HTLCs this node has fulfilled: the deadline
+ * after which the channel has to be failed and the HTLC fulfilled on-chain
+ * before its `cltv_expiry`. See steps 4-7 above, which imply a deadline of
+ * `2R+G+S` blocks before `cltv_expiry`: 7 blocks is reasonable.
  */
 /* We approximate this, by using half the cltv_expiry_delta (3R+2G+2S),
  * rounded up. */
@@ -1514,15 +1579,15 @@ static u32 htlc_in_deadline(const struct lightningd *ld,
 	return hin->cltv_expiry - (ld->config.cltv_expiry_delta + 1)/2;
 }
 
-void notify_new_block(struct lightningd *ld, u32 height)
+void htlcs_notify_new_block(struct lightningd *ld, u32 height)
 {
 	bool removed;
 
 	/* BOLT #2:
 	 *
-	 * A node ... MUST fail the channel if an HTLC which it offered is in
-	 * either node's current commitment transaction past this timeout
-	 * deadline.
+	 *   - if an HTLC which it offered is in either node's current
+	 *   commitment transaction, AND is past this timeout deadline:
+	 *     - MUST fail the channel.
 	 */
 	/* FIXME: use db to look this up in one go (earliest deadline per-peer) */
 	do {
@@ -1560,10 +1625,12 @@ void notify_new_block(struct lightningd *ld, u32 height)
 
 	/* BOLT #2:
 	 *
-	 * A node MUST estimate a fulfillment deadline for each HTLC it is
-	 * attempting to fulfill.  A node ... MUST fail the connection if a
-	 * HTLC it has fulfilled is in either node's current commitment
-	 * transaction past this fulfillment deadline.
+	 *   - for each HTLC it is attempting to fulfill:
+	 *     - MUST estimate a fulfillment deadline.
+	 *...
+	 *   - if an HTLC it has fulfilled is in either node's current commitment
+	 *   transaction, AND is past this fulfillment deadline:
+	 *     - MUST fail the connection.
 	 */
 	do {
 		struct htlc_in *hin;
@@ -1604,59 +1671,70 @@ void notify_new_block(struct lightningd *ld, u32 height)
 	} while (removed);
 }
 
-void notify_feerate_change(struct lightningd *ld)
+/**
+ * htlcs_reconnect -- Link outgoing HTLCs to their origins after initial db load
+ *
+ * For each outgoing HTLC find the incoming HTLC that triggered it. If
+ * we are the origin of the transfer then we cannot resolve the
+ * incoming HTLC in which case we just leave it `NULL`.
+ */
+void htlcs_reconnect(struct lightningd *ld,
+		     struct htlc_in_map *htlcs_in,
+		     struct htlc_out_map *htlcs_out)
 {
-	struct peer *peer;
+	struct htlc_in_map_iter ini;
+	struct htlc_out_map_iter outi;
+	struct htlc_in *hin;
+	struct htlc_out *hout;
 
-	/* FIXME: We should notify onchaind about NORMAL fee change in case
-	 * it's going to generate more txs. */
-	list_for_each(&ld->peers, peer, list) {
-		struct channel *channel = peer_active_channel(peer);
-		u8 *msg;
+	for (hout = htlc_out_map_first(htlcs_out, &outi); hout;
+	     hout = htlc_out_map_next(htlcs_out, &outi)) {
 
-		if (!channel || !channel_fees_can_change(channel))
+		if (hout->origin_htlc_id == 0) {
 			continue;
+		}
 
-		/* FIXME: We choose not to drop to chain if we can't contact
-		 * peer.  We *could* do so, however. */
-		if (!channel->owner)
-			continue;
+		for (hin = htlc_in_map_first(htlcs_in, &ini); hin;
+		     hin = htlc_in_map_next(htlcs_in, &ini)) {
+			if (hout->origin_htlc_id == hin->dbid) {
+				log_debug(ld->log,
+					  "Found corresponding htlc_in %" PRIu64
+					  " for htlc_out %" PRIu64,
+					  hin->dbid, hout->dbid);
+				hout->in = hin;
+				break;
+			}
+		}
 
-		msg = towire_channel_feerates(channel,
-					      get_feerate(ld->topology,
-							  FEERATE_IMMEDIATE),
-					      feerate_min(ld),
-					      feerate_max(ld));
-		subd_send_msg(channel->owner, take(msg));
+		if (!hout->in)
+			fatal("Unable to find corresponding htlc_in %"PRIu64" for htlc_out %"PRIu64,
+			      hout->origin_htlc_id, hout->dbid);
 	}
 }
+
 
 #if DEVELOPER
 static void json_dev_ignore_htlcs(struct command *cmd, const char *buffer,
 				  const jsmntok_t *params)
 {
-	jsmntok_t *nodeidtok, *ignoretok;
+	struct pubkey *peerid;
 	struct peer *peer;
+	bool *ignore;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "id", &nodeidtok,
-			     "ignore", &ignoretok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_req("id", json_tok_pubkey, &peerid),
+		   p_req("ignore", json_tok_bool, &ignore),
+		   NULL))
 		return;
-	}
 
-	peer = peer_from_json(cmd->ld, buffer, nodeidtok);
+	peer = peer_by_id(cmd->ld, peerid);
 	if (!peer) {
-		command_fail(cmd, "Could not find channel with that peer");
+		command_fail(cmd, LIGHTNINGD,
+			     "Could not find channel with that peer");
 		return;
 	}
+	peer->ignore_htlcs = *ignore;
 
-	if (!json_tok_bool(buffer, ignoretok, &peer->ignore_htlcs)) {
-		command_fail(cmd, "Invalid boolean '%.*s'",
-			     ignoretok->end - ignoretok->start,
-			     buffer + ignoretok->start);
-		return;
-	}
 	command_success(cmd, null_response(cmd));
 }
 

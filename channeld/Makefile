@@ -20,7 +20,7 @@ LIGHTNINGD_CHANNEL_HEADERS_NOGEN :=			\
 
 LIGHTNINGD_CHANNEL_HEADERS := $(LIGHTNINGD_CHANNEL_HEADERS_GEN) $(LIGHTNINGD_CHANNEL_HEADERS_NOGEN)
 
-LIGHTNINGD_CHANNEL_SRC := channeld/channel.c	\
+LIGHTNINGD_CHANNEL_SRC := channeld/channeld.c	\
 	channeld/commit_tx.c			\
 	channeld/full_channel.c		\
 	channeld/gen_channel_wire.c
@@ -54,10 +54,10 @@ CHANNELD_COMMON_OBJS :=				\
 	common/key_derive.o			\
 	common/memleak.o			\
 	common/msg_queue.o			\
-	common/ping.o				\
 	common/peer_billboard.o			\
 	common/peer_failed.o			\
 	common/permute_tx.o			\
+	common/ping.o				\
 	common/pseudorand.o			\
 	common/read_peer_msg.o			\
 	common/sphinx.o				\
@@ -93,7 +93,7 @@ channeld/gen_full_channel_error_names.h: channeld/full_channel_error.h ccan/ccan
 	ccan/ccan/cdump/tools/cdump-enumstr channeld/full_channel_error.h > $@
 
 
-$(LIGHTNINGD_CHANNEL_OBJS): $(LIGHTNINGD_HEADERS)
+$(LIGHTNINGD_CHANNEL_OBJS): $(LIGHTNINGD_HEADERS) $(LIGHTNINGD_GOSSIP_CONTROL_HEADERS)
 
 channeld/gen_channel_wire.h: $(WIRE_GEN) channeld/channel_wire.csv
 	$(WIRE_GEN) --header $@ channel_wire_type < channeld/channel_wire.csv > $@

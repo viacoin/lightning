@@ -16,7 +16,7 @@ LIGHTNINGD_OPENING_HEADERS_NOGEN :=
 
 LIGHTNINGD_OPENING_HEADERS := $(LIGHTNINGD_OPENING_HEADERS_GEN) $(LIGHTNINGD_OPENING_HEADERS_NOGEN)
 
-LIGHTNINGD_OPENING_SRC := openingd/opening.c	\
+LIGHTNINGD_OPENING_SRC := openingd/openingd.c	\
 	$(LIGHTNINGD_OPENING_HEADERS:.h=.c)
 LIGHTNINGD_OPENING_OBJS := $(LIGHTNINGD_OPENING_SRC:.c=.o)
 
@@ -55,7 +55,6 @@ OPENINGD_COMMON_OBJS :=				\
 	common/keyset.o				\
 	common/memleak.o			\
 	common/msg_queue.o			\
-	common/ping.o				\
 	common/peer_billboard.o			\
 	common/peer_failed.o			\
 	common/permute_tx.o			\

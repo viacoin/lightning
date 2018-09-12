@@ -14,8 +14,6 @@
 #include <wallet/wallet.h>
 #include <wire/peer_wire.h>
 
-#define ANNOUNCE_MIN_DEPTH 6
-
 struct crypto_state;
 
 struct peer {
@@ -43,6 +41,9 @@ struct peer {
 	/* Where we connected to, or it connected from. */
 	struct wireaddr_internal addr;
 
+	/* We keep a copy of their feature bits */
+	const u8 *local_features, *global_features;
+
 	/* If we open a channel our direction will be this */
 	u8 direction;
 
@@ -56,34 +57,19 @@ struct peer *find_peer_by_dbid(struct lightningd *ld, u64 dbid);
 
 struct peer *new_peer(struct lightningd *ld, u64 dbid,
 		      const struct pubkey *id,
-		      const struct wireaddr_internal *addr);
+		      const struct wireaddr_internal *addr,
+		      const u8 *gfeatures TAKES, const u8 *lfeatures TAKES);
 
-/* Also removes from db. */
-void delete_peer(struct peer *peer);
+/* Last one out deletes peer.  Also removes from db. */
+void maybe_delete_peer(struct peer *peer);
 
 struct peer *peer_by_id(struct lightningd *ld, const struct pubkey *id);
 struct peer *peer_from_json(struct lightningd *ld,
 			    const char *buffer,
-			    jsmntok_t *peeridtok);
+			    const jsmntok_t *peeridtok);
 
-/* The three ways peers enter from the network:
- *
- * peer_connected - when it first connects to gossipd (after init exchange).
- * peer_sent_nongossip - when it tries to fund a channel.
- * gossip_peer_released - when we tell gossipd to release it so we can fund
- *			  a channel.
-*/
 void peer_connected(struct lightningd *ld, const u8 *msg,
 		    int peer_fd, int gossip_fd);
-
-void peer_sent_nongossip(struct lightningd *ld,
-			 const struct pubkey *id,
-			 const struct wireaddr_internal *addr,
-			 const struct crypto_state *cs,
-			 const u8 *gfeatures,
-			 const u8 *lfeatures,
-			 int peer_fd, int gossip_fd,
-			 const u8 *in_msg);
 
 /* Could be configurable. */
 #define OUR_CHANNEL_FLAGS CHANNEL_FLAGS_ANNOUNCE_CHANNEL
@@ -102,9 +88,8 @@ void activate_peers(struct lightningd *ld);
 
 void drop_to_chain(struct lightningd *ld, struct channel *channel, bool cooperative);
 
-/* Get range of feerates to insist other side abide by for normal channels. */
-u32 feerate_min(struct lightningd *ld);
-u32 feerate_max(struct lightningd *ld);
-
 void channel_watch_funding(struct lightningd *ld, struct channel *channel);
+
+/* Pull peers, channels and HTLCs from db, and wire them up. */
+void load_channels_from_wallet(struct lightningd *ld);
 #endif /* LIGHTNING_LIGHTNINGD_PEER_CONTROL_H */

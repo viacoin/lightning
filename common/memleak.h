@@ -21,10 +21,9 @@
 void *notleak_(const void *ptr, bool plus_children);
 
 struct htable;
-struct backtrace_state;
 
-/* Initialize memleak detection, with this as the root */
-void memleak_init(const tal_t *root, struct backtrace_state *bstate);
+/* Initialize memleak detection */
+void memleak_init(void);
 
 /* Free memleak detection. */
 void memleak_cleanup(void);
@@ -37,8 +36,19 @@ struct htable *memleak_enter_allocations(const tal_t *ctx,
 /* Remove any pointers to memory under root */
 void memleak_remove_referenced(struct htable *memtable, const void *root);
 
+/* Remove any pointers inside this htable (which is opaque to memleak). */
+void memleak_remove_htable(struct htable *memtable, const struct htable *ht);
+
+/* Remove any pointers inside this uintmap (which is opaque to memleak). */
+#define memleak_remove_uintmap(memtable, umap)		\
+	memleak_remove_intmap_(memtable, uintmap_unwrap_(umap))
+
+struct intmap;
+void memleak_remove_intmap_(struct htable *memtable, const struct intmap *m);
+
 /* Mark this pointer as being referenced, and search within for more. */
-void memleak_scan_region(struct htable *memtable, const void *p);
+void memleak_scan_region(struct htable *memtable,
+			 const void *p, size_t bytelen);
 
 /* Get (and remove) a leak from memtable, or NULL */
 const void *memleak_get(struct htable *memtable, const uintptr_t **backtrace);

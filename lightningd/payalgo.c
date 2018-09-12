@@ -15,6 +15,7 @@
 #include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/param.h>
 #include <lightningd/subd.h>
 #include <sodium/randombytes.h>
 #include <wallet/wallet.h>
@@ -55,8 +56,7 @@ json_add_failure(struct json_result *r, char const *n,
 	switch (f->type) {
 	case FAIL_UNPARSEABLE_ONION:
 		json_add_string(r, "type", "FAIL_UNPARSEABLE_ONION");
-		json_add_hex(r, "onionreply", f->onionreply,
-			     tal_len(f->onionreply));
+		json_add_hex_talarr(r, "onionreply", f->onionreply);
 		break;
 
 	case FAIL_PAYMENT_REPLY:
@@ -68,9 +68,8 @@ json_add_failure(struct json_result *r, char const *n,
 		json_add_short_channel_id(r, "erring_channel",
 					  &rf->erring_channel);
 		if (rf->channel_update)
-			json_add_hex(r, "channel_update",
-				     rf->channel_update,
-				     tal_len(rf->channel_update));
+			json_add_hex_talarr(r, "channel_update",
+					    rf->channel_update);
 		break;
 	}
 	json_add_route(r, "route", f->route, tal_count(f->route));
@@ -127,6 +126,14 @@ struct pay {
 
 	/* Whether we are attempting payment or not. */
 	bool in_sendpay;
+
+	/* Maximum fee that is exempted from the maxfeepercent computation. This
+	 * is mainly useful for tiny transfers for which the leveraged fee would
+	 * be dominated by the forwarding fee. */
+	u64 exemptfee;
+
+	/* The description from the bolt11 string */
+	const char *description;
 };
 
 static struct routing_failure *
@@ -250,9 +257,8 @@ static void json_pay_failure(struct pay *pay,
 		json_add_short_channel_id(data, "erring_channel",
 					  &fail->erring_channel);
 		if (fail->channel_update)
-			json_add_hex(data, "channel_update",
-				     fail->channel_update,
-				     tal_len(fail->channel_update));
+			json_add_hex_talarr(data, "channel_update",
+					    fail->channel_update);
 		json_add_failures(data, "failures", &pay->pay_failures);
 		json_object_end(data);
 
@@ -429,15 +435,12 @@ static void json_pay_getroute_reply(struct subd *gossip UNUSED,
 
 	msatoshi_sent = route[0].amount;
 	fee = msatoshi_sent - pay->msatoshi;
-	/* FIXME: IEEE Double-precision floating point has only 53 bits
-	 * of precision. Total satoshis that can ever be created is
-	 * slightly less than 2100000000000000. Total msatoshis that
-	 * can ever be created is 1000 times that or
-	 * 2100000000000000000, requiring 60.865 bits of precision,
-	 * and thus losing precision in the below. Currently, OK, as,
-	 * payments are limited to 4294967295 msatoshi. */
+	/* Casting u64 to double will lose some precision. The loss of precision
+	 * in feepercent will be like 3.0000..(some dots)..1 % - 3.0 %.
+	 * That loss will not be representable in double. So, it's Okay to
+	 * cast u64 to double for feepercent calculation. */
 	feepercent = ((double) fee) * 100.0 / ((double) pay->msatoshi);
-	fee_too_high = (feepercent > pay->maxfeepercent);
+	fee_too_high = (fee > pay->exemptfee && feepercent > pay->maxfeepercent);
 	delay_too_high = (route[0].delay > pay->maxdelay);
 	/* compare fuzz to range */
 	if ((fee_too_high || delay_too_high) && pay->fuzz < 0.01) {
@@ -499,6 +502,7 @@ static void json_pay_getroute_reply(struct subd *gossip UNUSED,
 	send_payment(pay->try_parent,
 		     pay->cmd->ld, &pay->payment_hash, route,
 		     pay->msatoshi,
+		     pay->description,
 		     &json_pay_sendpay_resume, pay);
 }
 
@@ -595,41 +599,34 @@ static void json_pay_stop_retrying(struct pay *pay)
 static void json_pay(struct command *cmd,
 		     const char *buffer, const jsmntok_t *params)
 {
-	jsmntok_t *bolt11tok, *msatoshitok, *desctok, *riskfactortok, *maxfeetok;
-	jsmntok_t *retryfortok;
-	jsmntok_t *maxdelaytok;
-	double riskfactor = 1.0;
-	double maxfeepercent = 0.5;
-	u64 msatoshi;
+	double *riskfactor;
+	double *maxfeepercent;
+	u64 *msatoshi;
 	struct pay *pay = tal(cmd, struct pay);
 	struct bolt11 *b11;
-	char *fail, *b11str, *desc;
-	unsigned int retryfor = 60;
-	unsigned int maxdelay = 500;
+	const char *b11str, *desc;
+	char *fail;
+	unsigned int *retryfor;
+	unsigned int *maxdelay;
+	unsigned int *exemptfee;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "bolt11", &bolt11tok,
-			     "?msatoshi", &msatoshitok,
-			     "?description", &desctok,
-			     "?riskfactor", &riskfactortok,
-			     "?maxfeepercent", &maxfeetok,
-			     "?retry_for", &retryfortok,
-			     "?maxdelay", &maxdelaytok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_req("bolt11", json_tok_string, &b11str),
+		   p_opt("msatoshi", json_tok_u64, &msatoshi),
+		   p_opt("description", json_tok_string, &desc),
+		   p_opt_def("riskfactor", json_tok_double, &riskfactor, 1.0),
+		   p_opt_def("maxfeepercent", json_tok_percent, &maxfeepercent, 0.5),
+		   p_opt_def("retry_for", json_tok_number, &retryfor, 60),
+		   p_opt_def("maxdelay", json_tok_number, &maxdelay,
+			     cmd->ld->config.locktime_max),
+		   p_opt_def("exemptfee", json_tok_number, &exemptfee, 5000),
+		   NULL))
 		return;
-	}
-
-	b11str = tal_strndup(cmd, buffer + bolt11tok->start,
-			     bolt11tok->end - bolt11tok->start);
-	if (desctok)
-		desc = tal_strndup(cmd, buffer + desctok->start,
-				   desctok->end - desctok->start);
-	else
-		desc = NULL;
 
 	b11 = bolt11_decode(pay, b11str, desc, &fail);
 	if (!b11) {
-		command_fail(cmd, "Invalid bolt11: %s", fail);
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Invalid bolt11: %s", fail);
 		return;
 	}
 
@@ -639,80 +636,35 @@ static void json_pay(struct command *cmd,
 	memset(&pay->expiry, 0, sizeof(pay->expiry));
 	pay->expiry.ts.tv_sec = b11->timestamp + b11->expiry;
 	pay->min_final_cltv_expiry = b11->min_final_cltv_expiry;
-
-	if (retryfortok && !json_tok_number(buffer, retryfortok, &retryfor)) {
-		command_fail(cmd, "'%.*s' is not an integer",
-			     retryfortok->end - retryfortok->start,
-			     buffer + retryfortok->start);
-		return;
-	}
+	pay->exemptfee = *exemptfee;
 
 	if (b11->msatoshi) {
-		msatoshi = *b11->msatoshi;
-		if (msatoshitok) {
-			command_fail(cmd, "msatoshi parameter unnecessary");
+		if (msatoshi) {
+			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				     "msatoshi parameter unnecessary");
 			return;
 		}
+		msatoshi = b11->msatoshi;
 	} else {
-		if (!msatoshitok) {
-			command_fail(cmd, "msatoshi parameter required");
-			return;
-		}
-		if (!json_tok_u64(buffer, msatoshitok, &msatoshi)) {
-			command_fail(cmd,
-				     "msatoshi '%.*s' is not a valid number",
-				     msatoshitok->end-msatoshitok->start,
-				     buffer + msatoshitok->start);
+		if (!msatoshi) {
+			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				     "msatoshi parameter required");
 			return;
 		}
 	}
-	pay->msatoshi = msatoshi;
+	pay->msatoshi = *msatoshi;
+	pay->riskfactor = *riskfactor * 1000;
+	pay->maxfeepercent = *maxfeepercent;
 
-	if (riskfactortok
-	    && !json_tok_double(buffer, riskfactortok, &riskfactor)) {
-		command_fail(cmd, "'%.*s' is not a valid double",
-			     riskfactortok->end - riskfactortok->start,
-			     buffer + riskfactortok->start);
-		return;
-	}
-	pay->riskfactor = riskfactor * 1000;
-
-	if (maxfeetok
-	    && !json_tok_double(buffer, maxfeetok, &maxfeepercent)) {
-		command_fail(cmd, "'%.*s' is not a valid double",
-			     maxfeetok->end - maxfeetok->start,
-			     buffer + maxfeetok->start);
-		return;
-	}
-	/* Ensure it is in range 0.0 <= maxfeepercent <= 100.0 */
-	if (!(0.0 <= maxfeepercent)) {
-		command_fail(cmd, "%f maxfeepercent must be non-negative",
-			     maxfeepercent);
-		return;
-	}
-	if (!(maxfeepercent <= 100.0)) {
-		command_fail(cmd, "%f maxfeepercent must be <= 100.0",
-			     maxfeepercent);
-		return;
-	}
-	pay->maxfeepercent = maxfeepercent;
-
-	if (maxdelaytok
-	    && !json_tok_number(buffer, maxdelaytok, &maxdelay)) {
-		command_fail(cmd, "'%.*s' is not a valid double",
-			     maxdelaytok->end - maxdelaytok->start,
-			     buffer + maxdelaytok->start);
-		return;
-	}
-	if (maxdelay < pay->min_final_cltv_expiry) {
-		command_fail(cmd,
+	if (*maxdelay < pay->min_final_cltv_expiry) {
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 			     "maxdelay (%u) must be greater than "
 			     "min_final_cltv_expiry (%"PRIu32") of "
 			     "invoice",
-			     maxdelay, pay->min_final_cltv_expiry);
+			     *maxdelay, pay->min_final_cltv_expiry);
 		return;
 	}
-	pay->maxdelay = maxdelay;
+	pay->maxdelay = *maxdelay;
 
 	pay->getroute_tries = 0;
 	pay->sendpay_tries = 0;
@@ -732,6 +684,7 @@ static void json_pay(struct command *cmd,
 	/* Start with no failures */
 	list_head_init(&pay->pay_failures);
 	pay->in_sendpay = false;
+	pay->description = b11->description;
 
 	/* Initiate payment */
 	if (json_pay_try(pay))
@@ -740,7 +693,7 @@ static void json_pay(struct command *cmd,
 		return;
 
 	/* Set up timeout. */
-	new_reltimer(&cmd->ld->timers, pay, time_from_sec(retryfor),
+	new_reltimer(&cmd->ld->timers, pay, time_from_sec(*retryfor),
 		     &json_pay_stop_retrying, pay);
 }
 
@@ -752,6 +705,7 @@ static const struct json_command pay_command = {
 	"{description} (required if {bolt11} uses description hash), "
 	"{riskfactor} (default 1.0), "
 	"{maxfeepercent} (default 0.5) the maximum acceptable fee as a percentage (e.g. 0.5 => 0.5%), "
+	"{exemptfee} (default 5000 msat) disables the maxfeepercent check for fees below the threshold, "
 	"{retry_for} (default 60) the integer number of seconds before we stop retrying, and "
 	"{maxdelay} (default 500) the maximum number of blocks we allow the funds to possibly get locked"
 };

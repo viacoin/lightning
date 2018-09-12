@@ -4,7 +4,6 @@
 #include <bitcoin/tx.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/mem/mem.h>
-#include <ccan/structeq/structeq.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/commit_tx.h>
 #include <channeld/full_channel.h>
@@ -108,11 +107,13 @@ static void dump_htlc(const struct htlc *htlc, const char *prefix)
 		     htlc_state_name(htlc->state),
 		     htlc_state_name(remote_state),
 		     htlc->r ? "FULFILLED" : htlc->fail ? "FAILED" :
-		     htlc->malformed ? "MALFORMED" : "");
+		     htlc->failcode
+		     ? tal_fmt(tmpctx, "FAILCODE:%u", htlc->failcode) : "");
 }
 
 void dump_htlcs(const struct channel *channel, const char *prefix)
 {
+#ifdef SUPERVERBOSE
 	struct htlc_map_iter it;
 	const struct htlc *htlc;
 
@@ -121,6 +122,7 @@ void dump_htlcs(const struct channel *channel, const char *prefix)
 	     htlc = htlc_map_next(channel->htlcs, &it)) {
 		dump_htlc(htlc, prefix);
 	}
+#endif
 }
 
 /* Returns up to three arrays:
@@ -246,12 +248,8 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	struct keyset keyset;
 
 	if (!derive_keyset(per_commitment_point,
-			   &channel->basepoints[side].payment,
-			   &channel->basepoints[!side].payment,
-			   &channel->basepoints[side].htlc,
-			   &channel->basepoints[!side].htlc,
-			   &channel->basepoints[side].delayed_payment,
-			   &channel->basepoints[!side].revocation,
+			   &channel->basepoints[side],
+			   &channel->basepoints[!side],
 			   &keyset))
 		return NULL;
 
@@ -311,8 +309,11 @@ static enum channel_add_err add_htlc(struct channel *channel,
 
 	/* BOLT #2:
 	 *
-	 * A receiving node SHOULD fail the channel if a sending node... sets
-	 * `cltv_expiry` to greater or equal to 500000000.
+	 * A receiving node:
+	 *...
+	 *  - if sending node sets `cltv_expiry` to greater or equal to
+	 *    500000000:
+	 *    - SHOULD fail the channel.
 	 */
 	if (!blocks_to_abs_locktime(cltv_expiry, &htlc->expiry)) {
 		return CHANNEL_ERR_INVALID_EXPIRY;
@@ -320,7 +321,8 @@ static enum channel_add_err add_htlc(struct channel *channel,
 
 	htlc->rhash = *payment_hash;
 	htlc->fail = NULL;
-	htlc->malformed = 0;
+	htlc->failcode = 0;
+	htlc->failed_scid = NULL;
 	htlc->r = NULL;
 	htlc->routing = tal_dup_arr(htlc, u8, routing, TOTAL_PACKET_SIZE, 0);
 
@@ -329,7 +331,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 		if (old->state != htlc->state
 		    || old->msatoshi != htlc->msatoshi
 		    || old->expiry.locktime != htlc->expiry.locktime
-		    || !structeq(&old->rhash, &htlc->rhash))
+		    || !sha256_eq(&old->rhash, &htlc->rhash))
 			return CHANNEL_ERR_DUPLICATE_ID_DIFFERENT;
 		else
 			return CHANNEL_ERR_DUPLICATE;
@@ -340,9 +342,10 @@ static enum channel_add_err add_htlc(struct channel *channel,
 
 	/* BOLT #2:
 	 *
-	 * A receiving node SHOULD fail the channel if it receives an
-	 * `amount_msat` equal to zero, below its own `htlc_minimum_msat`,
-	 * or...
+	 * A receiving node:
+	 *  - receiving an `amount_msat` equal to 0, OR less than its own
+	 *    `htlc_minimum_msat`:
+	 *    - SHOULD fail the channel.
 	 */
 	if (htlc->msatoshi == 0) {
 		return CHANNEL_ERR_HTLC_BELOW_MINIMUM;
@@ -353,9 +356,8 @@ static enum channel_add_err add_htlc(struct channel *channel,
 
 	/* BOLT #2:
 	 *
-	 * For channels with `chain_hash` identifying the Bitcoin blockchain,
-	 * the sending node MUST set the 4 most significant bytes of
-	 * `amount_msat` to zero.
+	 * - for channels with `chain_hash` identifying the Bitcoin blockchain:
+	 *    - MUST set the four most significant bytes of `amount_msat` to 0.
 	 */
 	if (htlc->msatoshi & 0xFFFFFFFF00000000ULL) {
 		return CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
@@ -367,9 +369,10 @@ static enum channel_add_err add_htlc(struct channel *channel,
 
 	/* BOLT #2:
 	 *
-	 * A receiving node SHOULD fail the channel if a sending node
-	 * adds more than its `max_accepted_htlcs` HTLCs to its local
-	 * commitment transaction */
+	 *   - if a sending node adds more than its `max_accepted_htlcs` HTLCs to
+	 *     its local commitment transaction...
+	 *     - SHOULD fail the channel.
+	 */
 	if (enforce_aggregate_limits
 	    && tal_count(committed) - tal_count(removing) + tal_count(adding)
 	    > max_accepted_htlcs(channel, recipient)) {
@@ -382,9 +385,11 @@ static enum channel_add_err add_htlc(struct channel *channel,
 
 	/* BOLT #2:
 	 *
-	 * A receiving node SHOULD fail the channel if a sending node ... or
-	 * adds more than its `max_htlc_value_in_flight_msat` worth of offered
-	 * HTLCs to its local commitment transaction */
+	 *   - if a sending node... adds more than its
+	 *     `max_htlc_value_in_flight_msat` worth of offered HTLCs to its
+	 *     local commitment transaction:
+	 *     - SHOULD fail the channel.
+	 */
 	if (enforce_aggregate_limits
 	    && msat_in_htlcs > max_htlc_value_in_flight_msat(channel, recipient)) {
 		return CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
@@ -392,8 +397,12 @@ static enum channel_add_err add_htlc(struct channel *channel,
 
 	/* BOLT #2:
 	 *
-	 * or which the sending node cannot afford at the current
-	 * `feerate_per_kw` while maintaining its channel reserve.
+	 * A receiving node:
+	 *...
+	 *  - receiving an `amount_msat` that the sending node cannot afford at
+	 *    the current `feerate_per_kw` (while maintaining its channel
+	 *    reserve):
+	 *    - SHOULD fail the channel.
 	 */
 	if (channel->funder == htlc_owner(htlc)) {
 		u32 feerate = view->feerate_per_kw;
@@ -482,9 +491,10 @@ struct htlc *channel_get_htlc(struct channel *channel, enum side sender, u64 id)
 }
 
 enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
-					      enum side owner,
-					      u64 id,
-					      const struct preimage *preimage)
+					     enum side owner,
+					     u64 id,
+					     const struct preimage *preimage,
+					     struct htlc **htlcp)
 {
 	struct sha256 hash;
 	struct htlc *htlc;
@@ -499,20 +509,20 @@ enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
 	sha256(&hash, preimage, sizeof(*preimage));
 	/* BOLT #2:
 	 *
-	 * A receiving node MUST check that the `payment_preimage` value in
-	 * `update_fulfill_htlc` SHA256 hashes to the corresponding HTLC
-	 * `payment_hash`, and MUST fail the channel if it does not.
+	 *  - if the `payment_preimage` value in `update_fulfill_htlc`
+	 *  doesn't SHA256 hash to the corresponding HTLC `payment_hash`:
+	 *    - MUST fail the channel.
 	 */
-	if (!structeq(&hash, &htlc->rhash))
+	if (!sha256_eq(&hash, &htlc->rhash))
 		return CHANNEL_ERR_BAD_PREIMAGE;
 
 	htlc->r = tal_dup(htlc, struct preimage, preimage);
 
 	/* BOLT #2:
 	 *
-	 * A receiving node MUST check that `id` corresponds to an HTLC in its
-	 * current commitment transaction, and MUST fail the channel if it
-	 * does not.
+	 *  - if the `id` does not correspond to an HTLC in its current
+	 *    commitment transaction:
+	 *    - MUST fail the channel.
 	 */
 	if (!htlc_has(htlc, HTLC_FLAG(!htlc_owner(htlc), HTLC_F_COMMITTED))) {
 		status_trace("channel_fulfill_htlc: %"PRIu64" in state %s",
@@ -524,9 +534,12 @@ enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
 	 * based on: */
 	/* BOLT #2:
 	 *
-	 * A node MUST NOT send an `update_fulfill_htlc`, `update_fail_htlc`
-	 * or `update_fail_malformed_htlc` until the corresponding HTLC is
-	 * irrevocably committed in both sides' commitment transactions.
+	 * A node:
+	 *...
+	 *  - until the corresponding HTLC is irrevocably committed in both
+	 *    sides' commitment transactions:
+	 *    - MUST NOT send an `update_fulfill_htlc`, `update_fail_htlc`, or
+	 *      `update_fail_malformed_htlc`.
 	 */
 	if (htlc->state == SENT_ADD_ACK_REVOCATION)
 		htlc->state = RCVD_REMOVE_HTLC;
@@ -541,6 +554,9 @@ enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
 	channel->changes_pending[owner] = true;
 
 	dump_htlc(htlc, "FULFILL:");
+
+	if (htlcp)
+		*htlcp = htlc;
 
 	return CHANNEL_ERR_REMOVE_OK;
 }
@@ -557,9 +573,10 @@ enum channel_remove_err channel_fail_htlc(struct channel *channel,
 
 	/* BOLT #2:
 	 *
-	 * A receiving node MUST check that `id` corresponds to an HTLC in its
-	 * current commitment transaction, and MUST fail the channel if it
-	 * does not.
+	 * A receiving node:
+	 *   - if the `id` does not correspond to an HTLC in its current
+	 *     commitment transaction:
+	 *     - MUST fail the channel.
 	 */
 	if (!htlc_has(htlc, HTLC_FLAG(!htlc_owner(htlc), HTLC_F_COMMITTED))) {
 		status_trace("channel_fail_htlc: %"PRIu64" in state %s",
@@ -672,9 +689,11 @@ static int change_htlcs(struct channel *channel,
 /* FIXME: The sender's requirements are *implied* by this, not stated! */
 /* BOLT #2:
  *
- * A receiving node SHOULD fail the channel if the sender cannot
- * afford the new fee rate on the receiving node's current commitment
- * transaction
+ * A receiving node:
+ *...
+ *   - if the sender cannot afford the new fee rate on the receiving node's
+ *     current commitment transaction:
+ *      - SHOULD fail the channel,
  */
 u32 approx_max_feerate(const struct channel *channel)
 {
@@ -713,9 +732,10 @@ bool can_funder_afford_feerate(const struct channel *channel, u32 feerate_per_kw
 
 	/* BOLT #2:
 	 *
-	 * A receiving node SHOULD fail the channel if the sender cannot afford
-	 * the new fee rate on the receiving node's current commitment
-	 * transaction */
+	 *   - if the sender cannot afford the new fee rate on the receiving
+	 *     node's current commitment transaction:
+	 *     - SHOULD fail the channel
+	 */
 	/* Note: sender == funder */
 
 	/* How much does it think it has?  Must be >= reserve + fee */
@@ -881,7 +901,7 @@ static bool adjust_balance(struct channel *channel, struct htlc *htlc)
 		if (htlc_has(htlc, HTLC_FLAG(side, HTLC_F_COMMITTED)))
 			continue;
 
-		if (!htlc->fail && !htlc->malformed && !htlc->r) {
+		if (!htlc->fail && !htlc->failcode && !htlc->r) {
 			status_trace("%s HTLC %"PRIu64
 				     " %s neither fail nor fulfill?",
 				     htlc_state_owner(htlc->state) == LOCAL
@@ -973,6 +993,12 @@ bool channel_force_htlcs(struct channel *channel,
 				     fulfilled[i].id);
 			return false;
 		}
+		if (htlc->failcode) {
+			status_trace("Fulfill %s HTLC %"PRIu64" already fail %u",
+				     fulfilled_sides[i] == LOCAL ? "out" : "in",
+				     fulfilled[i].id, htlc->failcode);
+			return false;
+		}
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
 			status_trace("Fulfill %s HTLC %"PRIu64" state %s",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
@@ -1006,10 +1032,10 @@ bool channel_force_htlcs(struct channel *channel,
 				     failed[i]->id);
 			return false;
 		}
-		if (htlc->malformed) {
-			status_trace("Fail %s HTLC %"PRIu64" already malformed",
+		if (htlc->failcode) {
+			status_trace("Fail %s HTLC %"PRIu64" already fail %u",
 				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i]->id);
+				     failed[i]->id, htlc->failcode);
 			return false;
 		}
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
@@ -1019,13 +1045,20 @@ bool channel_force_htlcs(struct channel *channel,
 				     htlc_state_name(htlc->state));
 			return false;
 		}
-		if (failed[i]->malformed)
-			htlc->malformed = failed[i]->malformed;
-		else
+		htlc->failcode = failed[i]->failcode;
+		if (failed[i]->failreason)
 			htlc->fail = tal_dup_arr(htlc, u8,
 						 failed[i]->failreason,
-						 tal_len(failed[i]->failreason),
+						 tal_count(failed[i]->failreason),
 						 0);
+		else
+			htlc->fail = NULL;
+		if (failed[i]->scid)
+			htlc->failed_scid = tal_dup(htlc,
+						    struct short_channel_id,
+						    failed[i]->scid);
+		else
+			htlc->failed_scid = NULL;
 	}
 
 	for (i = 0; i < tal_count(htlcs); i++) {
@@ -1049,7 +1082,7 @@ const char *channel_add_err_name(enum channel_add_err e)
 		if (enum_channel_add_err_names[i].v == e)
 			return enum_channel_add_err_names[i].name;
 	}
-	sprintf(invalidbuf, "INVALID %i", e);
+	snprintf(invalidbuf, sizeof(invalidbuf), "INVALID %i", e);
 	return invalidbuf;
 }
 
@@ -1061,6 +1094,6 @@ const char *channel_remove_err_name(enum channel_remove_err e)
 		if (enum_channel_remove_err_names[i].v == e)
 			return enum_channel_remove_err_names[i].name;
 	}
-	sprintf(invalidbuf, "INVALID %i", e);
+	snprintf(invalidbuf, sizeof(invalidbuf), "INVALID %i", e);
 	return invalidbuf;
 }

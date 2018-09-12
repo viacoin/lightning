@@ -2,6 +2,8 @@
 #include <backtrace-supported.h>
 #include <backtrace.h>
 #include <ccan/array_size/array_size.h>
+#include <ccan/err/err.h>
+#include <ccan/io/io.h>
 #include <ccan/list/list.h>
 #include <ccan/opt/opt.h>
 #include <ccan/read_write_all/read_write_all.h>
@@ -15,8 +17,10 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/options.h>
+#include <lightningd/param.h>
 #include <signal.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -96,7 +100,7 @@ static void log_to_stdout(const char *prefix,
 
 static size_t mem_used(const struct log_entry *e)
 {
-	return sizeof(*e) + strlen(e->log) + 1 + tal_len(e->io);
+	return sizeof(*e) + strlen(e->log) + 1 + tal_count(e->io);
 }
 
 static size_t prune_log(struct log_book *log)
@@ -255,8 +259,10 @@ void logv(struct log *log, enum log_level level, const char *fmt, va_list ap)
 
 	l->log = tal_vfmt(l, fmt, ap);
 
+	size_t log_len = strlen(l->log);
+
 	/* Sanitize any non-printable characters, and replace with '?' */
-	for (size_t i=0; i<strlen(l->log); i++)
+	for (size_t i=0; i<log_len; i++)
 		if (l->log[i] < ' ' || l->log[i] >= 0x7f)
 			l->log[i] = '?';
 
@@ -356,12 +362,12 @@ static void log_one_line(unsigned int skipped,
 	char buf[101];
 
 	if (skipped) {
-		sprintf(buf, "%s... %u skipped...", data->prefix, skipped);
+		snprintf(buf, sizeof(buf), "%s... %u skipped...", data->prefix, skipped);
 		write_all(data->fd, buf, strlen(buf));
 		data->prefix = "\n";
 	}
 
-	sprintf(buf, "%s+%lu.%09u %s%s: ",
+	snprintf(buf, sizeof(buf), "%s+%lu.%09u %s%s: ",
 		data->prefix,
 		(unsigned long)diff.ts.tv_sec,
 		(unsigned)diff.ts.tv_nsec,
@@ -440,6 +446,59 @@ static void show_log_prefix(char buf[OPT_SHOW_LEN], const struct log *log)
 	strncpy(buf, log->prefix, OPT_SHOW_LEN);
 }
 
+static int signalfds[2];
+
+static void handle_sighup(int sig)
+{
+	/* Writes a single 0x00 byte to the signalfds pipe. This may fail if
+	 * we're hammered with SIGHUP.  We don't care. */
+	if (write(signalfds[1], "", 1))
+		;
+}
+
+/* Mutual recursion */
+static struct io_plan *setup_read(struct io_conn *conn, struct lightningd *ld);
+
+static struct io_plan *rotate_log(struct io_conn *conn, struct lightningd *ld)
+{
+	FILE *logf;
+
+	log_info(ld->log, "Ending log due to SIGHUP");
+	fclose(ld->log->lr->print_arg);
+
+	logf = fopen(ld->logfile, "a");
+	if (!logf)
+		err(1, "failed to reopen log file %s", ld->logfile);
+	set_log_outfn(ld->log->lr, log_to_file, logf);
+
+	log_info(ld->log, "Started log due to SIGHUP");
+	return setup_read(conn, ld);
+}
+
+static struct io_plan *setup_read(struct io_conn *conn, struct lightningd *ld)
+{
+	/* We read and discard. */
+	static char discard;
+	return io_read(conn, &discard, 1, rotate_log, ld);
+}
+
+static void setup_log_rotation(struct lightningd *ld)
+{
+	struct sigaction act;
+	if (pipe(signalfds) != 0)
+		errx(1, "Pipe for signalfds");
+
+	notleak(io_new_conn(ld, signalfds[0], setup_read, ld));
+
+	io_fd_block(signalfds[1], false);
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = handle_sighup;
+	act.sa_flags = SA_RESETHAND;
+
+	if (sigaction(SIGHUP, &act, NULL) != 0)
+		err(1, "Setting up SIGHUP handler");
+}
+
 char *arg_log_to_file(const char *arg, struct lightningd *ld)
 {
 	FILE *logf;
@@ -447,7 +506,9 @@ char *arg_log_to_file(const char *arg, struct lightningd *ld)
 	if (ld->logfile) {
 		fclose(ld->log->lr->print_arg);
 		ld->logfile = tal_free(ld->logfile);
-	}
+	} else
+		setup_log_rotation(ld);
+
 	ld->logfile = tal_strdup(ld, arg);
 	logf = fopen(arg, "a");
 	if (!logf)
@@ -487,9 +548,6 @@ static void log_dump_to_file(int fd, const struct log_book *lr)
 	struct log_data data;
 	time_t start;
 
-	write_all(fd, "Start of new crash log\n",
-		  strlen("Start of new crash log\n"));
-
 	i = list_top(&lr->log, const struct log_entry, list);
 	if (!i) {
 		write_all(fd, "0 bytes:\n\n", strlen("0 bytes:\n\n"));
@@ -497,7 +555,7 @@ static void log_dump_to_file(int fd, const struct log_book *lr)
 	}
 
 	start = lr->init_time.ts.tv_sec;
-	len = sprintf(buf, "%zu bytes, %s", lr->mem_used, ctime(&start));
+	len = snprintf(buf, sizeof(buf), "%zu bytes, %s", lr->mem_used, ctime(&start));
 	write_all(fd, buf, len);
 
 	/* ctime includes \n... WTF? */
@@ -510,28 +568,31 @@ static void log_dump_to_file(int fd, const struct log_book *lr)
 /* FIXME: Dump peer logs! */
 void log_backtrace_exit(void)
 {
+	int fd;
+	char timebuf[sizeof("YYYYmmddHHMMSS")];
+	char logfile[sizeof("/tmp/lightning-crash.log.") + sizeof(timebuf)];
+	struct timeabs time = time_now();
+
+	strftime(timebuf, sizeof(timebuf), "%Y%m%d%H%M%S", gmtime(&time.ts.tv_sec));
+
 	if (!crashlog)
 		return;
 
-	/* If we're not already pointing at a log file, make one */
-	if (crashlog->lr->print == log_to_stdout) {
-		const char *logfile = NULL;
-		int fd;
+	/* We expect to be in config dir. */
+	snprintf(logfile, sizeof(logfile), "crash.log.%s", timebuf);
 
-		/* We expect to be in config dir. */
-		logfile = "crash.log";
-		fd = open(logfile, O_WRONLY|O_CREAT|O_APPEND, 0600);
-		if (fd < 0) {
-			logfile = "/tmp/lightning-crash.log";
-			fd = open(logfile, O_WRONLY|O_CREAT, 0600);
-		}
+	fd = open(logfile, O_WRONLY|O_CREAT|O_TRUNC, 0600);
+	if (fd < 0) {
+		snprintf(logfile, sizeof(logfile),
+			 "/tmp/lightning-crash.log.%s", timebuf);
+		fd = open(logfile, O_WRONLY|O_CREAT|O_TRUNC, 0600);
+	}
 
-		/* Dump entire log. */
-		if (fd >= 0) {
-			log_dump_to_file(fd, crashlog->lr);
-			close(fd);
-			fprintf(stderr, "Log dumped in %s\n", logfile);
-		}
+	/* Dump entire log. */
+	if (fd >= 0) {
+		log_dump_to_file(fd, crashlog->lr);
+		close(fd);
+		fprintf(stderr, "Log dumped in %s\n", logfile);
 	}
 }
 
@@ -575,7 +636,7 @@ static void json_add_time(struct json_result *result, const char *fieldname,
 {
 	char timebuf[100];
 
-	sprintf(timebuf, "%lu.%09u",
+	snprintf(timebuf, sizeof(timebuf), "%lu.%09u",
 		(unsigned long)ts.tv_sec,
 		(unsigned)ts.tv_nsec);
 	json_add_string(result, fieldname, timebuf);
@@ -611,7 +672,7 @@ static void log_to_json(unsigned int skipped,
 	json_add_string(info->response, "source", prefix);
 	json_add_string(info->response, "log", log);
 	if (io)
-		json_add_hex(info->response, "data", io, tal_count(io));
+		json_add_hex_talarr(info->response, "data", io);
 
 	json_object_end(info->response);
 }
@@ -631,48 +692,47 @@ void json_add_log(struct json_result *response,
 	json_array_end(info.response);
 }
 
-bool json_tok_loglevel(const char *buffer, const jsmntok_t *tok,
-		       enum log_level *level)
+bool json_tok_loglevel(struct command *cmd, const char *name,
+		       const char *buffer, const jsmntok_t *tok,
+		       enum log_level **level)
 {
+	*level = tal(cmd, enum log_level);
 	if (json_tok_streq(buffer, tok, "io"))
-		*level = LOG_IO_OUT;
+		**level = LOG_IO_OUT;
 	else if (json_tok_streq(buffer, tok, "debug"))
-		*level = LOG_DBG;
+		**level = LOG_DBG;
 	else if (json_tok_streq(buffer, tok, "info"))
-		*level = LOG_INFORM;
+		**level = LOG_INFORM;
 	else if (json_tok_streq(buffer, tok, "unusual"))
-		*level = LOG_UNUSUAL;
-	else
+		**level = LOG_UNUSUAL;
+	else {
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "'%s' should be 'io', 'debug', 'info', or "
+			     "'unusual', not '%.*s'",
+			     name, tok->end - tok->start, buffer + tok->start);
 		return false;
+	}
 	return true;
 }
 
 static void json_getlog(struct command *cmd,
-			const char *buffer, const jsmntok_t *params)
+			const char *buffer, const jsmntok_t * params)
 {
 	struct json_result *response = new_json_result(cmd);
-	enum log_level minlevel;
+	enum log_level *minlevel;
 	struct log_book *lr = cmd->ld->log_book;
-	jsmntok_t *level;
 
-	if (!json_get_params(cmd, buffer, params, "?level", &level, NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt_def("level", json_tok_loglevel, &minlevel,
+				 LOG_INFORM),
+		   NULL))
 		return;
-	}
-
-	if (!level)
-		minlevel = LOG_INFORM;
-	else if (!json_tok_loglevel(buffer, level, &minlevel)) {
-		command_fail(cmd, "Invalid level param");
-		return;
-	}
 
 	json_object_start(response, NULL);
-	if (deprecated_apis)
-		json_add_time(response, "creation_time", log_init_time(lr)->ts);
 	json_add_time(response, "created_at", log_init_time(lr)->ts);
-	json_add_num(response, "bytes_used", (unsigned int)log_used(lr));
-	json_add_num(response, "bytes_max", (unsigned int)log_max_mem(lr));
-	json_add_log(response, lr, minlevel);
+	json_add_num(response, "bytes_used", (unsigned int) log_used(lr));
+	json_add_num(response, "bytes_max", (unsigned int) log_max_mem(lr));
+	json_add_log(response, lr, *minlevel);
 	json_object_end(response);
 	command_success(cmd, response);
 }

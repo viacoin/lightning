@@ -19,6 +19,8 @@ struct command {
 	struct lightningd *ld;
 	/* The 'id' which we need to include in the response. */
 	const char *id;
+	/* What command we're running (for logging) */
+	const struct json_command *json_cmd;
 	/* The connection, or NULL if it closed. */
 	struct json_connection *jcon;
 	/* Have we been marked by command_still_pending?  For debugging... */
@@ -60,19 +62,10 @@ struct json_command {
 	const char *verbose;
 };
 
-/* Get the parameters (by position or name).  Followed by triples of
- * of const char *name, const jsmntok_t **ret_ptr, then NULL.
- *
- * If name starts with '?' it is optional (and will be set to NULL
- * if it's a literal 'null' or not present).
- * Otherwise false is returned, and command_fail already called.
- */
-bool json_get_params(struct command *cmd,
-		     const char *buffer, const jsmntok_t param[], ...);
-
 struct json_result *null_response(const tal_t *ctx);
 void command_success(struct command *cmd, struct json_result *response);
-void PRINTF_FMT(2, 3) command_fail(struct command *cmd, const char *fmt, ...);
+void PRINTF_FMT(3, 4) command_fail(struct command *cmd, int code,
+				   const char *fmt, ...);
 void PRINTF_FMT(4, 5) command_fail_detailed(struct command *cmd,
 					     int code,
 					     const struct json_result *data,
@@ -104,7 +97,7 @@ json_tok_address_scriptpubkey(const tal_t *ctx,
 
 /* Parse the satoshi token in wallet_tx. */
 bool json_tok_wtx(struct wallet_tx * tx, const char * buffer,
-		  const jsmntok_t * sattok);
+		  const jsmntok_t * sattok, u64 max);
 
 AUTODATA_TYPE(json_command, struct json_command);
 #endif /* LIGHTNING_LIGHTNINGD_JSONRPC_H */

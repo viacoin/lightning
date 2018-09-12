@@ -3,6 +3,16 @@ import logging
 import socket
 
 
+class RpcError(ValueError):
+    def __init__(self, method, payload, error):
+        super(ValueError, self).__init__("RPC call failed: method: {}, payload: {}, error: {}"
+                                         .format(method, payload, error))
+
+        self.method = method
+        self.payload = payload
+        self.error = error
+
+
 class UnixDomainSocketRpc(object):
     def __init__(self, socket_path, executor=None, logger=logging):
         self.socket_path = socket_path
@@ -23,6 +33,10 @@ class UnixDomainSocketRpc(object):
                 buff += b
                 if len(b) == 0:
                     return {'error': 'Connection to RPC server lost.'}
+
+                if buff[-3:] != b' }\n':
+                    continue
+
                 # Convert late to UTF-8 so glyphs split across recvs do not
                 # impact us
                 objs, _ = self.decoder.raw_decode(buff.decode("UTF-8"))
@@ -63,12 +77,7 @@ class UnixDomainSocketRpc(object):
 
         self.logger.debug("Received response for %s call: %r", method, resp)
         if "error" in resp:
-            raise ValueError(
-                "RPC call failed: {}, method: {}, payload: {}".format(
-                    resp["error"],
-                    method,
-                    payload
-                ))
+            raise RpcError(method, payload, resp['error'])
         elif "result" not in resp:
             raise ValueError("Malformed response, \"result\" missing.")
         return resp["result"]
@@ -99,25 +108,6 @@ class LightningRpc(UnixDomainSocketRpc):
         res = self.call("listpeers", payload)
         return res.get("peers") and res["peers"][0] or None
 
-    def dev_blockheight(self):
-        """
-        Show current block height
-        """
-        return self.call("dev-blockheight")
-
-    def dev_setfees(self, immediate=None, normal=None, slow=None):
-        """
-        Set feerate in satoshi-per-kw for {immediate}, {normal} and {slow}
-        (each is optional, when set, separate by spaces) and show the value
-        of those three feerates
-        """
-        payload = {
-            "immediate": immediate,
-            "normal": normal,
-            "slow": slow
-        }
-        return self.call("dev-setfees", payload)
-
     def listnodes(self, node_id=None):
         """
         Show all nodes in our local network view, filter on node {id}
@@ -128,16 +118,22 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listnodes", payload)
 
-    def getroute(self, peer_id, msatoshi, riskfactor, cltv=9):
+    def getroute(self, peer_id, msatoshi, riskfactor, cltv=9, fromid=None, fuzzpercent=None, seed=None):
         """
         Show route to {id} for {msatoshi}, using {riskfactor} and optional
-        {cltv} (default 9)
+        {cltv} (default 9). If specified search from {fromid} otherwise use
+        this node as source. Randomize the route with up to {fuzzpercent}
+        (0.0 -> 100.0, default 5.0) using {seed} as an arbitrary-size string
+        seed.
         """
         payload = {
             "id": peer_id,
             "msatoshi": msatoshi,
             "riskfactor": riskfactor,
-            "cltv": cltv
+            "cltv": cltv,
+            "fromid": fromid,
+            "fuzzpercent": fuzzpercent,
+            "seed": seed
         }
         return self.call("getroute", payload)
 
@@ -249,19 +245,30 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("dev-crash")
 
+    def dev_query_scids(self, id, scids):
+        """
+        Ask peer for a particular set of scids
+        """
+        payload = {
+            "id": id,
+            "scids": scids
+        }
+        return self.call("dev-query-scids", payload)
+
     def getinfo(self):
         """
         Show information about this node
         """
         return self.call("getinfo")
 
-    def sendpay(self, route, payment_hash):
+    def sendpay(self, route, payment_hash, description=""):
         """
         Send along {route} in return for preimage of {payment_hash}
         """
         payload = {
             "route": route,
-            "payment_hash": payment_hash
+            "payment_hash": payment_hash,
+            "description": description,
         }
         return self.call("sendpay", payload)
 
@@ -324,13 +331,14 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listpeers", payload)
 
-    def fundchannel(self, channel_id, satoshi):
+    def fundchannel(self, node_id, satoshi, feerate=None):
         """
         Fund channel with {id} using {satoshi} satoshis"
         """
         payload = {
-            "id": channel_id,
-            "satoshi": satoshi
+            "id": node_id,
+            "satoshi": satoshi,
+            "feerate": feerate
         }
         return self.call("fundchannel", payload)
 
@@ -374,7 +382,7 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("dev-reenable-commit", payload)
 
-    def dev_ping(self, peer_id, length, pongbytes):
+    def ping(self, peer_id, length=128, pongbytes=128):
         """
         Send {peer_id} a ping of length {len} asking for {pongbytes}"
         """
@@ -383,7 +391,7 @@ class LightningRpc(UnixDomainSocketRpc):
             "len": length,
             "pongbytes": pongbytes
         }
-        return self.call("dev-ping", payload)
+        return self.call("ping", payload)
 
     def dev_memdump(self):
         """
@@ -397,14 +405,15 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("dev-memleak")
 
-    def withdraw(self, destination, satoshi):
+    def withdraw(self, destination, satoshi, feerate=None):
         """
         Send to {destination} address {satoshi} (or "all")
         amount via Bitcoin transaction
         """
         payload = {
             "destination": destination,
-            "satoshi": satoshi
+            "satoshi": satoshi,
+            "feerate": feerate
         }
         return self.call("withdraw", payload)
 
@@ -435,9 +444,21 @@ class LightningRpc(UnixDomainSocketRpc):
 
     def disconnect(self, peer_id):
         """
-        Show peer with {peer_id}, if {level} is set, include {log}s
+        Disconnect from peer with {peer_id}
         """
         payload = {
             "id": peer_id,
         }
         return self.call("disconnect", payload)
+
+    def feerates(self, style, urgent=None, normal=None, slow=None):
+        """
+        Supply feerate estimates manually.
+        """
+        payload = {
+            "style": style,
+            "urgent": urgent,
+            "normal": normal,
+            "slow": slow
+        }
+        return self.call("feerates", payload)

@@ -1,6 +1,5 @@
 #include "pay.h"
 #include <ccan/str/hex/hex.h>
-#include <ccan/structeq/structeq.h>
 #include <ccan/tal/str/str.h>
 #include <common/bolt11.h>
 #include <common/timeout.h>
@@ -12,6 +11,7 @@
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <lightningd/options.h>
+#include <lightningd/param.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/subd.h>
@@ -81,7 +81,7 @@ static void waitsendpay_resolve(const tal_t *ctx,
 	struct sendpay_command *pc;
 	struct sendpay_command *next;
 	list_for_each_safe(&ld->waitsendpay_commands, pc, next, list) {
-		if (!structeq(payment_hash, &pc->payment_hash))
+		if (!sha256_eq(payment_hash, &pc->payment_hash))
 			continue;
 
 		/* Delete later (in our own caller) if callback did
@@ -187,6 +187,27 @@ void payment_succeeded(struct lightningd *ld, struct htlc_out *hout,
 	payment_trigger_success(ld, &hout->payment_hash);
 }
 
+/* Fix up the channel_update to include the type if it doesn't currently have
+ * one. See ElementsProject/lightning#1730 and lightningnetwork/lnd#1599 for the
+ * in-depth discussion on why we break message parsing here... */
+static u8 *patch_channel_update(const tal_t *ctx, u8 *channel_update TAKES)
+{
+	u8 *fixed;
+	if (channel_update != NULL &&
+	    fromwire_peektype(channel_update) != WIRE_CHANNEL_UPDATE) {
+		/* This should be a channel_update, prefix with the
+		 * WIRE_CHANNEL_UPDATE type, but isn't. Let's prefix it. */
+		fixed = tal_arr(ctx, u8, 0);
+		towire_u16(&fixed, WIRE_CHANNEL_UPDATE);
+		towire(&fixed, channel_update, tal_bytelen(channel_update));
+		if (taken(channel_update))
+			tal_free(channel_update);
+		return fixed;
+	} else {
+		return channel_update;
+	}
+}
+
 /* Return NULL if the wrapped onion error message has no
  * channel_update field, or return the embedded
  * channel_update message otherwise. */
@@ -217,9 +238,9 @@ static u8 *channel_update_from_onion_error(const tal_t *ctx,
 		    		      onion_message,
 				      &channel_update))
 		/* No channel update. */
-		channel_update = NULL;
+		return NULL;
 
-	return channel_update;
+	return patch_channel_update(ctx, take(channel_update));
 }
 
 /* Return a struct routing_failure for an immediate failure
@@ -276,7 +297,8 @@ remote_routing_failure(const tal_t *ctx,
 		       bool *p_retry_plausible,
 		       bool *p_report_to_gossipd,
 		       const struct wallet_payment *payment,
-		       const struct onionreply *failure)
+		       const struct onionreply *failure,
+		       struct log *log)
 {
 	enum onion_type failcode = fromwire_peektype(failure->msg);
 	u8 *channel_update;
@@ -297,6 +319,11 @@ remote_routing_failure(const tal_t *ctx,
 	channel_update
 		= channel_update_from_onion_error(routing_failure,
 						  failure->msg);
+	if (channel_update)
+		log_debug(log, "Extracted channel_update %s from onionreply %s",
+			  tal_hex(tmpctx, channel_update),
+			  tal_hex(tmpctx, failure->msg));
+
 	retry_plausible = true;
 	report_to_gossipd = true;
 
@@ -381,6 +408,7 @@ static void report_routing_failure(struct log *log,
 		  type_to_string(tmpctx, struct short_channel_id,
 			  	 &fail->erring_channel),
 		  tal_hex(tmpctx, fail->channel_update));
+
 	gossip_msg = towire_gossip_routing_failure(tmpctx,
 						   &fail->erring_node,
 						   &fail->erring_channel,
@@ -407,7 +435,7 @@ void payment_store(struct lightningd *ld,
 
 	/* Trigger any sendpay commands waiting for the store to occur. */
 	list_for_each_safe(&ld->sendpay_commands, pc, next, list) {
-		if (!structeq(payment_hash, &pc->payment_hash))
+		if (!sha256_eq(payment_hash, &pc->payment_hash))
 			continue;
 
 		/* Delete later if callback did not delete. */
@@ -499,7 +527,8 @@ void payment_failed(struct lightningd *ld, const struct htlc_out *hout,
 			fail = remote_routing_failure(tmpctx,
 						      &retry_plausible,
 						      &report_to_gossipd,
-						      payment, reply);
+						      payment, reply,
+						      hout->key.channel->log);
 		}
 	}
 
@@ -632,6 +661,7 @@ send_payment(const tal_t *ctx,
 	     const struct sha256 *rhash,
 	     const struct route_hop *route,
 	     u64 msatoshi,
+	     const char *description TAKES,
 	     void (*cb)(const struct sendpay_result *, void*),
 	     void *cbarg)
 {
@@ -700,7 +730,7 @@ send_payment(const tal_t *ctx,
 				cb(result, cbarg);
 				return false;
 			}
-			if (!structeq(&payment->destination, &ids[n_hops-1])) {
+			if (!pubkey_eq(&payment->destination, &ids[n_hops-1])) {
 				char *msg = tal_fmt(tmpctx,
 						    "Already succeeded to %s",
 						    type_to_string(tmpctx,
@@ -792,6 +822,10 @@ send_payment(const tal_t *ctx,
 	payment->path_secrets = tal_steal(payment, path_secrets);
 	payment->route_nodes = tal_steal(payment, ids);
 	payment->route_channels = tal_steal(payment, channels);
+	if (description != NULL)
+		payment->description = tal_strdup(payment, description);
+	else
+		payment->description = NULL;
 
 	/* We write this into db when HTLC is actually sent. */
 	wallet_payment_setup(ld->wallet, payment);
@@ -847,8 +881,7 @@ static void json_waitsendpay_on_resolve(const struct sendpay_result *r,
 		case PAY_UNPARSEABLE_ONION:
 			data = new_json_result(cmd);
 			json_object_start(data, NULL);
-			json_add_hex(data, "onionreply",
-				     r->onionreply, tal_len(r->onionreply));
+			json_add_hex_talarr(data, "onionreply", r->onionreply);
 			json_object_end(data);
 
 			assert(r->details != NULL);
@@ -873,9 +906,8 @@ static void json_waitsendpay_on_resolve(const struct sendpay_result *r,
 			json_add_short_channel_id(data, "erring_channel",
 						  &fail->erring_channel);
 			if (fail->channel_update)
-				json_add_hex(data, "channel_update",
-					     fail->channel_update,
-					     tal_len(fail->channel_update));
+				json_add_hex_talarr(data, "channel_update",
+						    fail->channel_update);
 			json_object_end(data);
 
 			assert(r->details != NULL);
@@ -913,116 +945,73 @@ static void json_sendpay_on_resolve(const struct sendpay_result* r,
 static void json_sendpay(struct command *cmd,
 			 const char *buffer, const jsmntok_t *params)
 {
-	jsmntok_t *routetok, *rhashtok;
-	jsmntok_t *msatoshitok;
+	const jsmntok_t *routetok;
 	const jsmntok_t *t, *end;
 	size_t n_hops;
-	struct sha256 rhash;
+	struct sha256 *rhash;
 	struct route_hop *route;
-	u64 msatoshi;
+	u64 *msatoshi;
+	const char *description;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "route", &routetok,
-			     "payment_hash", &rhashtok,
-			     "?msatoshi", &msatoshitok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_req("route", json_tok_array, &routetok),
+		   p_req("payment_hash", json_tok_sha256, &rhash),
+		   p_opt("description", json_tok_escaped_string, &description),
+		   p_opt("msatoshi", json_tok_u64, &msatoshi),
+		   NULL))
 		return;
-	}
-
-	if (!hex_decode(buffer + rhashtok->start,
-			rhashtok->end - rhashtok->start,
-			&rhash, sizeof(rhash))) {
-		command_fail(cmd, "'%.*s' is not a valid sha256 hash",
-			     rhashtok->end - rhashtok->start,
-			     buffer + rhashtok->start);
-		return;
-	}
-
-	if (routetok->type != JSMN_ARRAY) {
-		command_fail(cmd, "'%.*s' is not an array",
-			     routetok->end - routetok->start,
-			     buffer + routetok->start);
-		return;
-	}
 
 	end = json_next(routetok);
 	n_hops = 0;
 	route = tal_arr(cmd, struct route_hop, n_hops);
 
 	for (t = routetok + 1; t < end; t = json_next(t)) {
-		const jsmntok_t *amttok, *idtok, *delaytok, *chantok;
+		u64 *amount;
+		struct pubkey *id;
+		struct short_channel_id *channel;
+		unsigned *delay;
 
-		if (t->type != JSMN_OBJECT) {
-			command_fail(cmd, "Route %zu '%.*s' is not an object",
-				     n_hops,
-				     t->end - t->start,
-				     buffer + t->start);
+		if (!param(cmd, buffer, t,
+			   p_req("msatoshi", json_tok_u64, &amount),
+			   p_req("id", json_tok_pubkey, &id),
+			   p_req("delay", json_tok_number, &delay),
+			   p_req("channel", json_tok_short_channel_id, &channel),
+			   NULL))
 			return;
-		}
-		amttok = json_get_member(buffer, t, "msatoshi");
-		idtok = json_get_member(buffer, t, "id");
-		delaytok = json_get_member(buffer, t, "delay");
-		chantok = json_get_member(buffer, t, "channel");
-		if (!amttok || !idtok || !delaytok || !chantok) {
-			command_fail(cmd, "Route %zu needs msatoshi/id/channel/delay",
-				     n_hops);
-			return;
-		}
 
 		tal_resize(&route, n_hops + 1);
 
-		/* What that hop will forward */
-		if (!json_tok_u64(buffer, amttok, &route[n_hops].amount)) {
-			command_fail(cmd, "Route %zu invalid msatoshi",
-				     n_hops);
-			return;
-		}
-
-		if (!json_tok_short_channel_id(buffer, chantok,
-					       &route[n_hops].channel_id)) {
-			command_fail(cmd, "Route %zu invalid channel_id", n_hops);
-			return;
-		}
-		if (!json_tok_pubkey(buffer, idtok, &route[n_hops].nodeid)) {
-			command_fail(cmd, "Route %zu invalid id", n_hops);
-			return;
-		}
-		if (!json_tok_number(buffer, delaytok, &route[n_hops].delay)) {
-			command_fail(cmd, "Route %zu invalid delay", n_hops);
-			return;
-		}
+		route[n_hops].amount = *amount;
+		route[n_hops].nodeid = *id;
+		route[n_hops].delay = *delay;
+		route[n_hops].channel_id = *channel;
 		n_hops++;
 	}
 
 	if (n_hops == 0) {
-		command_fail(cmd, "Empty route");
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Empty route");
 		return;
 	}
 
-	if (msatoshitok) {
-		if (!json_tok_u64(buffer, msatoshitok, &msatoshi)) {
-			command_fail(cmd, "'%.*s' is not a number",
-				     msatoshitok->end - msatoshitok->start,
-				     buffer + msatoshitok->start);
-			return;
-		}
-		/* The given msatoshi is the actual payment that
-		 * the payee is requesting. The final hop amount, is
-		 * what we actually give, which can be from the
-		 * msatoshi to twice msatoshi. */
-		/* if not: msatoshi <= finalhop.amount <= 2 * msatoshi,
-		 * fail. */
-		if (!(msatoshi <= route[n_hops-1].amount &&
-		      route[n_hops-1].amount <= 2 * msatoshi)) {
-			command_fail(cmd, "msatoshi %"PRIu64" out of range",
-				     msatoshi);
-			return;
-		}
-	} else
-		msatoshi = route[n_hops-1].amount;
+	/* The given msatoshi is the actual payment that the payee is
+	 * requesting. The final hop amount is what we actually give, which can
+	 * be from the msatoshi to twice msatoshi. */
 
-	if (send_payment(cmd, cmd->ld, &rhash, route, msatoshi,
-			  &json_sendpay_on_resolve, cmd))
+	/* if not: msatoshi <= finalhop.amount <= 2 * msatoshi, fail. */
+	if (msatoshi) {
+		if (!(*msatoshi <= route[n_hops-1].amount &&
+		      route[n_hops-1].amount <= 2 * *msatoshi)) {
+			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				     "msatoshi %"PRIu64" out of range",
+				     *msatoshi);
+			return;
+		}
+	}
+
+	if (send_payment(cmd, cmd->ld, rhash, route,
+			 msatoshi ? *msatoshi : route[n_hops-1].amount,
+			 description,
+			 &json_sendpay_on_resolve, cmd))
 		command_still_pending(cmd);
 }
 
@@ -1035,47 +1024,27 @@ AUTODATA(json_command, &sendpay_command);
 
 static void waitsendpay_timeout(struct command *cmd)
 {
-	command_fail_detailed(cmd, PAY_IN_PROGRESS, NULL,
-			      "Timed out while waiting");
+	command_fail(cmd, PAY_IN_PROGRESS, "Timed out while waiting");
 }
 
 static void json_waitsendpay(struct command *cmd, const char *buffer,
 			     const jsmntok_t *params)
 {
-	jsmntok_t *rhashtok;
-	jsmntok_t *timeouttok;
-	struct sha256 rhash;
-	unsigned int timeout;
+	struct sha256 *rhash;
+	unsigned int *timeout;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "payment_hash", &rhashtok,
-			     "?timeout", &timeouttok,
-			     NULL))
+	if (!param(cmd, buffer, params,
+		   p_req("payment_hash", json_tok_sha256, &rhash),
+		   p_opt("timeout", json_tok_number, &timeout),
+		   NULL))
 		return;
 
-	if (!hex_decode(buffer + rhashtok->start,
-			rhashtok->end - rhashtok->start,
-			&rhash, sizeof(rhash))) {
-		command_fail(cmd, "'%.*s' is not a valid sha256 hash",
-			     rhashtok->end - rhashtok->start,
-			     buffer + rhashtok->start);
-		return;
-	}
-
-	if (timeouttok && !json_tok_number(buffer, timeouttok, &timeout)) {
-		command_fail(cmd, "'%.*s' is not a valid number",
-			     timeouttok->end - timeouttok->start,
-			     buffer + timeouttok->start);
-		return;
-	}
-
-	if (!wait_payment(cmd, cmd->ld, &rhash, &json_waitsendpay_on_resolve, cmd))
+	if (!wait_payment(cmd, cmd->ld, rhash, &json_waitsendpay_on_resolve, cmd))
 		return;
 
-	if (timeouttok)
-		new_reltimer(&cmd->ld->timers, cmd, time_from_sec(timeout),
+	if (timeout)
+		new_reltimer(&cmd->ld->timers, cmd, time_from_sec(*timeout),
 			     &waitsendpay_timeout, cmd);
-
 	command_still_pending(cmd);
 }
 
@@ -1092,57 +1061,47 @@ static void json_listpayments(struct command *cmd, const char *buffer,
 {
 	const struct wallet_payment **payments;
 	struct json_result *response = new_json_result(cmd);
-	jsmntok_t *bolt11tok, *rhashtok;
-	struct sha256 *rhash = NULL;
+	struct sha256 *rhash;
+	const char *b11str;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "?bolt11", &bolt11tok,
-			     "?payment_hash", &rhashtok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt("bolt11", json_tok_string, &b11str),
+		   p_opt("payment_hash", json_tok_sha256, &rhash),
+		   NULL))
+		return;
+
+	if (rhash && b11str) {
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Can only specify one of"
+			     " {bolt11} or {payment_hash}");
 		return;
 	}
 
-	if (bolt11tok) {
+	if (b11str) {
 		struct bolt11 *b11;
-		char *b11str, *fail;
-
-		if (rhashtok) {
-			command_fail(cmd, "Can only specify one of"
-				     " {bolt11} or {payment_hash}");
-			return;
-		}
-
-		b11str = tal_strndup(cmd, buffer + bolt11tok->start,
-				     bolt11tok->end - bolt11tok->start);
+		char *fail;
 
 		b11 = bolt11_decode(cmd, b11str, NULL, &fail);
 		if (!b11) {
-			command_fail(cmd, "Invalid bolt11: %s", fail);
+			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				     "Invalid bolt11: %s", fail);
 			return;
 		}
 		rhash = &b11->payment_hash;
-	} else if (rhashtok) {
-		rhash = tal(cmd, struct sha256);
-		if (!hex_decode(buffer + rhashtok->start,
-				rhashtok->end - rhashtok->start,
-				rhash, sizeof(*rhash))) {
-			command_fail(cmd, "'%.*s' is not a valid sha256 hash",
-				     rhashtok->end - rhashtok->start,
-				     buffer + rhashtok->start);
-			return;
-		}
 	}
 
 	payments = wallet_payment_list(cmd, cmd->ld->wallet, rhash);
 
 	json_object_start(response, NULL);
+
 	json_array_start(response, "payments");
-	for (int i=0; i<tal_count(payments); i++) {
+	for (size_t i = 0; i < tal_count(payments); i++) {
 		json_object_start(response, NULL);
 		json_add_payment_fields(response, payments[i]);
 		json_object_end(response);
 	}
 	json_array_end(response);
+
 	json_object_end(response);
 	command_success(cmd, response);
 }

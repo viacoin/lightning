@@ -45,7 +45,7 @@ mailing list [lightning-dev@lists.linuxfoundation.org][ml2].
 ## Getting Started
 
 c-lightning currently only works on Linux (and possibly Mac OS with some
-tweaking), and requires a locally running `bitcoind` (version 0.15 or
+tweaking), and requires a locally (or remotely) running `bitcoind` (version 0.15 or
 above) that is fully caught up with the network you're testing on.
 Pruning (prune=n option in bitcoin.conf) is not currently supported.
 
@@ -58,18 +58,69 @@ For the impatient here's the gist of it for Ubuntu and Debian:
     sudo apt-get update
     sudo apt-get install -y \
       autoconf automake build-essential git libtool libgmp-dev \
-      libsqlite3-dev python python3 net-tools
+      libsqlite3-dev python python3 net-tools zlib1g-dev
     git clone https://github.com/ElementsProject/lightning.git
     cd lightning
+    ./configure
     make
 
-Or if you like to throw `docker` into the mix:
+Or if you like to throw `docker` into the mix, you can use the offial docker image either directly or as a base layer for more complex images.
+The docker image is [elementsproject/lightningd](https://hub.docker.com/r/elementsproject/lightningd/) (from this [Dockerfile](Dockerfile)).
+Image tags with `-dev` at the end are images built with `DEVELOPER=1`.
+If you build the image yourself, you can use the build arg `DEVELOPER=1` to build c-lightning in developer mode.
 
-    sudo docker run \
-    	-v $HOME/.lightning:/root/.lightning \
-    	-v $HOME/.bitcoin:/root/.bitcoin \
-    	-p 9735:9735 \
-    	cdecker/lightningd:latest
+It has the following environment variable:
+
+* `EXPOSE_TCP` default to false, if true, use expose c-lightning RPC on port 9835. (Use this only for testing)
+
+Here is an example of a docker-compose file with bitcoind and c-lightning on `testnet` which expose bitcoind's rpc interface on default ports `18332` and c-lightning API on port `9735`:
+
+```
+version: "3"
+services:
+  bitcoind:
+    image: nicolasdorier/docker-bitcoin:0.16.0
+    container_name: bitcoind
+    environment:
+      BITCOIN_EXTRA_ARGS: |
+        testnet=1
+        whitelist=0.0.0.0/0
+        server=1
+        rpcuser=rpcuser
+        rpcpassword=rpcpass
+    expose:
+      - "18332"
+    ports:
+      - "0.0.0.0:18333:18333"
+    volumes:
+      - "bitcoin_datadir:/data"
+
+  clightning_bitcoin:
+    image: elementsproject/lightningd
+    container_name: lightningd
+    command:
+      - --bitcoin-rpcconnect=bitcoind
+      - --bitcoin-rpcuser=rpcuser
+      - --bitcoin-rpcpassword=rpcpass
+      - --network=testnet
+      - --alias=myawesomenode
+      - --log-level=debug
+    environment:
+      EXPOSE_TCP: "true"
+    expose:
+      - "9735"
+    ports:
+      - "0.0.0.0:9735:9735"
+    volumes:
+      - "clightning_bitcoin_datadir:/root/.lightning"
+      - "bitcoin_datadir:/etc/bitcoin"
+    links:
+      - bitcoind
+
+volumes:
+  bitcoin_datadir:
+  clightning_bitcoin_datadir:
+```
 
 ### Starting `lightningd`
 
@@ -109,6 +160,12 @@ open a channel:
 If you don't have any testcoins you can get a few from a faucet such as
 [TPs' testnet faucet][tps] or [Kiwi's testnet faucet][kiw].
 You can send it directly to the `lightningd` address.
+
+You may need to generate a p2sh-segwit address if the faucet does not support
+bech32:
+
+    # Return a p2sh-segwit address
+    cli/lightning-cli newaddr p2sh-segwit
 
 [tps]: http://tpfaucet.appspot.com/
 [kiw]: https://testnet.manu.backend.hamburg/faucet

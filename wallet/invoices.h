@@ -30,14 +30,6 @@ struct invoices *invoices_new(const tal_t *ctx,
 			      struct timers *timers);
 
 /**
- * invoices_load - Second-stage constructor for invoice handler.
- * Must be called before the other functions are called
- *
- * @invoices - the invoice handler.
- */
-bool invoices_load(struct invoices *invoices);
-
-/**
  * invoices_create - Create a new invoice.
  *
  * @invoices - the invoice handler.
@@ -59,15 +51,16 @@ bool invoices_create(struct invoices *invoices,
 		     const struct json_escaped *label TAKES,
 		     u64 expiry,
 		     const char *b11enc,
+		     const char *description,
 		     const struct preimage *r,
 		     const struct sha256 *rhash);
 
 /**
  * invoices_find_by_label - Search for an invoice by label
  *
- * @invoices - the invoice handler.
- * @pinvoice - pointer to location to load found invoice in.
- * @label - the label to search for.
+ * @param invoices - the invoice handler.
+ * @param pinvoice - pointer to location to load found invoice in.
+ * @param label - the label to search for.
  *
  * Returns false if no invoice with that label exists.
  * Returns true if found.
@@ -168,13 +161,12 @@ bool invoices_iterate(struct invoices *invoices,
  * @ctx - the owner of the label and msatoshi fields returned.
  * @wallet - the wallet whose invoices are to be iterated over.
  * @iterator - the iterator object to use.
- * @details - pointer to details object to load.
+ * @return The invoice details allocated off of `ctx`
  *
  */
-void invoices_iterator_deref(const tal_t *ctx,
-			     struct invoices *invoices,
-			     const struct invoice_iterator *it,
-			     struct invoice_details *details);
+const struct invoice_details *invoices_iterator_deref(
+	const tal_t *ctx, struct invoices *invoices,
+	const struct invoice_iterator *it);
 
 /**
  * invoices_resolve - Mark an invoice as paid
@@ -238,11 +230,10 @@ void invoices_waitone(const tal_t *ctx,
  * @ctx - the owner of the label and msatoshi fields returned.
  * @invoices - the invoice handler,
  * @invoice - the invoice to get details on.
- * @details - pointer to details object to load.
+ * @return pointer to the invoice details allocated off of `ctx`.
  */
-void invoices_get_details(const tal_t *ctx,
-			  struct invoices *invoices,
-			  struct invoice invoice,
-			  struct invoice_details *details);
+const struct invoice_details *invoices_get_details(const tal_t *ctx,
+						   struct invoices *invoices,
+						   struct invoice invoice);
 
 #endif /* LIGHTNING_WALLET_INVOICES_H */

@@ -1,12 +1,12 @@
 #include "invoice.h"
 #include "json.h"
 #include "jsonrpc.h"
+#include "jsonrpc_errors.h"
 #include "lightningd.h"
 #include <bitcoin/address.h>
 #include <bitcoin/base58.h>
 #include <bitcoin/script.h>
 #include <ccan/str/hex/hex.h>
-#include <ccan/structeq/structeq.h>
 #include <ccan/tal/str/str.h>
 #include <common/bech32.h>
 #include <common/bolt11.h>
@@ -19,6 +19,7 @@
 #include <lightningd/jsonrpc_errors.h>
 #include <lightningd/log.h>
 #include <lightningd/options.h>
+#include <lightningd/param.h>
 #include <sodium/randombytes.h>
 #include <wire/wire_sync.h>
 
@@ -32,8 +33,7 @@ static const char *invoice_status_str(const struct invoice_details *inv)
 }
 
 static void json_add_invoice(struct json_result *response,
-			     const struct invoice_details *inv,
-			     bool modern)
+			     const struct invoice_details *inv)
 {
 	json_object_start(response, NULL);
 	json_add_escaped_string(response, "label", inv->label);
@@ -41,21 +41,17 @@ static void json_add_invoice(struct json_result *response,
 	json_add_hex(response, "payment_hash", &inv->rhash, sizeof(inv->rhash));
 	if (inv->msatoshi)
 		json_add_u64(response, "msatoshi", *inv->msatoshi);
-	if (modern)
-		json_add_string(response, "status", invoice_status_str(inv));
-	else if (deprecated_apis && !modern)
-		json_add_bool(response, "complete", inv->state == PAID);
+	json_add_string(response, "status", invoice_status_str(inv));
 	if (inv->state == PAID) {
 		json_add_u64(response, "pay_index", inv->pay_index);
 		json_add_u64(response, "msatoshi_received",
 			     inv->msatoshi_received);
-		if (deprecated_apis)
-			json_add_u64(response, "paid_timestamp",
-				     inv->paid_timestamp);
 		json_add_u64(response, "paid_at", inv->paid_timestamp);
 	}
-	if (deprecated_apis)
-		json_add_u64(response, "expiry_time", inv->expiry_time);
+
+	if (inv->description)
+		json_add_string(response, "description", inv->description);
+
 	json_add_u64(response, "expires_at", inv->expiry_time);
 
 	json_object_end(response);
@@ -64,19 +60,21 @@ static void json_add_invoice(struct json_result *response,
 static void tell_waiter(struct command *cmd, const struct invoice *inv)
 {
 	struct json_result *response = new_json_result(cmd);
-	struct invoice_details details;
+	const struct invoice_details *details;
 
-	wallet_invoice_details(cmd, cmd->ld->wallet, *inv, &details);
-	json_add_invoice(response, &details, true);
-	if (details.state == PAID)
+	details = wallet_invoice_details(cmd, cmd->ld->wallet, *inv);
+	json_add_invoice(response, details);
+	if (details->state == PAID)
 		command_success(cmd, response);
-	else
+	else {
+		/* FIXME: -2 should be a constant in jsonrpc_errors.h.  */
 		command_fail_detailed(cmd, -2, response,
 				      "invoice expired during wait");
+	}
 }
 static void tell_waiter_deleted(struct command *cmd)
 {
-	command_fail(cmd, "Invoice deleted during wait");
+	command_fail(cmd, LIGHTNINGD, "Invoice deleted during wait");
 }
 static void wait_on_invoice(const struct invoice *invoice, void *cmd)
 {
@@ -91,41 +89,17 @@ static bool hsm_sign_b11(const u5 *u5bytes,
 			 secp256k1_ecdsa_recoverable_signature *rsig,
 			 struct lightningd *ld)
 {
-	u8 *msg = towire_hsm_sign_invoice(ld, u5bytes, hrpu8);
+	u8 *msg = towire_hsm_sign_invoice(NULL, u5bytes, hrpu8);
 
 	if (!wire_sync_write(ld->hsm_fd, take(msg)))
 		fatal("Could not write to HSM: %s", strerror(errno));
 
-	msg = hsm_sync_read(ld, ld);
+	msg = wire_sync_read(tmpctx, ld->hsm_fd);
         if (!fromwire_hsm_sign_invoice_reply(msg, rsig))
 		fatal("HSM gave bad sign_invoice_reply %s",
 		      tal_hex(msg, msg));
 
-	tal_free(msg);
 	return true;
-}
-
-/* We allow a string, or a literal number, for labels */
-static struct json_escaped *json_tok_label(const tal_t *ctx,
-					   const char *buffer,
-					   const jsmntok_t *tok)
-{
-	struct json_escaped *label;
-
-	label = json_tok_escaped_string(ctx, buffer, tok);
-	if (label)
-		return label;
-
-	/* Allow literal numbers */
-	if (tok->type != JSMN_PRIMITIVE)
-		return NULL;
-
-	for (int i = tok->start; i < tok->end; i++)
-		if (!cisdigit(buffer[i]))
-			return NULL;
-
-	return json_escaped_string_(ctx, buffer + tok->start,
-				    tok->end - tok->start);
 }
 
 static bool parse_fallback(struct command *cmd,
@@ -141,10 +115,11 @@ static bool parse_fallback(struct command *cmd,
 						buffer, fallback,
 						fallback_script);
 	if (fallback_parse == ADDRESS_PARSE_UNRECOGNIZED) {
-		command_fail(cmd, "Fallback address not valid");
+		command_fail(cmd, LIGHTNINGD, "Fallback address not valid");
 		return false;
 	} else if (fallback_parse == ADDRESS_PARSE_WRONG_NETWORK) {
-		command_fail(cmd, "Fallback address does not match our network %s",
+		command_fail(cmd, LIGHTNINGD,
+			     "Fallback address does not match our network %s",
 			     get_chainparams(cmd->ld)->network_name);
 		return false;
 	}
@@ -155,83 +130,44 @@ static void json_invoice(struct command *cmd,
 			 const char *buffer, const jsmntok_t *params)
 {
 	struct invoice invoice;
-	struct invoice_details details;
-	jsmntok_t *msatoshi, *label, *desctok, *exp, *fallback, *fallbacks;
-	jsmntok_t *preimagetok;
+	const struct invoice_details *details;
+	const jsmntok_t *fallbacks;
+	const jsmntok_t *preimagetok;
 	u64 *msatoshi_val;
-	const struct json_escaped *label_val, *desc;
+	struct json_escaped *label_val;
 	const char *desc_val;
 	struct json_result *response = new_json_result(cmd);
 	struct wallet *wallet = cmd->ld->wallet;
 	struct bolt11 *b11;
 	char *b11enc;
 	const u8 **fallback_scripts = NULL;
-	u64 expiry = 3600;
+	u64 *expiry;
 	bool result;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "msatoshi", &msatoshi,
-			     "label", &label,
-			     "description", &desctok,
-			     "?expiry", &exp,
-			     "?fallback", &fallback,
-			     "?fallbacks", &fallbacks,
-			     "?preimage", &preimagetok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_req("msatoshi", json_tok_msat, &msatoshi_val),
+		   p_req("label", json_tok_label, &label_val),
+		   p_req("description", json_tok_escaped_string, &desc_val),
+		   p_opt_def("expiry", json_tok_u64, &expiry, 3600),
+		   p_opt("fallbacks", json_tok_array, &fallbacks),
+		   p_opt("preimage", json_tok_tok, &preimagetok),
+		   NULL))
 		return;
-	}
 
-	/* Get arguments. */
-	/* msatoshi */
-	if (json_tok_streq(buffer, msatoshi, "any"))
-		msatoshi_val = NULL;
-	else {
-		msatoshi_val = tal(cmd, u64);
-		if (!json_tok_u64(buffer, msatoshi, msatoshi_val)
-		    || *msatoshi_val == 0) {
-			command_fail(cmd,
-				     "'%.*s' is not a valid positive number",
-				     msatoshi->end - msatoshi->start,
-				     buffer + msatoshi->start);
-			return;
-		}
-	}
-	/* label */
-	label_val = json_tok_label(cmd, buffer, label);
-	if (!label_val) {
-		command_fail(cmd, "label '%.*s' not a string or number",
-			     label->end - label->start, buffer + label->start);
-		return;
-	}
 	if (wallet_invoice_find_by_label(wallet, &invoice, label_val)) {
-		command_fail_detailed(cmd, INVOICE_LABEL_ALREADY_EXISTS,
-				      NULL,
-				      "Duplicate label '%s'", label_val->s);
+		command_fail(cmd, INVOICE_LABEL_ALREADY_EXISTS,
+			     "Duplicate label '%s'", label_val->s);
 		return;
 	}
 	if (strlen(label_val->s) > INVOICE_MAX_LABEL_LEN) {
-		command_fail(cmd, "Label '%s' over %u bytes", label_val->s,
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Label '%s' over %u bytes", label_val->s,
 			     INVOICE_MAX_LABEL_LEN);
 		return;
 	}
 
-	desc = json_tok_escaped_string(cmd, buffer, desctok);
-	if (!desc) {
-		command_fail(cmd, "description '%.*s' not a string",
-			     desctok->end - desctok->start,
-			     buffer + desctok->start);
-		return;
-	}
-	desc_val = json_escaped_unescape(cmd, desc);
-	if (!desc_val) {
-		command_fail(cmd, "description '%s' is invalid"
-			     " (note: we don't allow \\u)",
-			     desc->s);
-		return;
-	}
-	/* description */
 	if (strlen(desc_val) >= BOLT11_FIELD_BYTE_LIMIT) {
-		command_fail(cmd,
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 			     "Descriptions greater than %d bytes "
 			     "not yet supported "
 			     "(description length %zu)",
@@ -239,40 +175,11 @@ static void json_invoice(struct command *cmd,
 			     strlen(desc_val));
 		return;
 	}
-	/* expiry */
-	if (exp && !json_tok_u64(buffer, exp, &expiry)) {
-		command_fail(cmd, "Expiry '%.*s' invalid seconds",
-			     exp->end - exp->start,
-			     buffer + exp->start);
-		return;
-	}
-
-	/* fallback addresses */
-	if (fallback) {
-		if (deprecated_apis) {
-			fallback_scripts = tal_arr(cmd, const u8 *, 1);
-			if (!parse_fallback(cmd, buffer, fallback,
-					    &fallback_scripts[0]))
-				return;
-		} else {
-			command_fail(cmd, "fallback is deprecated: use fallbacks");
-			return;
-		}
-	}
 
 	if (fallbacks) {
 		const jsmntok_t *i, *end = json_next(fallbacks);
 		size_t n = 0;
 
-		if (fallback) {
-			command_fail(cmd, "Cannot use fallback and fallbacks");
-			return;
-		}
-
-		if (fallbacks->type != JSMN_ARRAY) {
-			command_fail(cmd, "fallback must be an array");
-			return;
-		}
 		fallback_scripts = tal_arr(cmd, const u8 *, n);
 		for (i = fallbacks + 1; i < end; i = json_next(i)) {
 			tal_resize(&fallback_scripts, n+1);
@@ -291,7 +198,8 @@ static void json_invoice(struct command *cmd,
 		if (!hex_decode(buffer + preimagetok->start,
 				preimagetok->end - preimagetok->start,
 				r.r, sizeof(r.r))) {
-			command_fail(cmd, "preimage must be 64 hex digits");
+			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				     "preimage must be 64 hex digits");
 			return;
 		}
 	} else
@@ -306,8 +214,8 @@ static void json_invoice(struct command *cmd,
 	 */
 	if (preimagetok &&
 	    wallet_invoice_find_by_rhash(cmd->ld->wallet, &invoice, &rhash)) {
-		command_fail_detailed(cmd, INVOICE_PREIMAGE_ALREADY_EXISTS,
-				      NULL, "preimage already used");
+		command_fail(cmd, INVOICE_PREIMAGE_ALREADY_EXISTS,
+			     "preimage already used");
 		return;
 	}
 
@@ -318,7 +226,7 @@ static void json_invoice(struct command *cmd,
 	b11->payment_hash = rhash;
 	b11->receiver_id = cmd->ld->id;
 	b11->min_final_cltv_expiry = cmd->ld->config.cltv_final;
-	b11->expiry = expiry;
+	b11->expiry = *expiry;
 	b11->description = tal_steal(b11, desc_val);
 	b11->description_hash = NULL;
 	if (fallback_scripts)
@@ -331,113 +239,78 @@ static void json_invoice(struct command *cmd,
 				       &invoice,
 				       take(msatoshi_val),
 				       take(label_val),
-				       expiry,
+				       *expiry,
 				       b11enc,
+				       b11->description,
 				       &r,
 				       &rhash);
 
 	if (!result) {
-		   command_fail(cmd, "Failed to create invoice on database");
+		command_fail(cmd, LIGHTNINGD,
+			     "Failed to create invoice on database");
 		   return;
 	}
 
 	/* Get details */
-	wallet_invoice_details(cmd, cmd->ld->wallet, invoice, &details);
+	details = wallet_invoice_details(cmd, cmd->ld->wallet, invoice);
 
 	json_object_start(response, NULL);
-	json_add_hex(response, "payment_hash",
-		     &details.rhash, sizeof(details.rhash));
-	if (deprecated_apis)
-		json_add_u64(response, "expiry_time", details.expiry_time);
-	json_add_u64(response, "expires_at", details.expiry_time);
-	json_add_string(response, "bolt11", details.bolt11);
+	json_add_hex(response, "payment_hash", details->rhash.u.u8,
+		     sizeof(details->rhash));
+	json_add_u64(response, "expires_at", details->expiry_time);
+	json_add_string(response, "bolt11", details->bolt11);
 	json_object_end(response);
 
 	command_success(cmd, response);
 }
 
 static const struct json_command invoice_command = {
-	"invoice",
-	json_invoice,
-	"Create an invoice for {msatoshi} with {label} and {description} with optional {expiry} seconds (default 1 hour) and optional {preimage} (default autogenerated)"
-};
+    "invoice", json_invoice, "Create an invoice for {msatoshi} with {label} "
+			     "and {description} with optional {expiry} seconds "
+			     "(default 1 hour) and optional {preimage} "
+			     "(default autogenerated)"};
 AUTODATA(json_command, &invoice_command);
 
 static void json_add_invoices(struct json_result *response,
 			      struct wallet *wallet,
-			      const struct json_escaped *label,
-			      bool modern)
+			      const struct json_escaped *label)
 {
 	struct invoice_iterator it;
-	struct invoice_details details;
+	const struct invoice_details *details;
 
-	memset(&it, 0, sizeof(it));
-	while (wallet_invoice_iterate(wallet, &it)) {
-		wallet_invoice_iterator_deref(response, wallet, &it, &details);
-		if (label && !json_escaped_eq(details.label, label))
-			continue;
-		json_add_invoice(response, &details, modern);
-	}
-}
-
-static void json_listinvoice_internal(struct command *cmd,
-				      const char *buffer,
-				      const jsmntok_t *params,
-				      bool modern)
-{
-	jsmntok_t *labeltok = NULL;
-	struct json_escaped *label;
-	struct json_result *response = new_json_result(cmd);
-	struct wallet *wallet = cmd->ld->wallet;
-
-	if (!json_get_params(cmd, buffer, params,
-			     "?label", &labeltok,
-			     NULL)) {
+	/* Don't iterate entire db if we're just after one. */
+	if (label) {
+		struct invoice invoice;
+		if (wallet_invoice_find_by_label(wallet, &invoice, label)) {
+			details = wallet_invoice_details(response, wallet, invoice);
+			json_add_invoice(response, details);
+		}
 		return;
 	}
 
-	if (labeltok) {
-		label = json_tok_label(cmd, buffer, labeltok);
-		if (!label) {
-			command_fail(cmd, "label '%.*s' is not a string or number",
-				     labeltok->end - labeltok->start,
-				     buffer + labeltok->start);
-			return;
-		}
-	} else
-		label = NULL;
-
-	if (modern) {
-		json_object_start(response, NULL);
-		json_array_start(response, "invoices");
-	} else
-		json_array_start(response, NULL);
-	json_add_invoices(response, wallet, label, modern);
-	json_array_end(response);
-	if (modern)
-		json_object_end(response);
-	command_success(cmd, response);
+	memset(&it, 0, sizeof(it));
+	while (wallet_invoice_iterate(wallet, &it)) {
+		details = wallet_invoice_iterator_deref(response, wallet, &it);
+		json_add_invoice(response, details);
+	}
 }
-
-/* FIXME: Deprecated! */
-static void json_listinvoice(struct command *cmd,
-			     const char *buffer, const jsmntok_t *params)
-{
-	return json_listinvoice_internal(cmd, buffer, params, false);
-}
-
-static const struct json_command listinvoice_command = {
-	"listinvoice",
-	json_listinvoice,
-	"(DEPRECATED) Show invoice {label} (or all, if no {label}))",
-	.deprecated = true
-};
-AUTODATA(json_command, &listinvoice_command);
 
 static void json_listinvoices(struct command *cmd,
-			     const char *buffer, const jsmntok_t *params)
+			      const char *buffer, const jsmntok_t *params)
 {
-	return json_listinvoice_internal(cmd, buffer, params, true);
+	struct json_escaped *label;
+	struct json_result *response = new_json_result(cmd);
+	struct wallet *wallet = cmd->ld->wallet;
+	if (!param(cmd, buffer, params,
+		   p_opt("label", json_tok_label, &label),
+		   NULL))
+		return;
+	json_object_start(response, NULL);
+	json_array_start(response, "invoices");
+	json_add_invoices(response, wallet, label);
+	json_array_end(response);
+	json_object_end(response);
+	command_success(cmd, response);
 }
 
 static const struct json_command listinvoices_command = {
@@ -451,53 +324,43 @@ static void json_delinvoice(struct command *cmd,
 			    const char *buffer, const jsmntok_t *params)
 {
 	struct invoice i;
-	struct invoice_details details;
-	jsmntok_t *labeltok, *statustok;
+	const struct invoice_details *details;
 	struct json_result *response = new_json_result(cmd);
 	const char *status, *actual_status;
 	struct json_escaped *label;
 	struct wallet *wallet = cmd->ld->wallet;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "label", &labeltok,
-			     "status", &statustok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_req("label", json_tok_label, &label),
+		   p_req("status", json_tok_string, &status),
+		   NULL))
 		return;
-	}
 
-	label = json_tok_label(cmd, buffer, labeltok);
-	if (!label) {
-		command_fail(cmd, "label '%.*s' is not a string or number",
-			     labeltok->end - labeltok->start,
-			     buffer + labeltok->start);
-		return;
-	}
 	if (!wallet_invoice_find_by_label(wallet, &i, label)) {
-		command_fail(cmd, "Unknown invoice");
+		command_fail(cmd, LIGHTNINGD, "Unknown invoice");
 		return;
 	}
-	wallet_invoice_details(cmd, cmd->ld->wallet, i, &details);
 
-	status = tal_strndup(cmd, buffer + statustok->start,
-			     statustok->end - statustok->start);
+	details = wallet_invoice_details(cmd, cmd->ld->wallet, i);
+
 	/* This is time-sensitive, so only call once; otherwise error msg
 	 * might not make sense if it changed! */
-	actual_status = invoice_status_str(&details);
+	actual_status = invoice_status_str(details);
 	if (!streq(actual_status, status)) {
-		command_fail(cmd, "Invoice status is %s not %s",
+		command_fail(cmd, LIGHTNINGD, "Invoice status is %s not %s",
 			     actual_status, status);
 		return;
 	}
 
 	/* Get invoice details before attempting to delete, as
 	 * otherwise the invoice will be freed. */
-	json_add_invoice(response, &details, true);
+	json_add_invoice(response, details);
 
 	if (!wallet_invoice_delete(wallet, i)) {
 		log_broken(cmd->ld->log,
 			   "Error attempting to remove invoice %"PRIu64,
 			   i.id);
-		command_fail(cmd, "Database error");
+		command_fail(cmd, LIGHTNINGD, "Database error");
 		return;
 	}
 
@@ -514,26 +377,16 @@ AUTODATA(json_command, &delinvoice_command);
 static void json_delexpiredinvoice(struct command *cmd, const char *buffer,
 				   const jsmntok_t *params)
 {
-	jsmntok_t *maxexpirytimetok;
-	u64 maxexpirytime = time_now().ts.tv_sec;
+	u64 *maxexpirytime;
 	struct json_result *result;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "?maxexpirytime", &maxexpirytimetok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt_def("maxexpirytime", json_tok_u64, &maxexpirytime,
+				 time_now().ts.tv_sec),
+		   NULL))
 		return;
-	}
 
-	if (maxexpirytimetok) {
-		if (!json_tok_u64(buffer, maxexpirytimetok, &maxexpirytime)) {
-			command_fail(cmd, "'%.*s' is not a valid number",
-				     maxexpirytimetok->end - maxexpirytimetok->start,
-				     buffer + maxexpirytimetok->start);
-			return;
-		}
-	}
-
-	wallet_invoice_delete_expired(cmd->ld->wallet, maxexpirytime);
+	wallet_invoice_delete_expired(cmd->ld->wallet, *maxexpirytime);
 
 	result = new_json_result(cmd);
 	json_object_start(result, NULL);
@@ -551,37 +404,17 @@ static void json_autocleaninvoice(struct command *cmd,
 				  const char *buffer,
 				  const jsmntok_t *params)
 {
-	jsmntok_t *cycletok;
-	jsmntok_t *exbytok;
-	u64 cycle = 3600;
-	u64 exby = 86400;
+	u64 *cycle;
+	u64 *exby;
 	struct json_result *result;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "?cycle_seconds", &cycletok,
-			     "?expired_by", &exbytok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt_def("cycle_seconds", json_tok_u64, &cycle, 3600),
+		   p_opt_def("expired_by", json_tok_u64, &exby, 86400),
+		   NULL))
 		return;
-	}
 
-	if (cycletok) {
-		if (!json_tok_u64(buffer, cycletok, &cycle)) {
-			command_fail(cmd, "'%.*s' is not a valid number",
-				     cycletok->end - cycletok->start,
-				     buffer + cycletok->start);
-			return;
-		}
-	}
-	if (exbytok) {
-		if (!json_tok_u64(buffer, exbytok, &exby)) {
-			command_fail(cmd, "'%.*s' is not a valid number",
-				     exbytok->end - exbytok->start,
-				     buffer + exbytok->start);
-			return;
-		}
-	}
-
-	wallet_invoice_autoclean(cmd->ld->wallet, cycle, exby);
+	wallet_invoice_autoclean(cmd->ld->wallet, *cycle, *exby);
 
 	result = new_json_result(cmd);
 	json_object_start(result, NULL);
@@ -600,26 +433,13 @@ AUTODATA(json_command, &autocleaninvoice_command);
 static void json_waitanyinvoice(struct command *cmd,
 			    const char *buffer, const jsmntok_t *params)
 {
-	jsmntok_t *pay_indextok;
-	u64 pay_index;
+	u64 *pay_index;
 	struct wallet *wallet = cmd->ld->wallet;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "?lastpay_index", &pay_indextok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt_def("lastpay_index", json_tok_u64, &pay_index, 0),
+		   NULL))
 		return;
-	}
-
-	if (!pay_indextok) {
-		pay_index = 0;
-	} else {
-		if (!json_tok_u64(buffer, pay_indextok, &pay_index)) {
-			command_fail(cmd, "'%.*s' is not a valid number",
-				     pay_indextok->end - pay_indextok->start,
-				     buffer + pay_indextok->start);
-			return;
-		}
-	}
 
 	/* Set command as pending. We do not know if
 	 * wallet_invoice_waitany will return immediately
@@ -627,7 +447,7 @@ static void json_waitanyinvoice(struct command *cmd,
 	command_still_pending(cmd);
 
 	/* Find next paid invoice. */
-	wallet_invoice_waitany(cmd, wallet, pay_index,
+	wallet_invoice_waitany(cmd, wallet, *pay_index,
 			       &wait_on_invoice, (void*) cmd);
 }
 
@@ -648,32 +468,23 @@ static void json_waitinvoice(struct command *cmd,
 			      const char *buffer, const jsmntok_t *params)
 {
 	struct invoice i;
-	struct invoice_details details;
+	const struct invoice_details *details;
 	struct wallet *wallet = cmd->ld->wallet;
-	jsmntok_t *labeltok;
 	struct json_escaped *label;
 
-	if (!json_get_params(cmd, buffer, params, "label", &labeltok, NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_req("label", json_tok_label, &label),
+		   NULL))
 		return;
-	}
-
-	/* Search for invoice */
-	label = json_tok_label(cmd, buffer, labeltok);
-	if (!label) {
-		command_fail(cmd, "label '%.*s' is not a string or number",
-			     labeltok->end - labeltok->start,
-			     buffer + labeltok->start);
-		return;
-	}
 
 	if (!wallet_invoice_find_by_label(wallet, &i, label)) {
-		command_fail(cmd, "Label not found");
+		command_fail(cmd, LIGHTNINGD, "Label not found");
 		return;
 	}
-	wallet_invoice_details(cmd, cmd->ld->wallet, i, &details);
+	details = wallet_invoice_details(cmd, cmd->ld->wallet, i);
 
 	/* If paid or expired return immediately */
-	if (details.state == PAID || details.state == EXPIRED) {
+	if (details->state == PAID || details->state == EXPIRED) {
 		tell_waiter(cmd, &i);
 		return;
 	} else {
@@ -722,38 +533,28 @@ static void json_add_fallback(struct json_result *response,
 				       (const u8 *)&wsh, sizeof(wsh)))
 			json_add_string(response, "addr", out);
 	}
-	json_add_hex(response, "hex", fallback, tal_len(fallback));
+	json_add_hex_talarr(response, "hex", fallback);
 	json_object_end(response);
 }
 
 static void json_decodepay(struct command *cmd,
                            const char *buffer, const jsmntok_t *params)
 {
-	jsmntok_t *bolt11tok, *desctok;
 	struct bolt11 *b11;
 	struct json_result *response;
-        char *str, *desc, *fail;
+        const char *str, *desc;
+        char *fail;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "bolt11", &bolt11tok,
-			     "?description", &desctok,
-			     NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_req("bolt11", json_tok_string, &str),
+		   p_opt("description", json_tok_string, &desc),
+		   NULL))
 		return;
-	}
-
-        str = tal_strndup(cmd, buffer + bolt11tok->start,
-                          bolt11tok->end - bolt11tok->start);
-
-        if (desctok)
-                desc = tal_strndup(cmd, buffer + desctok->start,
-                                   desctok->end - desctok->start);
-        else
-                desc = NULL;
 
 	b11 = bolt11_decode(cmd, str, desc, &fail);
 
 	if (!b11) {
-		command_fail(cmd, "Invalid bolt11: %s", fail);
+		command_fail(cmd, LIGHTNINGD, "Invalid bolt11: %s", fail);
 		return;
 	}
 
@@ -761,8 +562,6 @@ static void json_decodepay(struct command *cmd,
 	json_object_start(response, NULL);
 
 	json_add_string(response, "currency", b11->chain->bip173_name);
-	if (deprecated_apis)
-		json_add_u64(response, "timestamp", b11->timestamp);
 	json_add_u64(response, "created_at", b11->timestamp);
 	json_add_u64(response, "expiry", b11->expiry);
 	json_add_pubkey(response, "payee", &b11->receiver_id);
@@ -779,9 +578,6 @@ static void json_decodepay(struct command *cmd,
 	json_add_num(response, "min_final_cltv_expiry",
 		     b11->min_final_cltv_expiry);
         if (tal_count(b11->fallbacks)) {
-		if (deprecated_apis)
-			json_add_fallback(response, "fallback",
-					  b11->fallbacks[0], b11->chain);
 		json_array_start(response, "fallbacks");
 		for (size_t i = 0; i < tal_count(b11->fallbacks); i++)
 			json_add_fallback(response, NULL,
@@ -822,10 +618,10 @@ static void json_decodepay(struct command *cmd,
 
                 json_array_start(response, "extra");
                 list_for_each(&b11->extra_fields, extra, list) {
-                        char *data = tal_arr(cmd, char, tal_len(extra->data)+1);
+                        char *data = tal_arr(cmd, char, tal_count(extra->data)+1);
                         size_t i;
 
-                        for (i = 0; i < tal_len(extra->data); i++)
+                        for (i = 0; i < tal_count(extra->data); i++)
                                 data[i] = bech32_charset[extra->data[i]];
                         data[i] = '\0';
                         json_object_start(response, NULL);
