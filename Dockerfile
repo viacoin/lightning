@@ -55,6 +55,18 @@ RUN mkdir /opt/litecoin && cd /opt/litecoin \
     && tar -xzvf litecoin.tar.gz $BD/litecoin-cli --strip-components=1 --exclude=*-qt \
     && rm litecoin.tar.gz
 
+ENV VIACOIN_VERSION 0.15.1
+ENV VIACOIN_URL https://github.com/viacoin/viacoin/releases/download/v0.15.1/viacoin-0.15.1-x86_64-linux-gnu.tar.gz
+ENV VIACOIN_SHA256 673bfd17194ca4fe8408450e1871447d461ce26925e71ea55eebd89c379f5775
+
+# install viacoin binaries
+RUN mkdir /opt/viacoin && cd /opt/viacoin \
+    && wget -qO viacoin.tar.gz "$VIACOIN_URL" \
+    && echo "$VIACOIN_SHA256  viacoin.tar.gz" | sha256sum -c - \
+    && BD=viacoin-$VIACOIN_VERSION/bin \
+    && tar -xzvf viacoin.tar.gz $BD/viacoin-cli --strip-components=1 --exclude=*-qt \
+    && rm viacoin.tar.gz
+
 ENV LIGHTNINGD_VERSION=master
 
 WORKDIR /opt/lightningd
@@ -98,6 +110,7 @@ COPY --from=builder /opt/lightningd/cli/lightning-cli /usr/bin
 COPY --from=builder /opt/lightningd/lightningd/lightning* /usr/bin/
 COPY --from=builder /opt/bitcoin/bin /usr/bin
 COPY --from=builder /opt/litecoin/bin /usr/bin
+COPY --from=builder /opt/viacoin/bin /usr/bin
 COPY tools/docker-entrypoint.sh entrypoint.sh
 
 EXPOSE 9735 9835
