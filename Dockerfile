@@ -55,9 +55,9 @@ RUN mkdir /opt/litecoin && cd /opt/litecoin \
     && tar -xzvf litecoin.tar.gz $BD/litecoin-cli --strip-components=1 --exclude=*-qt \
     && rm litecoin.tar.gz
 
-ENV VIACOIN_VERSION 0.15.1
-ENV VIACOIN_URL https://github.com/viacoin/viacoin/releases/download/v0.15.1/viacoin-0.15.1-x86_64-linux-gnu.tar.gz
-ENV VIACOIN_SHA256 673bfd17194ca4fe8408450e1871447d461ce26925e71ea55eebd89c379f5775
+ENV VIACOIN_VERSION 0.15.2
+ENV VIACOIN_URL https://github.com/viacoin/viacoin/releases/download/v0.15.2/viacoin-0.15.2-x86_64-linux-gnu.tar.gz
+ENV VIACOIN_SHA256 bdbd432645a8b4baadddb7169ea4bef3d03f80dc2ce53dce5783d8582ac63bab
 
 # install viacoin binaries
 RUN mkdir /opt/viacoin && cd /opt/viacoin \
