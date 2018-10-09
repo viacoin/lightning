@@ -15,6 +15,7 @@ LIGHTNINGD_CONNECT_CONTROL_OBJS := $(LIGHTNINGD_CONNECT_CONTROL_SRC:.c=.o)
 LIGHTNINGD_CONNECT_HEADERS := connectd/gen_connect_wire.h \
 	connectd/gen_connect_gossip_wire.h		\
 	connectd/connectd.h				\
+	connectd/peer_exchange_initmsg.h		\
 	connectd/handshake.h				\
 	connectd/netaddress.h				\
 	connectd/tor_autoservice.h			\
@@ -61,8 +62,7 @@ CONNECTD_COMMON_OBJS :=				\
 	common/wireaddr.o			\
 	common/wire_error.o			\
 	gossipd/gen_gossip_wire.o		\
-	hsmd/client.o				\
-	hsmd/gen_hsm_client_wire.o		\
+	hsmd/gen_hsm_wire.o			\
 	lightningd/gossip_msg.o			\
 	wire/gen_onion_wire.o
 

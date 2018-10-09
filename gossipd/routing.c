@@ -145,8 +145,7 @@ static struct node *new_node(struct routing_state *rstate,
 	n = tal(rstate, struct node);
 	n->id = *id;
 	n->chans = tal_arr(n, struct chan *, 0);
-	n->alias = NULL;
-	n->gfeatures = NULL;
+	n->globalfeatures = NULL;
 	n->node_announcement = NULL;
 	n->node_announcement_index = 0;
 	n->last_timestamp = -1;
@@ -259,13 +258,17 @@ static void destroy_chan(struct chan *chan, struct routing_state *rstate)
 
 static void init_half_chan(struct routing_state *rstate,
 				 struct chan *chan,
-				 int idx)
+				 int channel_idx)
 {
-	struct half_chan *c = &chan->half[idx];
+	struct half_chan *c = &chan->half[channel_idx];
 
 	c->channel_update = NULL;
 	c->unroutable_until = 0;
-	c->flags = idx;
+
+	/* Set the channel direction */
+	c->channel_flags = channel_idx;
+	// TODO: wireup message_flags
+	c->message_flags = 0;
 	/* We haven't seen channel_update: make it halfway to prune time,
 	 * which should be older than any update we'd see. */
 	c->last_timestamp = time_now().ts.tv_sec - rstate->prune_timeout/2;
@@ -287,7 +290,6 @@ struct chan *new_chan(struct routing_state *rstate,
 {
 	struct chan *chan = tal(rstate, struct chan);
 	int n1idx = pubkey_idx(id1, id2);
-	size_t n;
 	struct node *n1, *n2;
 
 	/* We should never add a channel twice */
@@ -310,12 +312,8 @@ struct chan *new_chan(struct routing_state *rstate,
 	chan->satoshis = satoshis;
 	chan->local_disabled = false;
 
-	n = tal_count(n2->chans);
-	tal_resize(&n2->chans, n+1);
-	n2->chans[n] = chan;
-	n = tal_count(n1->chans);
-	tal_resize(&n1->chans, n+1);
-	n1->chans[n] = chan;
+	*tal_arr_expand(&n2->chans) = chan;
+	*tal_arr_expand(&n1->chans) = chan;
 
 	/* Populate with (inactive) connections */
 	init_half_chan(rstate, chan, n1idx);
@@ -749,11 +747,16 @@ bool routing_add_channel_announcement(struct routing_state *rstate,
 	/* Channel is now public. */
 	chan->channel_announce = tal_dup_arr(chan, u8, msg, tal_count(msg), 0);
 
-	/* Clear any private updates: new updates will trigger broadcast of
-	 * this channel_announce. */
-	for (size_t i = 0; i < ARRAY_SIZE(chan->half); i++)
-		chan->half[i].channel_update
-			= tal_free(chan->half[i].channel_update);
+	/* Apply any private updates. */
+	for (size_t i = 0; i < ARRAY_SIZE(chan->half); i++) {
+		const u8 *update = chan->half[i].channel_update;
+		if (!update)
+			continue;
+
+		/* Remove from channel, otherwise it will be freed! */
+		chan->half[i].channel_update = NULL;
+		routing_add_channel_update(rstate, take(update));
+	}
 
 	return true;
 }
@@ -1003,7 +1006,8 @@ static void set_connection_values(struct chan *chan,
 				  u32 base_fee,
 				  u32 proportional_fee,
 				  u32 delay,
-				  u16 flags,
+				  u8 message_flags,
+				  u8 channel_flags,
 				  u64 timestamp,
 				  u32 htlc_minimum_msat)
 {
@@ -1013,9 +1017,10 @@ static void set_connection_values(struct chan *chan,
 	c->htlc_minimum_msat = htlc_minimum_msat;
 	c->base_fee = base_fee;
 	c->proportional_fee = proportional_fee;
-	c->flags = flags;
+	c->message_flags = message_flags;
+	c->channel_flags = channel_flags;
 	c->last_timestamp = timestamp;
-	assert((c->flags & ROUTING_FLAGS_DIRECTION) == idx);
+	assert((c->channel_flags & ROUTING_FLAGS_DIRECTION) == idx);
 
 	/* If it was temporarily unroutable, re-enable */
 	c->unroutable_until = 0;
@@ -1031,7 +1036,7 @@ static void set_connection_values(struct chan *chan,
 					    &chan->scid),
 			     idx,
 			     c->proportional_fee);
-		c->flags |= ROUTING_FLAGS_DISABLED;
+		c->channel_flags |= ROUTING_FLAGS_DISABLED;
 	}
 }
 
@@ -1041,7 +1046,7 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	secp256k1_ecdsa_signature signature;
 	struct short_channel_id short_channel_id;
 	u32 timestamp;
-	u16 flags;
+	u8 message_flags, channel_flags;
 	u16 expiry;
 	u64 htlc_minimum_msat;
 	u32 fee_base_msat;
@@ -1049,10 +1054,10 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	struct bitcoin_blkid chain_hash;
 	struct chan *chan;
 	u8 direction;
-	bool have_broadcast_announce;
 
 	if (!fromwire_channel_update(update, &signature, &chain_hash,
-				     &short_channel_id, &timestamp, &flags,
+				     &short_channel_id, &timestamp,
+				     &message_flags, &channel_flags,
 				     &expiry, &htlc_minimum_msat, &fee_base_msat,
 				     &fee_proportional_millionths))
 		return false;
@@ -1060,14 +1065,11 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	if (!chan)
 		return false;
 
-	/* We broadcast announce once we have one update */
-	have_broadcast_announce = is_halfchan_defined(&chan->half[0])
-		|| is_halfchan_defined(&chan->half[1]);
-
-	direction = flags & 0x1;
+	direction = channel_flags & 0x1;
 	set_connection_values(chan, direction, fee_base_msat,
 			      fee_proportional_millionths, expiry,
-			      flags, timestamp, htlc_minimum_msat);
+			      message_flags, channel_flags,
+			      timestamp, htlc_minimum_msat);
 
 	/* Replace any old one. */
 	tal_free(chan->half[direction].channel_update);
@@ -1085,7 +1087,7 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	 *   - MUST consider whether to send the `channel_announcement` after
 	 *     receiving the first corresponding `channel_update`.
 	 */
-	if (!have_broadcast_announce)
+	if (chan->channel_announcement_index == 0)
 		add_channel_announce_to_broadcast(rstate, chan, timestamp);
 
 	persistent_broadcast(rstate, chan->half[direction].channel_update,
@@ -1093,7 +1095,7 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	return true;
 }
 
-u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
+u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 			  const char *source)
 {
 	u8 *serialized;
@@ -1101,7 +1103,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
 	secp256k1_ecdsa_signature signature;
 	struct short_channel_id short_channel_id;
 	u32 timestamp;
-	u16 flags;
+	u8 message_flags, channel_flags;
 	u16 expiry;
 	u64 htlc_minimum_msat;
 	u32 fee_base_msat;
@@ -1115,7 +1117,8 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
 	serialized = tal_dup_arr(tmpctx, u8, update, len, 0);
 	if (!fromwire_channel_update(serialized, &signature,
 				     &chain_hash, &short_channel_id,
-				     &timestamp, &flags, &expiry,
+				     &timestamp, &message_flags,
+				     &channel_flags, &expiry,
 				     &htlc_minimum_msat, &fee_base_msat,
 				     &fee_proportional_millionths)) {
 		err = towire_errorfmt(rstate, NULL,
@@ -1123,7 +1126,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
 				      tal_hex(tmpctx, serialized));
 		return err;
 	}
-	direction = flags & 0x1;
+	direction = channel_flags & 0x1;
 
 	/* BOLT #7:
 	 *
@@ -1160,7 +1163,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
 						 type_to_string(tmpctx,
 							struct short_channel_id,
 							&short_channel_id),
-						 flags));
+						 channel_flags));
 			return NULL;
 		}
 	}
@@ -1198,7 +1201,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
 				       type_to_string(tmpctx,
 						      struct short_channel_id,
 						      &short_channel_id),
-				       flags,
+				       channel_flags,
 				       tal_hex(tmpctx, c->channel_update),
 				       tal_hex(tmpctx, serialized));
 		}
@@ -1224,10 +1227,10 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
 	status_trace("Received channel_update for channel %s(%d) now %s was %s (from %s)",
 		     type_to_string(tmpctx, struct short_channel_id,
 				    &short_channel_id),
-		     flags & 0x01,
-		     flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE",
+		     channel_flags & 0x01,
+		     channel_flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE",
 		     is_halfchan_defined(c)
-		     ? (c->flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE")
+		     ? (c->channel_flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE")
 		     : "UNDEFINED",
 		     source);
 
@@ -1243,7 +1246,6 @@ static struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser)
 	const u8 *cursor = ser;
 	size_t len = tal_count(ser);
 	struct wireaddr *wireaddrs = tal_arr(ctx, struct wireaddr, 0);
-	int numaddrs = 0;
 
 	while (cursor && len) {
 		struct wireaddr wireaddr;
@@ -1269,16 +1271,12 @@ static struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser)
 			break;
 		}
 
-		tal_resize(&wireaddrs, numaddrs+1);
-		wireaddrs[numaddrs] = wireaddr;
-		numaddrs++;
+		*tal_arr_expand(&wireaddrs) = wireaddr;
 	}
 	return wireaddrs;
 }
 
-bool routing_add_node_announcement(struct routing_state *rstate,
-				   const u8 *msg TAKES,
-				   bool *unknown_node)
+bool routing_add_node_announcement(struct routing_state *rstate, const u8 *msg TAKES)
 {
 	struct node *node;
 	secp256k1_ecdsa_signature signature;
@@ -1292,32 +1290,25 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 	if (!fromwire_node_announcement(tmpctx, msg,
 					&signature, &features, &timestamp,
 					&node_id, rgb_color, alias,
-					&addresses)) {
-		if (unknown_node)
-			*unknown_node = false;
+					&addresses))
 		return false;
-	}
 
 	node = get_node(rstate, &node_id);
 
 	/* May happen if we accepted the node_announcement due to a local
 	* channel, for which we didn't have the announcement yet. */
-	if (node == NULL) {
-		if (unknown_node)
-			*unknown_node = true;
+	if (node == NULL)
 		return false;
-	}
 
 	wireaddrs = read_addresses(tmpctx, addresses);
 	tal_free(node->addresses);
 	node->addresses = tal_steal(node, wireaddrs);
 
 	node->last_timestamp = timestamp;
-	memcpy(node->rgb_color, rgb_color, 3);
-	tal_free(node->alias);
-	node->alias = tal_dup_arr(node, u8, alias, 32, 0);
-	tal_free(node->gfeatures);
-	node->gfeatures = tal_steal(node, features);
+	memcpy(node->rgb_color, rgb_color, ARRAY_SIZE(node->rgb_color));
+	memcpy(node->alias, alias, ARRAY_SIZE(node->alias));
+	tal_free(node->globalfeatures);
+	node->globalfeatures = tal_steal(node, features);
 
 	tal_free(node->node_announcement);
 	node->node_announcement = tal_dup_arr(node, u8, msg, tal_count(msg), 0);
@@ -1459,7 +1450,7 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 	status_trace("Received node_announcement for node %s",
 		     type_to_string(tmpctx, struct pubkey, &node_id));
 
-	applied = routing_add_node_announcement(rstate, serialized, NULL);
+	applied = routing_add_node_announcement(rstate, serialized);
 	assert(applied);
 	return NULL;
 }

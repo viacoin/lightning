@@ -4,7 +4,7 @@
 #include <common/wire_error.h>
 #include <connectd/gen_connect_wire.h>
 #include <errno.h>
-#include <hsmd/gen_hsm_client_wire.h>
+#include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <lightningd/channel.h>
 #include <lightningd/connect_control.h>
@@ -265,6 +265,17 @@ struct channel *peer_active_channel(struct peer *peer)
 
 	list_for_each(&peer->channels, channel, list) {
 		if (channel_active(channel))
+			return channel;
+	}
+	return NULL;
+}
+
+struct channel *peer_normal_channel(struct peer *peer)
+{
+	struct channel *channel;
+
+	list_for_each(&peer->channels, channel, list) {
+		if (channel->state == CHANNELD_NORMAL)
 			return channel;
 	}
 	return NULL;

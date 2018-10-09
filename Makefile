@@ -9,7 +9,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := fd9da9b95eb5d585252d7e749212151502e0cc17
+BOLTVERSION := 0891374d47ddffa64c5a2e6ad151247e3d6b7a59
 
 -include config.vars
 
@@ -38,7 +38,7 @@ ifeq ($(COMPAT),1)
 COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1
 endif
 
-PYTEST_OPTS := -v -x
+PYTEST_OPTS := -v
 
 # This is where we add new features as bitcoin adds them.
 FEATURES :=
@@ -186,7 +186,6 @@ include external/Makefile
 include bitcoin/Makefile
 include common/Makefile
 include wire/Makefile
-include wallet/Makefile
 include hsmd/Makefile
 include gossipd/Makefile
 include openingd/Makefile
@@ -206,8 +205,14 @@ ifneq ($(TEST_GROUP_COUNT),)
 PYTEST_OPTS += --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT)
 endif
 
+# If we run the tests in parallel we can speed testing up by a lot, however we
+# then don't exit on the first error, since that'd kill the other tester
+# processes and result in loads in loads of output. So we only tell py.test to
+# abort early if we aren't running in parallel.
 ifneq ($(PYTEST_PAR),)
 PYTEST_OPTS += -n=$(PYTEST_PAR)
+else
+PYTEST_OPTS += -x
 endif
 
 check:
@@ -238,10 +243,12 @@ check-makefile:
 
 # Any mention of BOLT# must be followed by an exact quote, modulo whitespace.
 bolt-check/%: % bolt-precheck tools/check-bolt
-	@[ ! -d .tmp.lightningrfc ] || tools/check-bolt .tmp.lightningrfc $<
+	@if [ -d .tmp.lightningrfc ]; then tools/check-bolt .tmp.lightningrfc $<; else echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; fi
+
+LOCAL_BOLTDIR=.tmp.lightningrfc
 
 bolt-precheck:
-	@rm -rf .tmp.lightningrfc; if [ ! -d $(BOLTDIR) ]; then echo Not checking BOLT references: BOLTDIR $(BOLTDIR) does not exist >&2; exit 0; fi; set -e; if [ -n "$(BOLTVERSION)" ]; then git clone -q $(BOLTDIR) .tmp.lightningrfc && cd .tmp.lightningrfc && git checkout -q $(BOLTVERSION); else cp -a $(BOLTDIR) .tmp.lightningrfc; fi
+	@[ -d $(BOLTDIR) ] || exit 0; set -e; if [ -z "$(BOLTVERSION)" ]; then rm -rf $(LOCAL_BOLTDIR); ln -sf $(BOLTDIR) $(LOCAL_BOLTDIR); exit 0; fi; [ "$$(git -C $(LOCAL_BOLTDIR) rev-list --max-count=1 HEAD 2>/dev/null)" != "$(BOLTVERSION)" ] || exit 0; rm -rf $(LOCAL_BOLTDIR) && git clone -q $(BOLTDIR) $(LOCAL_BOLTDIR) && cd $(LOCAL_BOLTDIR) && git checkout -q $(BOLTVERSION)
 
 check-source-bolt: $(ALL_TEST_PROGRAMS:%=bolt-check/%.c)
 
@@ -278,7 +285,7 @@ check-cppcheck: .cppcheck-suppress
 	@trap 'rm -f .cppcheck-suppress' 0; git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs cppcheck -q --language=c --std=c11 --error-exitcode=1 --suppressions-list=.cppcheck-suppress
 
 check-shellcheck:
-	git ls-files -- "*.sh" | xargs shellcheck
+	@git ls-files -- "*.sh" | xargs shellcheck
 
 check-setup_locale:
 	@tools/check-setup_locale.sh

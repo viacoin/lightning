@@ -305,7 +305,7 @@ def test_reconnect_gossiping(node_factory):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
     l2.rpc.ping(l1.info['id'], 1, 65532)
-    l1.daemon.wait_for_log('Forgetting peer')
+    wait_for(lambda: l1.rpc.listpeers(l2.info['id'])['peers'] == [])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l2.daemon.wait_for_log('processing now old peer gone')
@@ -783,7 +783,7 @@ def test_channel_persistence(node_factory, bitcoind, executor):
     # Now make sure l1 is watching for unilateral closes
     l2.rpc.dev_fail(l1.info['id'])
     l2.daemon.wait_for_log('Failing due to dev-fail command')
-    l2.daemon.wait_for_log('sendrawtx exit 0')
+    l2.wait_for_channel_onchain(l1.info['id'])
     bitcoind.generate_block(1)
 
     # L1 must notice.
@@ -836,8 +836,8 @@ def test_update_fee(node_factory, bitcoind):
     l2.daemon.wait_for_log(' to CLOSINGD_COMPLETE')
 
     # And should put closing into mempool.
-    l1.daemon.wait_for_log('sendrawtx exit 0')
-    l2.daemon.wait_for_log('sendrawtx exit 0')
+    l1.wait_for_channel_onchain(l2.info['id'])
+    l2.wait_for_channel_onchain(l1.info['id'])
 
     bitcoind.generate_block(1)
     l1.daemon.wait_for_log(' to ONCHAIN')
@@ -925,8 +925,8 @@ def test_update_fee_reconnect(node_factory, bitcoind):
     l1.rpc.close(chan)
 
     # And should put closing into mempool.
-    l1.daemon.wait_for_log('sendrawtx exit 0')
-    l2.daemon.wait_for_log('sendrawtx exit 0')
+    l1.wait_for_channel_onchain(l2.info['id'])
+    l2.wait_for_channel_onchain(l1.info['id'])
 
     bitcoind.generate_block(1)
     l1.daemon.wait_for_log(' to ONCHAIN')
@@ -991,8 +991,8 @@ def test_peerinfo(node_factory, bitcoind):
     # Gossiping but no node announcement yet
     assert l1.rpc.getpeer(l2.info['id'])['connected']
     assert len(l1.rpc.getpeer(l2.info['id'])['channels']) == 0
-    assert l1.rpc.getpeer(l2.info['id'])['local_features'] == '8a'
-    assert l1.rpc.getpeer(l2.info['id'])['global_features'] == ''
+    assert l1.rpc.getpeer(l2.info['id'])['localfeatures'] == '8a'
+    assert l1.rpc.getpeer(l2.info['id'])['globalfeatures'] == ''
 
     # Fund a channel to force a node announcement
     chan = l1.fund_channel(l2, 10**6)
@@ -1006,24 +1006,26 @@ def test_peerinfo(node_factory, bitcoind):
     nodes2 = l2.rpc.listnodes(l2.info['id'])['nodes']
     peer1 = l1.rpc.getpeer(l2.info['id'])
     peer2 = l2.rpc.getpeer(l1.info['id'])
-    assert only_one(nodes1)['global_features'] == peer1['global_features']
-    assert only_one(nodes2)['global_features'] == peer2['global_features']
+    assert only_one(nodes1)['globalfeatures'] == peer1['globalfeatures']
+    assert only_one(nodes2)['globalfeatures'] == peer2['globalfeatures']
 
-    assert l1.rpc.getpeer(l2.info['id'])['local_features'] == '8a'
-    assert l2.rpc.getpeer(l1.info['id'])['local_features'] == '8a'
+    assert l1.rpc.getpeer(l2.info['id'])['localfeatures'] == '8a'
+    assert l2.rpc.getpeer(l1.info['id'])['localfeatures'] == '8a'
 
     # If it reconnects after db load, it should know features.
     l1.restart()
     wait_for(lambda: l1.rpc.getpeer(l2.info['id'])['connected'])
     wait_for(lambda: l2.rpc.getpeer(l1.info['id'])['connected'])
-    assert l1.rpc.getpeer(l2.info['id'])['local_features'] == '8a'
-    assert l2.rpc.getpeer(l1.info['id'])['local_features'] == '8a'
+    assert l1.rpc.getpeer(l2.info['id'])['localfeatures'] == '8a'
+    assert l2.rpc.getpeer(l1.info['id'])['localfeatures'] == '8a'
 
     # Close the channel to forget the peer
     with pytest.raises(RpcError, match=r'Channel close negotiation not finished'):
         l1.rpc.close(chan, False, 0)
 
-    l1.daemon.wait_for_log('Forgetting peer')
+    wait_for(lambda: not only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected'])
+    wait_for(lambda: not only_one(l2.rpc.listpeers(l1.info['id'])['peers'])['connected'])
+
     bitcoind.generate_block(100)
     l1.daemon.wait_for_log('WIRE_ONCHAIN_ALL_IRREVOCABLY_RESOLVED')
     l2.daemon.wait_for_log('WIRE_ONCHAIN_ALL_IRREVOCABLY_RESOLVED')
@@ -1088,19 +1090,23 @@ def test_fundee_forget_funding_tx_unconfirmed(node_factory, bitcoind):
     # Let blocks settle.
     time.sleep(1)
 
-    # Prevent funder from broadcasting funding tx.
-    l1.bitcoind_cmd_override('exit 1')
+    def mock_sendrawtransaction(r):
+        return {'error': 'sendrawtransaction disabled'}
+
+    # Prevent funder from broadcasting funding tx (any tx really).
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', mock_sendrawtransaction)
+
     # Fund the channel.
     # The process will complete, but funder will be unable
     # to broadcast and confirm funding tx.
     l1.rpc.fundchannel(l2.info['id'], 10**6)
-    # Prevent l1 from timing out bitcoin-cli.
-    l1.bitcoind_cmd_remove_override()
+
     # Generate blocks until unconfirmed.
     bitcoind.generate_block(blocks)
 
     # fundee will forget channel!
     l2.daemon.wait_for_log('Forgetting channel: It has been {} blocks'.format(blocks))
+
     # fundee will also forget and disconnect from peer.
     assert len(l2.rpc.listpeers(l1.info['id'])['peers']) == 0
 
@@ -1108,8 +1114,11 @@ def test_fundee_forget_funding_tx_unconfirmed(node_factory, bitcoind):
 @unittest.skipIf(not DEVELOPER, "needs dev_fail")
 def test_no_fee_estimate(node_factory, bitcoind, executor):
     l1 = node_factory.get_node(start=False)
-    l1.bitcoind_cmd_override(cmd='estimatesmartfee',
-                             failscript="""echo '{ "errors": [ "Insufficient data or no feerate found" ], "blocks": 0 }'; exit 0""")
+
+    # Fail any fee estimation requests until we allow them further down
+    l1.daemon.rpcproxy.mock_rpc('estimatesmartfee', {
+        'error': {"errors": ["Insufficient data or no feerate found"], "blocks": 0}
+    })
     l1.start()
 
     l2 = node_factory.get_node()
@@ -1143,7 +1152,7 @@ def test_no_fee_estimate(node_factory, bitcoind, executor):
     l1.daemon.wait_for_log('sendrawtx exit 0')
     l1.rpc.dev_fail(l2.info['id'])
     l1.daemon.wait_for_log('Failing due to dev-fail command')
-    l1.daemon.wait_for_log('sendrawtx exit 0')
+    l1.wait_for_channel_onchain(l2.info['id'])
     bitcoind.generate_block(6)
     wait_for(lambda: only_one(l1.rpc.getpeer(l2.info['id'])['channels'])['state'] == 'ONCHAIN')
     wait_for(lambda: only_one(l2.rpc.getpeer(l1.info['id'])['channels'])['state'] == 'ONCHAIN')
@@ -1165,9 +1174,9 @@ def test_no_fee_estimate(node_factory, bitcoind, executor):
     l2.pay(l1, 10**9 // 2)
     l1.rpc.dev_fail(l2.info['id'])
     l1.daemon.wait_for_log('Failing due to dev-fail command')
-    l1.daemon.wait_for_log('sendrawtx exit 0')
+    l1.wait_for_channel_onchain(l2.info['id'])
     bitcoind.generate_block(5)
-    l1.daemon.wait_for_log('sendrawtx exit 0')
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) > 0)
     bitcoind.generate_block(100)
 
     # Start estimatesmartfee.
@@ -1273,7 +1282,7 @@ def test_dataloss_protection(node_factory, bitcoind):
     l2.daemon.wait_for_log("Peer permanent failure in CHANNELD_NORMAL: Awaiting unilateral close")
 
     # l1 should drop to chain.
-    l1.daemon.wait_for_log('sendrawtx exit 0')
+    l1.wait_for_channel_onchain(l2.info['id'])
 
     # l2 must NOT drop to chain.
     l2.daemon.wait_for_log("Cannot broadcast our commitment tx: they have a future one")

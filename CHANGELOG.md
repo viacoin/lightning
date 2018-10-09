@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- JSON API: `listpeers` has new field `scratch_txid`: the latest tx in channel.
+- JSON API: `listpeers` has new array `htlcs`: the current live payments.
+- JSON API: `listchannels` has two new fields: `message_flags` and `channel_flags`. This replaces `flags`.
+- Bitcoind: more parallelism in requests, for very slow nodes.
+- Testing: fixed logging, cleaner interception of bitcoind, minor fixes.
+- JSON API: `invoice` now adds route hint to invoices for incoming capacity (RouteBoost), and warns if insufficient capacity.
+
+### Changed
+
+- Protocol: `channel_update` sent to disable channel only if we reject an HTLC.
+- Protocol: we don't send redundant `node_announcement` on every new channel.
+
+### Deprecated
+
+Note: You should always set `allow-deprecated-apis=false` to test for
+changes.
+
+- JSON RPC: `listchannels`' `flags` field. This has been split into two fields, see Added.
+- JSON RPC: `global_features` and `local_features` fields: use `globalfeatures` and `localfeatures` as per BOLT #1.
+
+### Removed
+
+### Fixed
+
+- Startup: more coherent complaint if daemon already running.
+- JSON RPC: `getinfo` now shows correct Tor port.
+- JSON RPC: `ping` now works even after one peer fails to respond.
+- JSON RPC: `getroute` `fuzzpercent` and `pay` `maxfeepercent` can now be > 100.
+- JSON RPC: `riskfactor` in `pay` and `getroute` no longer always treated as 1.
+- Protocol: fix occasional deadlock when both peers flood with gossip.
+- Protocol: fix occasional long delay on sending `reply_short_channel_ids_end`.
+- Protocol: re-send `node_announcement` when address/alias/color etc change.
+
+### Security
+
 ## [0.6.1] - 2018-09-11: "Principled Opposition To Segwit"
 
 This release named by ZmnSCPxj.
@@ -50,9 +89,6 @@ This release named by ZmnSCPxj.
   do not have a fee estimate (eg. bitcoind not synced); use new `feerate` arg.
 
 ### Deprecated
-
-Note: You should always set `allow-deprecated-apis=false` to test for
-changes.
 
 ### Removed
 

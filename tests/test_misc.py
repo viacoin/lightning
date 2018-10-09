@@ -89,7 +89,12 @@ def test_bitcoin_failure(node_factory, bitcoind):
     # Make sure we're not failing it between getblockhash and getblock.
     sync_blockheight(bitcoind, [l1])
 
-    l1.bitcoind_cmd_override('exit 1')
+    def crash_bitcoincli(r):
+        return {'error': 'go away'}
+
+    # This is not a JSON-RPC response by purpose
+    l1.daemon.rpcproxy.mock_rpc('estimatesmartfee', crash_bitcoincli)
+    l1.daemon.rpcproxy.mock_rpc('getblockhash', crash_bitcoincli)
 
     # This should cause both estimatefee and getblockhash fail
     l1.daemon.wait_for_logs(['estimatesmartfee .* exited with status 1',
@@ -100,7 +105,9 @@ def test_bitcoin_failure(node_factory, bitcoind):
                              'getblockhash .* exited with status 1'])
 
     # Restore, then it should recover and get blockheight.
-    l1.bitcoind_cmd_remove_override()
+    l1.daemon.rpcproxy.mock_rpc('estimatesmartfee', None)
+    l1.daemon.rpcproxy.mock_rpc('getblockhash', None)
+
     bitcoind.generate_block(5)
     sync_blockheight(bitcoind, [l1])
 
@@ -175,7 +182,7 @@ def test_htlc_sig_persistence(node_factory, executor):
     # This should reload the htlc_sig
     l2.rpc.dev_fail(l1.info['id'])
     # Make sure it broadcasts to chain.
-    l2.daemon.wait_for_log('sendrawtx exit 0')
+    l2.wait_for_channel_onchain(l1.info['id'])
     l2.stop()
     l1.bitcoin.rpc.generate(1)
     l1.start()
@@ -570,8 +577,6 @@ def test_listconfigs(node_factory, bitcoind):
 
     configs = l1.rpc.listconfigs()
     # See utils.py
-    assert configs['bitcoin-datadir'] == bitcoind.bitcoin_dir
-    assert configs['lightning-dir'] == l1.daemon.lightning_dir
     assert configs['allow-deprecated-apis'] is False
     assert configs['network'] == 'regtest'
     assert configs['ignore-fee-limits'] is False
@@ -617,7 +622,7 @@ def test_cli(node_factory):
                                    .format(l1.daemon.lightning_dir),
                                    'help']).decode('utf-8')
     # Test some known output.
-    assert 'help\n    List available commands, or give verbose help on one command' in out
+    assert 'help [command]\n    List available commands, or give verbose help on one {command}' in out
 
     # Test JSON output.
     out = subprocess.check_output(['cli/lightning-cli',
@@ -860,20 +865,21 @@ def test_ipv4_and_ipv6(node_factory):
 
 def test_feerates(node_factory):
     l1 = node_factory.get_node(options={'log-level': 'io'}, start=False)
-    l1.bitcoind_cmd_override(cmd='estimatesmartfee',
-                             failscript="""echo '{ "errors": [ "Insufficient data or no feerate found" ], "blocks": 0 }'; exit 0""")
+    l1.daemon.rpcproxy.mock_rpc('estimatesmartfee', {
+        'error': {"errors": ["Insufficient data or no feerate found"], "blocks": 0}
+    })
     l1.start()
 
     # Query feerates (shouldn't give any!)
+    wait_for(lambda: len(l1.rpc.feerates('perkw')['perkw']) == 2)
     feerates = l1.rpc.feerates('perkw')
-    assert len(feerates['perkw']) == 2
     assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkb' not in feerates
     assert feerates['perkw']['max_acceptable'] == 2**32 - 1
     assert feerates['perkw']['min_acceptable'] == 253
 
+    wait_for(lambda: len(l1.rpc.feerates('perkb')['perkb']) == 2)
     feerates = l1.rpc.feerates('perkb')
-    assert len(feerates['perkb']) == 2
     assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkw' not in feerates
     assert feerates['perkb']['max_acceptable'] == (2**32 - 1)
@@ -881,8 +887,8 @@ def test_feerates(node_factory):
 
     # Now try setting them, one at a time.
     l1.set_feerates((15000, 0, 0), True)
+    wait_for(lambda: len(l1.rpc.feerates('perkw')['perkw']) == 3)
     feerates = l1.rpc.feerates('perkw')
-    assert len(feerates['perkw']) == 3
     assert feerates['perkw']['urgent'] == 15000
     assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkb' not in feerates
@@ -890,8 +896,8 @@ def test_feerates(node_factory):
     assert feerates['perkw']['min_acceptable'] == 253
 
     l1.set_feerates((15000, 6250, 0), True)
+    wait_for(lambda: len(l1.rpc.feerates('perkb')['perkb']) == 4)
     feerates = l1.rpc.feerates('perkb')
-    assert len(feerates['perkb']) == 4
     assert feerates['perkb']['urgent'] == 15000 * 4
     assert feerates['perkb']['normal'] == 25000
     assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
@@ -900,8 +906,8 @@ def test_feerates(node_factory):
     assert feerates['perkb']['min_acceptable'] == 253 * 4
 
     l1.set_feerates((15000, 6250, 5000), True)
+    wait_for(lambda: len(l1.rpc.feerates('perkw')['perkw']) == 5)
     feerates = l1.rpc.feerates('perkw')
-    assert len(feerates['perkw']) == 5
     assert feerates['perkw']['urgent'] == 15000
     assert feerates['perkw']['normal'] == 25000 // 4
     assert feerates['perkw']['slow'] == 5000
@@ -922,6 +928,8 @@ def test_logging(node_factory):
     logpath = os.path.join(l1.daemon.lightning_dir, 'logfile')
     logpath_moved = os.path.join(l1.daemon.lightning_dir, 'logfile_moved')
 
+    l1.daemon.rpcproxy.start()
+    l1.daemon.opts['bitcoin-rpcport'] = l1.daemon.rpcproxy.rpcport
     TailableProc.start(l1.daemon)
     wait_for(lambda: os.path.exists(logpath))
 
@@ -931,14 +939,16 @@ def test_logging(node_factory):
     wait_for(lambda: os.path.exists(logpath))
 
     log1 = open(logpath_moved).readlines()
-    log2 = open(logpath).readlines()
-
     assert log1[-1].endswith("Ending log due to SIGHUP\n")
-    assert log2[0].endswith("Started log due to SIGHUP\n")
+
+    def check_new_log():
+        log2 = open(logpath).readlines()
+        return len(log2) > 1 and log2[0].endswith("Started log due to SIGHUP\n")
+    wait_for(check_new_log)
 
 
-@unittest.skipIf(VALGRIND and not DEVELOPER,
-                 "Backtrace upsets valgrind: only suppressed in DEVELOPER mode")
+@unittest.skipIf(VALGRIND,
+                 "Valgrind sometimes fails assert on injected SEGV")
 def test_crashlog(node_factory):
     l1 = node_factory.get_node(may_fail=True)
 

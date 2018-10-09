@@ -31,7 +31,11 @@ struct half_chan {
 
 	/* Flags as specified by the `channel_update`s, among other
 	 * things indicated direction wrt the `channel_id` */
-	u16 flags;
+	u8 channel_flags;
+
+	/* Flags as specified by the `channel_update`s, indicates
+	 * optional fields.  */
+	u8 message_flags;
 
 	/* If greater than current time, this connection should not
 	 * be used for routing. */
@@ -81,7 +85,7 @@ static inline bool is_halfchan_defined(const struct half_chan *hc)
 
 static inline bool is_halfchan_enabled(const struct half_chan *hc)
 {
-	return is_halfchan_defined(hc) && !(hc->flags & ROUTING_FLAGS_DISABLED);
+	return is_halfchan_defined(hc) && !(hc->channel_flags & ROUTING_FLAGS_DISABLED);
 }
 
 struct node {
@@ -106,14 +110,14 @@ struct node {
 		struct chan *prev;
 	} bfg[ROUTING_MAX_HOPS+1];
 
-	/* UTF-8 encoded alias as tal_arr, not zero terminated */
-	u8 *alias;
+	/* UTF-8 encoded alias, not zero terminated */
+	u8 alias[32];
 
 	/* Color to be used when displaying the name */
 	u8 rgb_color[3];
 
 	/* (Global) features */
-	u8 *gfeatures;
+	u8 *globalfeatures;
 
 	/* Cached `node_announcement` we might forward to new peers (or NULL). */
 	const u8 *node_announcement;
@@ -136,7 +140,8 @@ static inline int pubkey_idx(const struct pubkey *id1, const struct pubkey *id2)
 }
 
 /* Fast versions: if you know n is one end of the channel */
-static inline struct node *other_node(const struct node *n, struct chan *chan)
+static inline struct node *other_node(const struct node *n,
+				      const struct chan *chan)
 {
 	int idx = (chan->nodes[1] == n);
 
@@ -155,7 +160,7 @@ static inline struct half_chan *half_chan_from(const struct node *n,
 }
 
 /* If you know n is one end of the channel, get index dst == n */
-static inline int half_chan_to(const struct node *n, struct chan *chan)
+static inline int half_chan_to(const struct node *n, const struct chan *chan)
 {
 	int idx = (chan->nodes[1] == n);
 
@@ -248,7 +253,7 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 				  const u8 *txscript);
 
 /* Returns NULL if all OK, otherwise an error for the peer which sent. */
-u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
+u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 			  const char *source);
 
 /* Returns NULL if all OK, otherwise an error for the peer which sent. */
@@ -308,13 +313,9 @@ bool routing_add_channel_update(struct routing_state *rstate,
  * Directly add the node being announced to the network view, without verifying
  * it. This must be from a trusted source, e.g., gossip_store. For untrusted
  * sources (peers) please use @see{handle_node_announcement}.
- *
- * Populates *unknown_node if it isn't NULL and this returns false to indicate
- * if failure was due to an unknown node_id.
  */
 bool routing_add_node_announcement(struct routing_state *rstate,
-				   const u8 *msg TAKES,
-				   bool *unknown_node);
+                                  const u8 *msg TAKES);
 
 
 /**

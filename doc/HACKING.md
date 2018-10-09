@@ -158,7 +158,7 @@ Testing
 Install `valgrind` and the python dependencies for best results:
 
 ```
-sudo apt install valgrind
+sudo apt install valgrind cppcheck shellcheck
 pip3 install -r tests/requirements.txt
 ```
 
@@ -172,7 +172,7 @@ PYTEST_PAR=n    - runs pytests in parallel
 
 A modern desktop can build and run through all the tests in a couple of minutes with:
 
-    make -j12 check PYTEST_PAR=24 DEVELOPER=1 VALGRIND=0
+    make -j12 full-check PYTEST_PAR=24 DEVELOPER=1 VALGRIND=0
 
 Adjust `-j` and `PYTEST_PAR` accordingly for your hardware.
 
@@ -180,7 +180,7 @@ There are three kinds of tests:
 
 * **source tests** - run by `make check-source`, looks for whitespace,
   header order, and checks formatted quotes from BOLTs if BOLTDIR
-  exists (currently disabled, since BOLTs are being re-edited).
+  exists.
 
 * **unit tests** - standalone programs that can be run individually.
   They are `run-*.c` files in test/ subdirectories used to test routines

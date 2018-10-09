@@ -11,7 +11,7 @@
 #include <common/bolt11.h>
 #include <common/utils.h>
 #include <errno.h>
-#include <hsmd/gen_hsm_client_wire.h>
+#include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/jsonrpc.h>
@@ -422,18 +422,13 @@ static char *decode_r(struct bolt11 *b11,
         pull_bits_certain(hu5, data, data_len, r8, data_length * 5, false);
 
         do {
-                tal_resize(&r, n+1);
-                if (!fromwire_route_info(&cursor, &rlen, &r[n])) {
+                if (!fromwire_route_info(&cursor, &rlen, tal_arr_expand(&r))) {
                         return tal_fmt(b11, "r: hop %zu truncated", n);
                 }
-                n++;
         } while (rlen);
 
         /* Append route */
-        n = tal_count(b11->routes);
-        tal_resize(&b11->routes, n+1);
-        b11->routes[n] = tal_steal(b11, r);
-
+	*tal_arr_expand(&b11->routes) = tal_steal(b11, r);
         return NULL;
 }
 
@@ -498,7 +493,8 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
         /* BOLT #11:
          *
-         * A reader MUST fail if it does not understand the `prefix`.
+         * A reader:
+         *   - MUST fail if it does not understand the `prefix`
          */
         if (!strstarts(prefix, "ln"))
                 return decode_fail(b11, fail,
@@ -510,14 +506,13 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
         /* BOLT #11:
          *
-         * A reader SHOULD fail if `amount` contains a non-digit or
-         * is followed by anything except a `multiplier` in the table
-         * above. */
+         *   - If the `amount` is empty:
+         * */
         amountstr = tal_strdup(tmpctx, hrp + strlen(prefix));
         if (streq(amountstr, "")) {
                 /* BOLT #11:
                  *
-                 * A reader SHOULD indicate if amount is unspecified
+	         * - SHOULD indicate if amount is unspecified
                  */
                 b11->msatoshi = NULL;
         } else {
@@ -537,10 +532,9 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
                 /* BOLT #11:
                  *
-                 * A reader SHOULD fail if `amount` contains a non-digit or
-                 * is followed by anything except a `multiplier` in the table
-                 * above.
-                 */
+                 * MUST fail if `amount` contains a non-digit or is followed by
+                 * anything except a `multiplier` in the table above
+                 **/
                 amount = strtoull(amountstr, &end, 10);
                 if (amount == ULLONG_MAX && errno == ERANGE)
                         return decode_fail(b11, fail,
@@ -549,7 +543,12 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
                         return decode_fail(b11, fail,
                                            "Invalid amount postfix '%s'", end);
 
-                /* Convert to millisatoshis. */
+                /* BOLT #11:
+                 *
+                 * - If the `multiplier` is present:
+                 *   - MUST multiply `amount` by the `multiplier`
+                 *   value to derive the amount required for payment
+                 **/
                 b11->msatoshi = tal(b11, u64);
                 *b11->msatoshi = amount * m10 / 10;
         }
@@ -873,9 +872,15 @@ char *bolt11_encode_(const tal_t *ctx,
 
         /* BOLT #11:
          *
-         * A writer MUST encode `amount` as a positive decimal integer
-         * with no leading zeroes and SHOULD use the shortest representation
-	 * possible.
+         * A writer:
+         *   - MUST encode `prefix` using the currency it requires
+         *   for successful payment
+         *   - If it requires a specific minimum amount for successful payment:
+	 *     - MUST include that `amount`
+	 *     - MUST encode `amount` as a positive decimal integer
+         *     with no leading zeroes
+	 *     - SHOULD use the shortest representation possible by
+         *     using the largest multiplier or omitting the multiplier
          */
         if (b11->msatoshi) {
                 char postfix;

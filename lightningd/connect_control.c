@@ -11,9 +11,10 @@
 #include <connectd/gen_connect_wire.h>
 #include <errno.h>
 #include <hsmd/capabilities.h>
-#include <hsmd/gen_hsm_client_wire.h>
+#include <hsmd/gen_hsm_wire.h>
 #include <lightningd/channel.h>
 #include <lightningd/connect_control.h>
+#include <lightningd/hsm_control.h>
 #include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/jsonrpc_errors.h>
@@ -333,7 +334,6 @@ int connectd_init(struct lightningd *ld)
 	int fds[2];
 	u8 *msg;
 	int hsmfd;
-	u64 capabilities = HSM_CAP_ECDH;
 	struct wireaddr_internal *wireaddrs = ld->proposed_wireaddr;
 	enum addr_listen_announce *listen_announce = ld->proposed_listen_announce;
 	bool allow_localhost = false;
@@ -345,17 +345,7 @@ int connectd_init(struct lightningd *ld)
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0)
 		fatal("Could not socketpair for connectd<->gossipd");
 
-	msg = towire_hsm_client_hsmfd(tmpctx, &ld->id, 0, capabilities);
-	if (!wire_sync_write(ld->hsm_fd, msg))
-		fatal("Could not write to HSM: %s", strerror(errno));
-
-	msg = wire_sync_read(tmpctx, ld->hsm_fd);
-	if (!fromwire_hsm_client_hsmfd_reply(msg))
-		fatal("Malformed hsmfd response: %s", tal_hex(msg, msg));
-
-	hsmfd = fdpass_recv(ld->hsm_fd);
-	if (hsmfd < 0)
-		fatal("Could not read fd from HSM: %s", strerror(errno));
+	hsmfd = hsm_get_global_fd(ld, HSM_CAP_ECDH);
 
 	ld->connectd = new_global_subd(ld, "lightning_connectd",
 				       connect_wire_type_name, connectd_msg,
@@ -374,8 +364,8 @@ int connectd_init(struct lightningd *ld)
 
 	msg = towire_connectctl_init(
 	    tmpctx, &ld->id,
-	    get_offered_global_features(tmpctx),
-	    get_offered_local_features(tmpctx), wireaddrs,
+	    get_offered_globalfeatures(tmpctx),
+	    get_offered_localfeatures(tmpctx), wireaddrs,
 	    listen_announce,
 	    ld->proxyaddr, ld->use_proxy_always || ld->pure_tor_setup,
 	    allow_localhost, ld->config.use_dns,
