@@ -9,7 +9,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := 0891374d47ddffa64c5a2e6ad151247e3d6b7a59
+BOLTVERSION := b6ae60d24138a3601561fbc1c9d82d983595ae4f
 
 -include config.vars
 
@@ -35,7 +35,7 @@ endif
 
 ifeq ($(COMPAT),1)
 # We support compatibility with pre-0.6.
-COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1
+COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1 -DCOMPAT_V061=1
 endif
 
 PYTEST_OPTS := -v
