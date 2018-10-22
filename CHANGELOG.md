@@ -11,9 +11,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - JSON API: `listpeers` has new field `scratch_txid`: the latest tx in channel.
 - JSON API: `listpeers` has new array `htlcs`: the current live payments.
 - JSON API: `listchannels` has two new fields: `message_flags` and `channel_flags`. This replaces `flags`.
+- JSON API: `invoice` now adds route hint to invoices for incoming capacity (RouteBoost), and warns if insufficient capacity.
+- JSON API: `listforwards` lists all forwarded payments, their associated channels, and fees.
+- JSON API: `getinfo` shows forwarding fees earnt as `msatoshi_fees_collected`.
 - Bitcoind: more parallelism in requests, for very slow nodes.
 - Testing: fixed logging, cleaner interception of bitcoind, minor fixes.
-- JSON API: `invoice` now adds route hint to invoices for incoming capacity (RouteBoost), and warns if insufficient capacity.
+- Protocol: we set and handle the new `htlc_maximum_msat` channel_update field.
 
 ### Changed
 
@@ -21,6 +24,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Protocol: we don't send redundant `node_announcement` on every new channel.
 - Config: config file can override `lightning-dir` (makes sense with `--conf`).
 - Config: `--conf` option is now relative to current directory, not `lightning-dir`.
+- lightning-cli: `help <cmd>` prints basic information even if no man page found.
+- JSON API: `getinfo` now reports global statistics about forwarded payments, including total fees earned and amounts routed.
 
 ### Deprecated
 
@@ -41,9 +46,13 @@ changes.
 - JSON RPC: `getroute` `fuzzpercent` and `pay` `maxfeepercent` can now be > 100.
 - JSON RPC: `riskfactor` in `pay` and `getroute` no longer always treated as 1.
 - JSON-RPC: `listpeers` was always reporting 0 for all stats.
+- JSON RPC: `withdraw all` says `Cannot afford transaction` if you have
+             absolutely no funds, rather than `Output 0 satoshis would be dust`.
+- Protocol: don't send gossip about closed channels.
 - Protocol: fix occasional deadlock when both peers flood with gossip.
 - Protocol: fix occasional long delay on sending `reply_short_channel_ids_end`.
 - Protocol: re-send `node_announcement` when address/alias/color etc change.
+- Options: 'autotor' defaults to port 9051 if not specified.
 
 ### Security
 

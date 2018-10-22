@@ -10,7 +10,6 @@
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/configdir.h>
-#include <common/json_escaped.h>
 #include <common/memleak.h>
 #include <common/version.h>
 #include <common/wireaddr.h>
@@ -20,6 +19,7 @@
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/json.h>
+#include <lightningd/json_escaped.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
@@ -405,7 +405,7 @@ static void dev_register_opts(struct lightningd *ld)
 	opt_register_arg("--dev-debugger=<subdaemon>", opt_subd_debug, NULL,
 			 ld, "Invoke gdb at start of <subdaemon>");
 	opt_register_arg("--dev-broadcast-interval=<ms>", opt_set_uintval,
-			 opt_show_uintval, &ld->config.broadcast_interval,
+			 opt_show_uintval, &ld->config.broadcast_interval_msec,
 			 "Time between gossip broadcasts in milliseconds");
 	opt_register_arg("--dev-disconnect=<filename>", opt_subd_dev_disconnect,
 			 NULL, ld, "File containing disconnection points");
@@ -465,7 +465,7 @@ static const struct config testnet_config = {
 	 *   - SHOULD flush outgoing gossip messages once every 60
 	 *     seconds, independently of the arrival times of the messages.
 	 */
-	.broadcast_interval = 60000,
+	.broadcast_interval_msec = 60000,
 
 	/* Send a keepalive update at least every week, prune every twice that */
 	.channel_update_interval = 1209600/2,
@@ -528,7 +528,7 @@ static const struct config mainnet_config = {
 	 *   - SHOULD flush outgoing gossip messages once every 60
 	 *     seconds, independently of the arrival times of the messages.
 	 */
-	.broadcast_interval = 60000,
+	.broadcast_interval_msec = 60000,
 
 	/* Send a keepalive update at least every week, prune every twice that */
 	.channel_update_interval = 1209600/2,
@@ -856,7 +856,7 @@ static const char *next_name(const char *names, unsigned *len)
 	return first_name(names + 1, len);
 }
 
-static void json_add_opt_addrs(struct json_result *response,
+static void json_add_opt_addrs(struct json_stream *response,
 			       const char *name0,
 			       const struct wireaddr_internal *wireaddrs,
 			       const enum addr_listen_announce *listen_announce,
@@ -872,7 +872,7 @@ static void json_add_opt_addrs(struct json_result *response,
 }
 
 static void add_config(struct lightningd *ld,
-		       struct json_result *response,
+		       struct json_stream *response,
 		       const struct opt_table *opt,
 		       const char *name, size_t len)
 {
@@ -978,18 +978,19 @@ static void json_listconfigs(struct command *cmd,
 			     const char *buffer, const jsmntok_t *params)
 {
 	size_t i;
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response = NULL;
 	const jsmntok_t *configtok;
-	bool found = false;
 
 	if (!param(cmd, buffer, params,
 		   p_opt("config", json_tok_tok, &configtok),
 		   NULL))
 		return;
 
-	json_object_start(response, NULL);
-	if (!configtok)
+	if (!configtok) {
+		response = json_stream_success(cmd);
+		json_object_start(response, NULL);
 		json_add_string(response, "# version", version());
+	}
 
 	for (i = 0; i < opt_count; i++) {
 		unsigned int len;
@@ -1012,20 +1013,23 @@ static void json_listconfigs(struct command *cmd,
 				      name + 1, len - 1))
 				continue;
 
-			found = true;
+			if (!response) {
+				response = json_stream_success(cmd);
+				json_object_start(response, NULL);
+			}
 			add_config(cmd->ld, response, &opt_table[i],
 				   name+1, len-1);
 		}
 	}
-	json_object_end(response);
 
-	if (configtok && !found) {
+	if (configtok && !response) {
 		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 			     "Unknown config option '%.*s'",
 			     configtok->end - configtok->start,
 			     buffer + configtok->start);
 		return;
 	}
+	json_object_end(response);
 	command_success(cmd, response);
 }
 

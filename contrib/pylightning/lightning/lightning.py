@@ -428,6 +428,11 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("listfunds")
 
+    def listforwards(self):
+        """List all forwarded payments and their information
+        """
+        return self.call("listforwards")
+
     def dev_rescan_outputs(self):
         """
         Synchronize the state of our funds with bitcoind
