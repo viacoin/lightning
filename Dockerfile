@@ -38,23 +38,6 @@ RUN mkdir /opt/bitcoin && cd /opt/bitcoin \
     && tar -xzvf $BITCOIN_TARBALL $BD/bitcoin-cli --strip-components=1 \
     && rm $BITCOIN_TARBALL
 
-ENV LITECOIN_VERSION 0.14.2
-ENV LITECOIN_URL https://download.litecoin.org/litecoin-0.14.2/linux/litecoin-0.14.2-x86_64-linux-gnu.tar.gz
-ENV LITECOIN_SHA256 05f409ee57ce83124f2463a3277dc8d46fca18637052d1021130e4deaca07b3c
-ENV LITECOIN_ASC_URL https://download.litecoin.org/litecoin-0.14.2/linux/litecoin-0.14.2-linux-signatures.asc
-ENV LITECOIN_PGP_KEY FE3348877809386C
-
-# install litecoin binaries
-RUN mkdir /opt/litecoin && cd /opt/litecoin \
-    && wget -qO litecoin.tar.gz "$LITECOIN_URL" \
-    && echo "$LITECOIN_SHA256  litecoin.tar.gz" | sha256sum -c - \
-    && gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "$LITECOIN_PGP_KEY" \
-    && wget -qO litecoin.asc "$LITECOIN_ASC_URL" \
-    && gpg --verify litecoin.asc \
-    && BD=litecoin-$LITECOIN_VERSION/bin \
-    && tar -xzvf litecoin.tar.gz $BD/litecoin-cli --strip-components=1 --exclude=*-qt \
-    && rm litecoin.tar.gz
-
 ENV VIACOIN_VERSION 0.15.2
 ENV VIACOIN_URL https://github.com/viacoin/viacoin/releases/download/v0.15.2/viacoin-0.15.2-x86_64-linux-gnu.tar.gz
 ENV VIACOIN_SHA256 bdbd432645a8b4baadddb7169ea4bef3d03f80dc2ce53dce5783d8582ac63bab
@@ -109,7 +92,6 @@ VOLUME [ "/root/.lightning" ]
 COPY --from=builder /opt/lightningd/cli/lightning-cli /usr/bin
 COPY --from=builder /opt/lightningd/lightningd/lightning* /usr/bin/
 COPY --from=builder /opt/bitcoin/bin /usr/bin
-COPY --from=builder /opt/litecoin/bin /usr/bin
 COPY --from=builder /opt/viacoin/bin /usr/bin
 COPY tools/docker-entrypoint.sh entrypoint.sh
 
