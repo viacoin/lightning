@@ -8,7 +8,7 @@ lightningd-config - Lightning daemon configuration file
 
 SYNOPSIS
 --------
-*~/.lightningd/config*
+*~/.lightning/config*
 
 DESCRIPTION
 -----------
@@ -124,6 +124,11 @@ Lightning daemon options:
     (we allow missing files in the default case).
     Using this inside a configuration file is meaningless.
 
+*plugin*='PATH'::
+    Specify a plugin to run as part of c-lightning. This can be specified
+    multiple times and may enable additional configuration options and JSON-RPC
+    methods, depending on the plugin.
+
 Lightning node customization options:
 
 *rgb*='RRGGBB'::
@@ -213,7 +218,8 @@ will announce it to peers if it's seems like a public address.
 
 You can instead use 'addr' to override this (eg. to change the port),
 or precisely control where to bind and what to announce with the
-'bind-addr' and 'announce-addr' options.
+'bind-addr' and 'announce-addr' options.  These will *disable* the
+'autolisten' logic, so you must specifiy exactly what you want!
 
 *addr*='[IPADDRESS[:PORT]]|autotor:TORIPADDRESS[:TORPORT]'::
 

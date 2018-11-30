@@ -57,7 +57,6 @@
 /*~ This is common code: routines shared by one or more executables
  *  (separate daemons, or the lightning-cli program). */
 #include <common/daemon.h>
-#include <common/memleak.h>
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <common/version.h>
@@ -116,15 +115,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_disconnect_fd = -1;
 	ld->dev_subdaemon_fail = false;
 	ld->dev_allow_localhost = false;
-
-	/*~ Behaving differently depending on environment variables is a hack,
-	 * *but* hacks are allowed for dev-mode stuff.  In this case, there's
-	 * a significant overhead to the memory leak detection stuff, and we
-	 * can't use it under valgrind (an awesome runtime memory usage
-	 * detector for C and C++ programs), so the test harness uses this var
-	 * to disable it in that case. */
-	if (getenv("LIGHTNINGD_DEV_MEMLEAK"))
-		memleak_init();
 #endif
 
 	/*~ These are CCAN lists: an embedded double-linked list.  It's not
@@ -210,6 +200,14 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->pure_tor_setup = false;
 	ld->tor_service_password = NULL;
 	ld->max_funding_unconfirmed = 2016;
+
+	/*~ We run a number of plugins (subprocesses that we talk JSON-RPC with)
+	 *alongside this process. This allows us to have an easy way for users
+	 *to add their own tools without having to modify the c-lightning source
+	 *code. Here we initialize the context that will keep track and control
+	 *the plugins.
+	 */
+	ld->plugins = plugins_new(ld, ld->log_book);
 
 	return ld;
 }
@@ -366,9 +364,10 @@ static const char *find_daemon_dir(const tal_t *ctx, const char *argv0)
 	return find_my_pkglibexec_path(ctx, take(my_path));
 }
 
-/*~ We like to free everything on exit, so valgrind doesn't complain.  In some
- * ways it would be neater not to do this, but it turns out some transient
- * objects still need cleaning. */
+/*~ We like to free everything on exit, so valgrind doesn't complain (valgrind
+ * is an awesome runtime memory usage detector for C and C++ programs). In
+ * some ways it would be neater not to do this, but it turns out some
+ * transient objects still need cleaning. */
 static void shutdown_subdaemons(struct lightningd *ld)
 {
 	struct peer *p;
@@ -585,8 +584,24 @@ int main(int argc, char *argv[])
 	 *  mimic this API here, even though they're on separate lines.*/
 	register_opts(ld);
 
+	/*~ Handle early options, but don't move to --lightning-dir
+	 *  just yet. Plugins may add new options, which is why we are
+	 *  splitting between early args (including --plugin
+	 *  registration) and non-early opts. */
+	handle_early_opts(ld, argc, argv);
+
+	/*~ Initialize all the plugins we just registered, so they can
+	 *  do their thing and tell us about themselves (including
+	 *  options registration). */
+	plugins_init(ld->plugins);
+
 	/*~ Handle options and config; move to .lightningd (--lightning-dir) */
 	handle_opts(ld, argc, argv);
+
+	/*~ Now that we have collected all the early options, gave
+	 *  plugins a chance to register theirs and collected all
+	 *  remaining options it's time to tell the plugins. */
+	plugins_config(ld->plugins);
 
 	/*~ Make sure we can reach the subdaemons, and versions match. */
 	test_subdaemons(ld);
@@ -774,9 +789,6 @@ int main(int argc, char *argv[])
 	tal_free(ld);
 	opt_free_table();
 
-#if DEVELOPER
-	memleak_cleanup();
-#endif
 	daemon_shutdown();
 
 	/*~ Farewell.  Next stop: hsmd/hsmd.c. */

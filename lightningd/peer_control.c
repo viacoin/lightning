@@ -18,6 +18,7 @@
 #include <common/key_derive.h>
 #include <common/status.h>
 #include <common/timeout.h>
+#include <common/version.h>
 #include <common/wire_error.h>
 #include <connectd/gen_connect_wire.h>
 #include <errno.h>
@@ -34,6 +35,7 @@
 #include <lightningd/jsonrpc.h>
 #include <lightningd/jsonrpc_errors.h>
 #include <lightningd/log.h>
+#include <lightningd/memdump.h>
 #include <lightningd/onchain_control.h>
 #include <lightningd/opening_control.h>
 #include <lightningd/options.h>
@@ -1068,6 +1070,78 @@ static const struct json_command disconnect_command = {
 };
 AUTODATA(json_command, &disconnect_command);
 
+static void json_getinfo(struct command *cmd,
+             const char *buffer UNUSED, const jsmntok_t *params UNUSED)
+{
+    struct json_stream *response;
+    struct peer *peer;
+    struct channel *channel;
+    unsigned int pending_channels = 0, active_channels = 0,
+            inactive_channels = 0, num_peers = 0;
+
+    if (!param(cmd, buffer, params, NULL))
+        return;
+
+    response = json_stream_success(cmd);
+    json_object_start(response, NULL);
+    json_add_pubkey(response, "id", &cmd->ld->id);
+    json_add_string(response, "alias", (const char *)cmd->ld->alias);
+    json_add_hex_talarr(response, "color", cmd->ld->rgb);
+
+    /* Add some peer and channel stats */
+    list_for_each(&cmd->ld->peers, peer, list) {
+        num_peers++;
+        /* Count towards pending? */
+        if (peer->uncommitted_channel) {
+            pending_channels++;
+        }
+
+        list_for_each(&peer->channels, channel, list) {
+            if (channel->state == CHANNELD_AWAITING_LOCKIN) {
+                pending_channels++;
+            } else if (channel_active(channel)) {
+                active_channels++;
+            } else {
+                inactive_channels++;
+            }
+        }
+    }
+    json_add_num(response, "num_peers", num_peers);
+    json_add_num(response, "num_pending_channels", pending_channels);
+    json_add_num(response, "num_active_channels", active_channels);
+    json_add_num(response, "num_inactive_channels", inactive_channels);
+
+    /* Add network info */
+    if (cmd->ld->listen) {
+        /* These are the addresses we're announcing */
+        json_array_start(response, "address");
+        for (size_t i = 0; i < tal_count(cmd->ld->announcable); i++)
+            json_add_address(response, NULL, cmd->ld->announcable+i);
+        json_array_end(response);
+
+        /* This is what we're actually bound to. */
+        json_array_start(response, "binding");
+        for (size_t i = 0; i < tal_count(cmd->ld->binding); i++)
+            json_add_address_internal(response, NULL,
+                          cmd->ld->binding+i);
+        json_array_end(response);
+    }
+    json_add_string(response, "version", version());
+    json_add_num(response, "blockheight", get_block_height(cmd->ld->topology));
+    json_add_string(response, "network", get_chainparams(cmd->ld)->network_name);
+    json_add_u64(response, "msatoshi_fees_collected",
+             wallet_total_forward_fees(cmd->ld->wallet));
+    json_object_end(response);
+    command_success(cmd, response);
+}
+
+static const struct json_command getinfo_command = {
+    "getinfo",
+    json_getinfo,
+    "Show information about this node"
+};
+AUTODATA(json_command, &getinfo_command);
+
 #if DEVELOPER
 static void json_sign_last_tx(struct command *cmd,
 			      const char *buffer, const jsmntok_t *params)
@@ -1322,4 +1396,100 @@ static const struct json_command dev_forget_channel_command = {
 	"Forget the channel with peer {id}. Checks if the channel is still active by checking its funding transaction. Check can be ignored by setting {force} to 'true'"
 };
 AUTODATA(json_command, &dev_forget_channel_command);
+
+static void subd_died_forget_memleak(struct subd *openingd, struct command *cmd)
+{
+	/* FIXME: We ignore the remaining per-peer daemons in this case. */
+	peer_memleak_done(cmd, NULL);
+}
+
+/* Mutual recursion */
+static void peer_memleak_req_next(struct command *cmd, struct channel *prev);
+static void peer_memleak_req_done(struct subd *subd, bool found_leak,
+				  struct command *cmd)
+{
+	struct channel *c = subd->channel;
+
+	if (found_leak)
+		peer_memleak_done(cmd, subd);
+	else
+		peer_memleak_req_next(cmd, c);
+}
+
+static void channeld_memleak_req_done(struct subd *channeld,
+				      const u8 *msg, const int *fds UNUSED,
+				      struct command *cmd)
+{
+	bool found_leak;
+
+	tal_del_destructor2(channeld, subd_died_forget_memleak, cmd);
+	if (!fromwire_channel_dev_memleak_reply(msg, &found_leak)) {
+		command_fail(cmd, LIGHTNINGD, "Bad channel_dev_memleak");
+		return;
+	}
+	peer_memleak_req_done(channeld, found_leak, cmd);
+}
+
+static void onchaind_memleak_req_done(struct subd *onchaind,
+				      const u8 *msg, const int *fds UNUSED,
+				      struct command *cmd)
+{
+	bool found_leak;
+
+	tal_del_destructor2(onchaind, subd_died_forget_memleak, cmd);
+	if (!fromwire_onchain_dev_memleak_reply(msg, &found_leak)) {
+		command_fail(cmd, LIGHTNINGD, "Bad onchain_dev_memleak");
+		return;
+	}
+	peer_memleak_req_done(onchaind, found_leak, cmd);
+}
+
+static void peer_memleak_req_next(struct command *cmd, struct channel *prev)
+{
+	struct peer *p;
+
+	list_for_each(&cmd->ld->peers, p, list) {
+		struct channel *c;
+
+		list_for_each(&p->channels, c, list) {
+			if (c == prev) {
+				prev = NULL;
+				continue;
+			}
+
+			if (!c->owner)
+				continue;
+
+			if (prev != NULL)
+				continue;
+
+			/* Note: closingd does its own checking automatically */
+			if (streq(c->owner->name, "lightning_channeld")) {
+				subd_req(c, c->owner,
+					 take(towire_channel_dev_memleak(NULL)),
+					 -1, 0, channeld_memleak_req_done, cmd);
+				tal_add_destructor2(c->owner,
+						    subd_died_forget_memleak,
+						    cmd);
+				return;
+			}
+			if (streq(c->owner->name, "lightning_onchaind")) {
+				subd_req(c, c->owner,
+					 take(towire_onchain_dev_memleak(NULL)),
+					 -1, 0, onchaind_memleak_req_done, cmd);
+				tal_add_destructor2(c->owner,
+						    subd_died_forget_memleak,
+						    cmd);
+				return;
+			}
+		}
+	}
+	peer_memleak_done(cmd, NULL);
+}
+
+void peer_dev_memleak(struct command *cmd)
+{
+	peer_memleak_req_next(cmd, NULL);
+}
 #endif /* DEVELOPER */
+

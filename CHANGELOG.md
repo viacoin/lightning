@@ -8,7 +8,14 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
+- JSON API: `getinfo` now returns `num_peers` `num_pending_channels`,
+  `num_active_channels` and `num_inactive_channels` fields.
+- JSON API: use `\n\n` to terminate responses, for simplified parsing (pylightning now relies on this)
+- Plugins: Added plugins to `lightningd` and implemented the option passthrough.
+
 ### Changed
+
+- JSON API: `pay` and `decodepay` accept and ignore `lightning:` prefixes.
 
 ### Deprecated
 
@@ -20,6 +27,9 @@ changes.
 ### Fixed
 
 - JSON API: uppercase invoices now parsed correctly (broken in 0.6.2).
+- JSON API: commands are once again read even if one hasn't responded yet (broken in 0.6.2).
+- Protocol: allow lnd to send `update_fee` before `funding_locked`.
+- pylightning: handle multiple simultanous RPC replies reliably.
 
 ### Security
 

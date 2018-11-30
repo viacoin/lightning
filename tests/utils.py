@@ -1,3 +1,10 @@
+from bitcoin.rpc import RawProxy as BitcoinProxy
+from btcproxy import BitcoinRpcProxy
+from decimal import Decimal
+from ephemeral_port_reserve import reserve
+from lightning import LightningRpc
+
+import json
 import logging
 import os
 import random
@@ -8,12 +15,6 @@ import string
 import subprocess
 import threading
 import time
-
-from btcproxy import BitcoinRpcProxy
-from bitcoin.rpc import RawProxy as BitcoinProxy
-from decimal import Decimal
-from ephemeral_port_reserve import reserve
-from lightning import LightningRpc
 
 BITCOIND_CONFIG = {
     "regtest": 1,
@@ -298,6 +299,7 @@ class BitcoinD(TailableProc):
 class LightningD(TailableProc):
     def __init__(self, lightning_dir, bitcoind, port=9735, random_hsm=False, node_id=0):
         TailableProc.__init__(self, lightning_dir)
+        self.executable = 'lightningd/lightningd'
         self.lightning_dir = lightning_dir
         self.port = port
         self.cmd_prefix = []
@@ -351,7 +353,7 @@ class LightningD(TailableProc):
             else:
                 opts.append("--{}={}".format(k, v))
 
-        return self.cmd_prefix + ['lightningd/lightningd'] + opts
+        return self.cmd_prefix + [self.executable] + opts
 
     def start(self):
         self.rpcproxy.start()
@@ -492,7 +494,7 @@ class LightningNode(object):
 
         self.start()
 
-    def fund_channel(self, l2, amount):
+    def fund_channel(self, l2, amount, wait_for_active=True):
 
         # Give yourself some funds to work with
         addr = self.rpc.newaddr()['address']
@@ -523,18 +525,19 @@ class LightningNode(object):
             decoded2 = self.bitcoin.rpc.decoderawtransaction(tx)
             raise ValueError("Can't find {} payment in {} (1={} 2={})".format(amount, tx, decoded, decoded2))
 
-        # We wait until gossipd sees both local updates, as well as status NORMAL,
-        # so it can definitely route through.
-        self.daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
-                                   .format(scid),
-                                   r'update for channel {}\(1\) now ACTIVE'
-                                   .format(scid),
-                                   'to CHANNELD_NORMAL'])
-        l2.daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
-                                 .format(scid),
-                                 r'update for channel {}\(1\) now ACTIVE'
-                                 .format(scid),
-                                 'to CHANNELD_NORMAL'])
+        if wait_for_active:
+            # We wait until gossipd sees both local updates, as well as status NORMAL,
+            # so it can definitely route through.
+            self.daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
+                                       .format(scid),
+                                       r'update for channel {}\(1\) now ACTIVE'
+                                       .format(scid),
+                                       'to CHANNELD_NORMAL'])
+            l2.daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
+                                     .format(scid),
+                                     r'update for channel {}\(1\) now ACTIVE'
+                                     .format(scid),
+                                     'to CHANNELD_NORMAL'])
         return scid
 
     def subd_pid(self, subd):
@@ -770,7 +773,7 @@ class NodeFactory(object):
                 'valgrind',
                 '-q',
                 '--trace-children=yes',
-                '--trace-children-skip=*bitcoin-cli*',
+                '--trace-children-skip=*plugins*,*python*,*bitcoin-cli*',
                 '--error-exitcode=7',
                 '--log-file={}/valgrind-errors.%p'.format(node.daemon.lightning_dir)
             ]
@@ -862,7 +865,9 @@ class NodeFactory(object):
                     unexpected_fail = True
 
             if leaks is not None and len(leaks) != 0:
-                raise Exception("Node {} has memory leaks: {}"
-                                .format(self.nodes[i].daemon.lightning_dir, leaks))
+                raise Exception("Node {} has memory leaks: {}".format(
+                    self.nodes[i].daemon.lightning_dir,
+                    json.dumps(leaks, sort_keys=True, indent=4)
+                ))
 
         return not unexpected_fail

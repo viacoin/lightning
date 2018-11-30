@@ -1,13 +1,13 @@
 '\" t
 .\"     Title: lightningd-config
 .\"    Author: [see the "AUTHOR" section]
-.\" Generator: DocBook XSL Stylesheets v1.79.1 <http://docbook.sf.net/>
-.\"      Date: 10/12/2018
+.\" Generator: DocBook XSL Stylesheets vsnapshot <http://docbook.sf.net/>
+.\"      Date: 11/22/2018
 .\"    Manual: \ \&
 .\"    Source: \ \&
 .\"  Language: English
 .\"
-.TH "LIGHTNINGD\-CONFIG" "5" "10/12/2018" "\ \&" "\ \&"
+.TH "LIGHTNINGD\-CONFIG" "5" "11/22/2018" "\ \&" "\ \&"
 .\" -----------------------------------------------------------------
 .\" * Define some portability stuff
 .\" -----------------------------------------------------------------
@@ -31,7 +31,7 @@
 lightningd-config \- Lightning daemon configuration file
 .SH "SYNOPSIS"
 .sp
-\fB~/\&.lightningd/config\fR
+\fB~/\&.lightning/config\fR
 .SH "DESCRIPTION"
 .sp
 When lightningd(8) starts up, it reads a configuration file\&. By default that is \fIconfig\fR in the \fB\&.lightning\fR subdirectory of the home directory (if it exists), but that can be changes by the \fI\-\-lightning\-dir\fR or \fI\-\-conf\fR options on the lightningd(8) command line\&.
@@ -176,6 +176,11 @@ Sets configuration file (default:
 \fIPATH\fR
 must exist and be readable (we allow missing files in the default case)\&. Using this inside a configuration file is meaningless\&.
 .RE
+.PP
+\fBplugin\fR=\fIPATH\fR
+.RS 4
+Specify a plugin to run as part of c\-lightning\&. This can be specified multiple times and may enable additional configuration options and JSON\-RPC methods, depending on the plugin\&.
+.RE
 .sp
 Lightning node customization options:
 .PP
@@ -273,7 +278,7 @@ Networking options:
 .sp
 Note that for simple setups, the implicit \fIautolisten\fR option does the right thing: it will try to bind to port 9735 on IPv4 and IPv6, and will announce it to peers if it\(cqs seems like a public address\&.
 .sp
-You can instead use \fIaddr\fR to override this (eg\&. to change the port), or precisely control where to bind and what to announce with the \fIbind\-addr\fR and \fIannounce\-addr\fR options\&.
+You can instead use \fIaddr\fR to override this (eg\&. to change the port), or precisely control where to bind and what to announce with the \fIbind\-addr\fR and \fIannounce\-addr\fR options\&. These will \fBdisable\fR the \fIautolisten\fR logic, so you must specifiy exactly what you want!
 .PP
 \fBaddr\fR=\fI[IPADDRESS[:PORT]]|autotor:TORIPADDRESS[:TORPORT]\fR
 .RS 4

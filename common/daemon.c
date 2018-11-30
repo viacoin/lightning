@@ -5,6 +5,7 @@
 #include <ccan/io/io.h>
 #include <ccan/str/str.h>
 #include <common/daemon.h>
+#include <common/memleak.h>
 #include <common/status.h>
 #include <common/utils.h>
 #include <common/version.h>
@@ -79,7 +80,7 @@ int daemon_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 	return poll(fds, nfds, timeout);
 }
 
-#if DEVELOPER
+#if DEVELOPER && BACKTRACE_SUPPORTED
 static void steal_notify(tal_t *child, enum tal_notify_type n, tal_t *newparent)
 {
 	tal_t *p = newparent;
@@ -126,8 +127,15 @@ void daemon_setup(const char *argv0,
 	crashlog_activate();
 #endif
 
+#if DEVELOPER
+	/* This has significant overhead, so we only enable it if told */
+	if (getenv("LIGHTNINGD_DEV_MEMLEAK"))
+		memleak_init();
+#endif
+
 	/* We handle write returning errors! */
 	signal(SIGPIPE, SIG_IGN);
+	wally_init(0);
 	secp256k1_ctx = wally_get_secp_context();
 
 	setup_tmpctx();
@@ -136,6 +144,9 @@ void daemon_setup(const char *argv0,
 
 void daemon_shutdown(void)
 {
+#if DEVELOPER
+	memleak_cleanup();
+#endif
 	tal_free(tmpctx);
 	wally_cleanup(0);
 }
