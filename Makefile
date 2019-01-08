@@ -180,13 +180,20 @@ CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLU
 CONFIGURATOR_CC := $(CC)
 
 LDFLAGS = $(PIE_LDFLAGS)
+ifeq ($(STATIC),1)
+LDLIBS = -L/usr/local/lib -Wl,-dn -lgmp -lsqlite3 -lz -Wl,-dy -lm -lpthread -ldl $(COVFLAGS)
+else
 LDLIBS = -L/usr/local/lib -lm -lgmp -lsqlite3 -lz $(COVFLAGS)
+endif
 
 default: all-programs all-test-programs
 
-config.vars ccan/config.h: configure
-	@if [ ! -f config.vars ]; then echo 'The 1990s are calling: use ./configure!' >&2; exit 1; fi
+ccan/config.h: config.vars configure ccan/tools/configurator/configurator.c
 	./configure --reconfigure
+
+config.vars:
+	@echo 'File config.vars not found: you must run ./configure before running make.' >&2
+	@exit 1
 
 include external/Makefile
 include bitcoin/Makefile
@@ -226,7 +233,7 @@ check:
 	$(MAKE) pytest
 
 pytest: $(ALL_PROGRAMS)
-ifndef PYTEST
+ifeq ($(PYTEST),)
 	@echo "py.test is required to run the integration tests, please install using 'pip3 install -r tests/requirements.txt', and rerun 'configure'."
 	exit 1
 else
@@ -334,7 +341,18 @@ gen_version.h: FORCE
 	@(echo "#define VERSION \"$(VERSION)\"" && echo "#define BUILD_FEATURES \"$(FEATURES)\"") > $@.new
 	@if cmp $@.new $@ >/dev/null 2>&2; then rm -f $@.new; else mv $@.new $@; echo Version updated; fi
 
-# All binaries require the external libs, ccan
+# We force make to relink this every time, to detect version changes.
+tools/headerversions: FORCE tools/headerversions.o $(CCAN_OBJS)
+	@$(LINK.o) tools/headerversions.o $(CCAN_OBJS) $(LOADLIBES) $(LDLIBS) -o $@
+
+# That forces this rule to be run every time, too.
+gen_header_versions.h: tools/headerversions
+	@tools/headerversions $@
+
+# Rebuild the world if this changes.
+ALL_GEN_HEADERS += gen_header_versions.h
+
+# All binaries require the external libs, ccan and system library versions.
 $(ALL_PROGRAMS) $(ALL_TEST_PROGRAMS): $(EXTERNAL_LIBS) $(CCAN_OBJS)
 
 # Each test program depends on its own object.
@@ -401,6 +419,7 @@ exec_prefix = $(prefix)
 bindir = $(exec_prefix)/bin
 libexecdir = $(exec_prefix)/libexec
 pkglibexecdir = $(libexecdir)/$(PKGNAME)
+plugindir = $(pkglibexecdir)/plugins
 datadir = $(prefix)/share
 docdir = $(datadir)/doc/$(PKGNAME)
 mandir = $(datadir)/man
@@ -427,6 +446,7 @@ installdirs:
 	@$(NORMAL_INSTALL)
 	$(MKDIR_P) $(DESTDIR)$(bindir)
 	$(MKDIR_P) $(DESTDIR)$(pkglibexecdir)
+	$(MKDIR_P) $(DESTDIR)$(plugindir)
 	$(MKDIR_P) $(DESTDIR)$(man1dir)
 	$(MKDIR_P) $(DESTDIR)$(man5dir)
 	$(MKDIR_P) $(DESTDIR)$(man7dir)
@@ -446,11 +466,13 @@ PKGLIBEXEC_PROGRAMS = \
 	       lightningd/lightning_hsmd \
 	       lightningd/lightning_onchaind \
 	       lightningd/lightning_openingd
+PLUGINS=
 
 install-program: installdirs $(BIN_PROGRAMS) $(PKGLIBEXEC_PROGRAMS)
 	@$(NORMAL_INSTALL)
 	$(INSTALL_PROGRAM) $(BIN_PROGRAMS) $(DESTDIR)$(bindir)
 	$(INSTALL_PROGRAM) $(PKGLIBEXEC_PROGRAMS) $(DESTDIR)$(pkglibexecdir)
+	[ -z "$(PLUGINS)" ] || $(INSTALL_PROGRAM) $(PLUGINS) $(DESTDIR)$(plugindir)
 
 MAN1PAGES = $(filter %.1,$(MANPAGES))
 MAN5PAGES = $(filter %.5,$(MANPAGES))
@@ -471,6 +493,10 @@ uninstall:
 	@for f in $(BIN_PROGRAMS); do \
 	  echo rm -f $(DESTDIR)$(bindir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(bindir)/`basename $$f`; \
+	done
+	@for f in $(PLUGINS); do \
+	  echo rm -f $(DESTDIR)$(plugindir)/`basename $$f`; \
+	  rm -f $(DESTDIR)$(plugindir)/`basename $$f`; \
 	done
 	@for f in $(PKGLIBEXEC_PROGRAMS); do \
 	  echo rm -f $(DESTDIR)$(pkglibexecdir)/`basename $$f`; \

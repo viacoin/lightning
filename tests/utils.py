@@ -1,5 +1,6 @@
 from bitcoin.rpc import RawProxy as BitcoinProxy
 from btcproxy import BitcoinRpcProxy
+from collections import OrderedDict
 from decimal import Decimal
 from ephemeral_port_reserve import reserve
 from lightning import LightningRpc
@@ -23,19 +24,20 @@ BITCOIND_CONFIG = {
 }
 
 
-LIGHTNINGD_CONFIG = {
+LIGHTNINGD_CONFIG = OrderedDict({
     "log-level": "debug",
     "cltv-delta": 6,
     "cltv-final": 5,
     "watchtime-blocks": 5,
     "rescan": 1,
     'disable-dns': None,
-}
+})
 
 with open('config.vars') as configfile:
     config = dict([(line.rstrip().split('=', 1)) for line in configfile])
 
 DEVELOPER = os.getenv("DEVELOPER", config['DEVELOPER']) == "1"
+EXPERIMENTAL_FEATURES = os.getenv("EXPERIMENTAL_FEATURES", config['EXPERIMENTAL_FEATURES']) == "1"
 TIMEOUT = int(os.getenv("TIMEOUT", "60"))
 VALGRIND = os.getenv("VALGRIND", config['VALGRIND']) == "1"
 SLOW_MACHINE = os.getenv("SLOW_MACHINE", "0") == "1"
@@ -344,7 +346,7 @@ class LightningD(TailableProc):
     def cmd_line(self):
 
         opts = []
-        for k, v in sorted(self.opts.items()):
+        for k, v in self.opts.items():
             if v is None:
                 opts.append("--{}".format(k))
             elif isinstance(v, list):
@@ -383,24 +385,30 @@ class LightningNode(object):
         self.may_fail = may_fail
         self.may_reconnect = may_reconnect
 
-    def openchannel(self, remote_node, capacity, addrtype="p2sh-segwit", confirm=True, announce=True, connect=True):
+    def connect(self, remote_node):
+            self.rpc.connect(remote_node.info['id'], '127.0.0.1', remote_node.daemon.port)
+
+    def is_connected(self, remote_node):
+        return remote_node.info['id'] in [p['id'] for p in self.rpc.listpeers()['peers']]
+
+    def openchannel(self, remote_node, capacity, addrtype="p2sh-segwit", confirm=True, wait_for_announce=True, connect=True):
         addr, wallettxid = self.fundwallet(10 * capacity, addrtype)
 
-        if connect and remote_node.info['id'] not in [p['id'] for p in self.rpc.listpeers()['peers']]:
-            self.rpc.connect(remote_node.info['id'], '127.0.0.1', remote_node.daemon.port)
+        if connect and not self.is_connected(remote_node):
+            self.connect(remote_node)
 
         fundingtx = self.rpc.fundchannel(remote_node.info['id'], capacity)
 
         # Wait for the funding transaction to be in bitcoind's mempool
         wait_for(lambda: fundingtx['txid'] in self.bitcoin.rpc.getrawmempool())
 
-        if confirm or announce:
+        if confirm or wait_for_announce:
             self.bitcoin.generate_block(1)
 
-        if announce:
+        if wait_for_announce:
             self.bitcoin.generate_block(5)
 
-        if confirm or announce:
+        if confirm or wait_for_announce:
             self.daemon.wait_for_log(
                 r'Funding tx {} depth'.format(fundingtx['txid']))
         return {'address': addr, 'wallettxid': wallettxid, 'fundingtx': fundingtx}
@@ -786,9 +794,10 @@ class NodeFactory(object):
                 raise
         return node
 
-    def line_graph(self, num_nodes, fundchannel=True, fundamount=10**6, announce=False, opts=None):
+    def line_graph(self, num_nodes, fundchannel=True, fundamount=10**6, wait_for_announce=False, opts=None, announce_channels=True):
         """ Create nodes, connect them and optionally fund channels.
         """
+        assert not (wait_for_announce and not announce_channels), "You've asked to wait for an announcement that's not coming. (wait_for_announce=True,announce_channels=False)"
         nodes = self.get_nodes(num_nodes, opts=opts)
         bitcoin = nodes[0].bitcoin
         connections = [(nodes[i], nodes[i + 1]) for i in range(0, num_nodes - 1)]
@@ -811,7 +820,7 @@ class NodeFactory(object):
         bitcoin.generate_block(1)
         for src, dst in connections:
             wait_for(lambda: len(src.rpc.listfunds()['outputs']) > 0)
-            tx = src.rpc.fundchannel(dst.info['id'], fundamount)
+            tx = src.rpc.fundchannel(dst.info['id'], fundamount, announce=announce_channels)
             wait_for(lambda: tx['txid'] in bitcoin.rpc.getrawmempool())
 
         # Confirm all channels and wait for them to become usable
@@ -823,7 +832,7 @@ class NodeFactory(object):
             src.daemon.wait_for_log(r'Received channel_update for channel {scid}\(.\) now ACTIVE'.format(scid=scid))
             scids.append(scid)
 
-        if not announce:
+        if not wait_for_announce:
             return nodes
 
         bitcoin.generate_block(5)

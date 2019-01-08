@@ -1,70 +1,38 @@
 #!/usr/bin/env python3
-"""Simple plugin to show how to build new plugins for c-lightning
-
-It demonstrates how a plugin communicates with c-lightning, how it registers
-command line arguments that should be passed through and how it can register
-JSON-RPC commands. We communicate with the main daemon through STDIN and STDOUT,
-reading and writing JSON-RPC requests.
-
-"""
-import json
-import sys
+from lightning import Plugin
 
 
-greeting = "World"
+plugin = Plugin(autopatch=True)
 
 
-def json_hello(request):
-    greeting = "Hello {}".format(request['params']['name'])
-    return greeting
+@plugin.method("hello")
+def hello(plugin, name="world"):
+    """This is the documentation string for the hello-function.
 
+    It gets reported as the description when registering the function
+    as a method with `lightningd`.
 
-def json_getmanifest(request):
-    global greeting
-    return {
-        "options": [
-            {"name": "greeting",
-             "type": "string",
-             "default": greeting,
-             "description": "What name should I call you?"},
-        ],
-        "rpcmethods": [
-            {
-                "name": "hello",
-                "description": "Returns a personalized greeting for {name}",
-            },
-        ]
-    }
-
-
-def json_init(request):
-    """The main daemon is telling us the relevant cli options
     """
-    global greeting
+    greeting = plugin.get_option('greeting')
+    s = '{} {}'.format(greeting, name)
+    plugin.log(s)
+    return s
 
-    greeting = request['params']['options']['greeting']
-    return "ok"
+
+@plugin.method("init")
+def init(options, configuration, plugin):
+    plugin.log("Plugin helloworld.py initialized")
 
 
-methods = {
-    'hello': json_hello,
-    'getmanifest': json_getmanifest,
-    'init': json_init,
-}
+@plugin.subscribe("connect")
+def on_connect(plugin, id, address):
+    plugin.log("Received connect event for peer {}".format(id))
 
-partial = ""
-for l in sys.stdin:
-    partial += l
-    try:
-        request = json.loads(partial)
-        result = {
-            "jsonrpc": "2.0",
-            "result": methods[request['method']](request),
-            "id": request['id']
-        }
-        json.dump(result, fp=sys.stdout)
-        sys.stdout.write('\n')
-        sys.stdout.flush()
-        partial = ""
-    except Exception:
-        pass
+
+@plugin.subscribe("disconnect")
+def on_disconnect(plugin, id):
+    plugin.log("Received disconnect event for peer {}".format(id))
+
+
+plugin.add_option('greeting', 'Hello', 'The greeting I should use.')
+plugin.run()

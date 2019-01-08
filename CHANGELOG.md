@@ -8,28 +8,40 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
+- JSON API: New command `check` checks the validity of a JSON API call without running it.
 - JSON API: `getinfo` now returns `num_peers` `num_pending_channels`,
   `num_active_channels` and `num_inactive_channels` fields.
 - JSON API: use `\n\n` to terminate responses, for simplified parsing (pylightning now relies on this)
-- Plugins: Added plugins to `lightningd` and implemented the option passthrough.
+- JSON API: `fundchannel` now includes an `announce` option, when false it will keep channel private. Defaults to true.
+- JSON API: `listpeers`'s `channels` now includes a `private` flag to indicate if channel is announced or not.
+- Plugins: Added plugins to `lightningd`, including option passthrough and JSON-RPC passthrough.
 
 ### Changed
 
 - JSON API: `pay` and `decodepay` accept and ignore `lightning:` prefixes.
+- pylightning: Allow either keyword arguments or positional arguments.
+- JSON-RPC: messages are now separated by 2 consecutive newlines.
+- JSON-RPC: `jsonrpc`:`2.0` now included in json-rpc command calls. complies with spec.
 
 ### Deprecated
 
 Note: You should always set `allow-deprecated-apis=false` to test for
 changes.
 
+- pylightning: Support for pre-2-newline JSON-RPC (<= 0.6.2 lightningd) is deprecated.
+
 ### Removed
+
+- option_data_loss_protect is now only offered if EXPERIMENTAL_FEATURES is enabled, since it seems incompatible with lnd and has known bugs.
 
 ### Fixed
 
 - JSON API: uppercase invoices now parsed correctly (broken in 0.6.2).
 - JSON API: commands are once again read even if one hasn't responded yet (broken in 0.6.2).
 - Protocol: allow lnd to send `update_fee` before `funding_locked`.
+- Protocol: fix limit on how much funder can send (fee was 1000x too small)
 - pylightning: handle multiple simultanous RPC replies reliably.
+
 
 ### Security
 

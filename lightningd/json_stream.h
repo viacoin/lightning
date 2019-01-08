@@ -24,6 +24,19 @@ struct json_stream;
 struct json_stream *new_json_stream(const tal_t *ctx, struct command *writer);
 
 /**
+ * Duplicate an existing stream.
+ *
+ * Mostly useful when we want to send copies of a given stream to
+ * multiple recipients, that might read at different speeds from the
+ * stream. For example this is used when construcing a single
+ * notification and then duplicating it for the fanout.
+ *
+ * @ctx: tal context for allocation.
+ * @original: the stream to duplicate.
+ */
+struct json_stream *json_stream_dup(const tal_t *ctx, struct json_stream *original);
+
+/**
  * json_stream_close - finished writing to a JSON stream.
  * @js: the json_stream.
  * @writer: object responsible for writing to this stream.
@@ -54,6 +67,15 @@ void json_object_end(struct json_stream *js);
  * @str: the string.
  */
 void json_stream_append(struct json_stream *js, const char *str);
+
+/**
+ * json_stream_append_part - literally insert part of string into json_stream.
+ * @js: the json_stream.
+ * @str: the string.
+ * @len: the length to append (<= strlen(str)).
+ */
+void json_stream_append_part(struct json_stream *js, const char *str,
+			     size_t len);
 
 /**
  * json_stream_append_fmt - insert formatted string into the json_stream.

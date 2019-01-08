@@ -16,7 +16,8 @@ struct plugins;
 /**
  * Create a new plugins context.
  */
-struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book);
+struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
+			    struct jsonrpc *rpc, struct lightningd *ld);
 
 /**
  * Initialize the registered plugins.
@@ -26,8 +27,10 @@ struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book);
  * arguments. In order to read the getmanifest reply from the plugins
  * we spin up our own io_loop that exits once all plugins have
  * responded.
+ *
+ * The dev_plugin_debug arg comes from --dev-debugger if DEVELOPER.
  */
-void plugins_init(struct plugins *plugins);
+void plugins_init(struct plugins *plugins, const char *dev_plugin_debug);
 
 /**
  * Register a plugin for initialization and execution.
@@ -36,6 +39,15 @@ void plugins_init(struct plugins *plugins);
  * @param path: The path of the executable for this plugin
  */
 void plugin_register(struct plugins *plugins, const char* path TAKES);
+
+
+/**
+ * Remove a plugin registered for initialization.
+ *
+ * @param plugins: Plugin context
+ * @param arg: The basename or fullname of the executable for this plugin
+ */
+bool plugin_remove(struct plugins *plugins, const char *name);
 
 /**
  * Send the configure message to all plugins.
@@ -54,5 +66,20 @@ void plugins_config(struct plugins *plugins);
  */
 void json_add_opt_plugins(struct json_stream *response,
 			  const struct plugins *plugins);
+
+
+/**
+ * Add a directory to the plugin path to automatically load plugins.
+ */
+char *add_plugin_dir(struct plugins *plugins, const char *dir,
+		     bool nonexist_ok);
+
+/**
+ * Clear all plugins registered so far.
+ */
+void clear_plugins(struct plugins *plugins);
+
+void plugins_notify(struct plugins *plugins,
+		    const struct jsonrpc_notification *n TAKES);
 
 #endif /* LIGHTNING_LIGHTNINGD_PLUGIN_H */
