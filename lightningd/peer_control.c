@@ -16,6 +16,7 @@
 #include <common/features.h>
 #include <common/initial_commit_tx.h>
 #include <common/json_command.h>
+#include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
 #include <common/key_derive.h>
 #include <common/param.h>
@@ -550,12 +551,10 @@ static enum watch_result funding_lockin_cb(struct lightningd *ld,
 	/* BOLT #7:
 	 *
 	 * A node:
-	 *   - if the `open_channel` message has the `announce_channel` bit set
-	 *     AND a `shutdown` message has not been sent:
+	 *   - if the `open_channel` message has the `announce_channel` bit set AND a `shutdown` message has not been sent:
 	 *     - MUST send the `announcement_signatures` message.
-	 *       - MUST NOT send `announcement_signatures` messages until
-	 *         `funding_locked` has been sent AND the funding transaction has
-	 *         at least six confirmations.
+	 *       - MUST NOT send `announcement_signatures` messages until `funding_locked`
+	 *       has been sent and received AND the funding transaction has at least six confirmations.
 	 *   - otherwise:
 	 *     - MUST NOT send the `announcement_signatures` message.
 	 */
@@ -704,10 +703,13 @@ static void json_add_peer(struct lightningd *ld,
 		if (channel->owner)
 			json_add_string(response, "owner",
 					channel->owner->name);
-		if (channel->scid)
+		if (channel->scid) {
 			json_add_short_channel_id(response,
 						  "short_channel_id",
 						  channel->scid);
+			json_add_num(response, "direction",
+				     pubkey_idx(&ld->id, &p->id));
+		}
 		derive_channel_id(&cid,
 				  &channel->funding_txid,
 				  channel->funding_outnum);

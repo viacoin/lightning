@@ -16,8 +16,7 @@ variety of ways:
    internal events in `lightningd` and alter its behavior or inject
    custom behaviors.
    
-*Notice: at the time of writing only command line option passthrough
-is implemented, the other features are under active development.*
+*Note: Hooks are not yet implemented, and the API is under active development.*
 
 A plugin may be written in any language, and communicates with
 `lightningd` through the plugin's `stdin` and `stdout`. JSON-RPCv2 is

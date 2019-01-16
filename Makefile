@@ -1,6 +1,12 @@
 #! /usr/bin/make
-VERSION_NAME=Principled Opposition to SegWit
-VERSION=$(shell git describe --always --dirty=-modded --abbrev=7)
+
+# Extract version from git, or if we're from a zipfile, use dirname
+VERSION=$(shell git describe --always --dirty=-modded --abbrev=7 2>/dev/null || pwd | sed -n 's,.*/clightning-\(v[0-9.rc]*\)$$,\1,p')
+
+ifeq ($(VERSION),)
+$(error "ERROR: git is required for generating version information")
+endif
+
 DISTRO=$(shell lsb_release -is 2>/dev/null || echo unknown)-$(shell lsb_release -rs 2>/dev/null || echo unknown)
 PKGNAME = c-lightning
 
@@ -9,7 +15,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := bca814e270dcbee2fea51c0a26ca99efef261f2b
+BOLTVERSION := 3fef98d10695462edecc63cba05e4a96374f4664
 
 -include config.vars
 
@@ -35,7 +41,7 @@ endif
 
 ifeq ($(COMPAT),1)
 # We support compatibility with pre-0.6.
-COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1 -DCOMPAT_V061=1
+COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1 -DCOMPAT_V061=1 -DCOMPAT_V062=1
 endif
 
 # Timeout shortly before the 600 second travis silence timeout

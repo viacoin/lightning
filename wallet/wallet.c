@@ -2,6 +2,7 @@
 #include "wallet.h"
 
 #include <bitcoin/script.h>
+#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/key_derive.h>
 #include <common/wireaddr.h>
@@ -188,7 +189,7 @@ struct utxo **wallet_get_utxos(const tal_t *ctx, struct wallet *w, const enum ou
 	results = tal_arr(ctx, struct utxo*, 0);
 	for (i=0; sqlite3_step(stmt) == SQLITE_ROW; i++) {
 		struct utxo *u = wallet_stmt2output(results, stmt);
-		*tal_arr_expand(&results) = u;
+		tal_arr_expand(&results, u);
 	}
 
 	db_stmt_done(stmt);
@@ -208,7 +209,7 @@ struct utxo **wallet_get_unconfirmed_closeinfo_utxos(const tal_t *ctx, struct wa
        	results = tal_arr(ctx, struct utxo*, 0);
 	for (i=0; sqlite3_step(stmt) == SQLITE_ROW; i++) {
 		struct utxo *u = wallet_stmt2output(results, stmt);
-		*tal_arr_expand(&results) = u;
+		tal_arr_expand(&results, u);
 	}
 	db_stmt_done(stmt);
 
@@ -281,7 +282,7 @@ static const struct utxo **wallet_select(const tal_t *ctx, struct wallet *w,
 		size_t input_weight;
 		struct utxo *u = tal_steal(utxos, available[i]);
 
-		*tal_arr_expand(&utxos) = u;
+		tal_arr_expand(&utxos, u);
 
 		if (!wallet_update_output_status(
 			w, &available[i]->txid, available[i]->outnum,
@@ -548,8 +549,11 @@ wallet_htlc_sigs_load(const tal_t *ctx, struct wallet *w, u64 channelid)
 	secp256k1_ecdsa_signature *htlc_sigs = tal_arr(ctx, secp256k1_ecdsa_signature, 0);
 	sqlite3_bind_int64(stmt, 1, channelid);
 
-	while (stmt && sqlite3_step(stmt) == SQLITE_ROW)
-		sqlite3_column_signature(stmt, 0, tal_arr_expand(&htlc_sigs));
+	while (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
+		secp256k1_ecdsa_signature sig;
+		sqlite3_column_signature(stmt, 0, &sig);
+		tal_arr_expand(&htlc_sigs, sig);
+	}
 
 	db_stmt_done(stmt);
 	log_debug(w->log, "Loaded %zu HTLC signatures from DB",
@@ -1186,8 +1190,11 @@ void wallet_htlc_save_in(struct wallet *wallet,
 		sqlite3_bind_null(stmt, 7);
 	sqlite3_bind_int(stmt, 8, in->hstate);
 
-	sqlite3_bind_blob(stmt, 9, &in->shared_secret,
-			  sizeof(in->shared_secret), SQLITE_TRANSIENT);
+	if (!in->shared_secret)
+		sqlite3_bind_null(stmt, 9);
+	else
+		sqlite3_bind_blob(stmt, 9, in->shared_secret,
+				  sizeof(*in->shared_secret), SQLITE_TRANSIENT);
 
 	sqlite3_bind_blob(stmt, 10, &in->onion_routing_packet,
 			  sizeof(in->onion_routing_packet), SQLITE_TRANSIENT);
@@ -1314,9 +1321,18 @@ static bool wallet_stmt2htlc_in(struct channel *channel,
 	in->failuremsg = sqlite3_column_arr(in, stmt, 8, u8);
 	in->failcode = sqlite3_column_int(stmt, 9);
 
-	assert(sqlite3_column_bytes(stmt, 11) == sizeof(struct secret));
-	memcpy(&in->shared_secret, sqlite3_column_blob(stmt, 11),
-	       sizeof(struct secret));
+	if (sqlite3_column_type(stmt, 11) == SQLITE_NULL) {
+		in->shared_secret = NULL;
+	} else {
+		assert(sqlite3_column_bytes(stmt, 11) == sizeof(struct secret));
+		in->shared_secret = tal(in, struct secret);
+		memcpy(in->shared_secret, sqlite3_column_blob(stmt, 11),
+		       sizeof(struct secret));
+#ifdef COMPAT_V062
+		if (memeqzero(in->shared_secret, sizeof(*in->shared_secret)))
+			in->shared_secret = tal_free(in->shared_secret);
+#endif
+	}
 
 	return ok;
 }
@@ -1552,17 +1568,18 @@ struct htlc_stub *wallet_htlc_stubs(const tal_t *ctx, struct wallet *wallet,
 	stubs = tal_arr(ctx, struct htlc_stub, 0);
 
 	while (sqlite3_step(stmt) == SQLITE_ROW) {
-		struct htlc_stub *stub = tal_arr_expand(&stubs);
+		struct htlc_stub stub;
 
 		assert(sqlite3_column_int64(stmt, 0) == chan->dbid);
 
 		/* FIXME: merge these two enums */
-		stub->owner = sqlite3_column_int(stmt, 1)==DIRECTION_INCOMING?REMOTE:LOCAL;
-		stub->cltv_expiry = sqlite3_column_int(stmt, 2);
-		stub->id = sqlite3_column_int(stmt, 3);
+		stub.owner = sqlite3_column_int(stmt, 1)==DIRECTION_INCOMING?REMOTE:LOCAL;
+		stub.cltv_expiry = sqlite3_column_int(stmt, 2);
+		stub.id = sqlite3_column_int(stmt, 3);
 
 		sqlite3_column_sha256(stmt, 4, &payment_hash);
-		ripemd160(&stub->ripemd, payment_hash.u.u8, sizeof(payment_hash.u));
+		ripemd160(&stub.ripemd, payment_hash.u.u8, sizeof(payment_hash.u));
+		tal_arr_expand(&stubs, stub);
 	}
 	db_stmt_done(stmt);
 	return stubs;
@@ -1821,7 +1838,8 @@ void wallet_payment_get_failinfo(const tal_t *ctx,
 				 struct pubkey **failnode,
 				 struct short_channel_id **failchannel,
 				 u8 **failupdate,
-				 char **faildetail)
+				 char **faildetail,
+				 int *faildirection)
 {
 	sqlite3_stmt *stmt;
 	int res;
@@ -1832,7 +1850,7 @@ void wallet_payment_get_failinfo(const tal_t *ctx,
 			  "SELECT failonionreply, faildestperm"
 			  "     , failindex, failcode"
 			  "     , failnode, failchannel"
-			  "     , failupdate, faildetail"
+			  "     , failupdate, faildetail, faildirection"
 			  "  FROM payments"
 			  " WHERE payment_hash=?;");
 	sqlite3_bind_sha256(stmt, 1, payment_hash);
@@ -1861,6 +1879,9 @@ void wallet_payment_get_failinfo(const tal_t *ctx,
 		*failchannel = tal(ctx, struct short_channel_id);
 		resb = sqlite3_column_short_channel_id(stmt, 5, *failchannel);
 		assert(resb);
+
+		/* For pre-0.6.2 dbs, direction will be 0 */
+		*faildirection = sqlite3_column_int(stmt, 8);
 	}
 	if (sqlite3_column_type(stmt, 6) == SQLITE_NULL)
 		*failupdate = NULL;
@@ -1884,7 +1905,8 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 				 const struct pubkey *failnode,
 				 const struct short_channel_id *failchannel,
 				 const u8 *failupdate /*tal_arr*/,
-				 const char *faildetail)
+				 const char *faildetail,
+				 int faildirection)
 {
 	sqlite3_stmt *stmt;
 
@@ -1898,6 +1920,7 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 			  "     , failchannel=?"
 			  "     , failupdate=?"
 			  "     , faildetail=?"
+			  "     , faildirection=?"
 			  " WHERE payment_hash=?;");
 	if (failonionreply)
 		sqlite3_bind_blob(stmt, 1,
@@ -1918,8 +1941,11 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 		struct short_channel_id *scid = tal(tmpctx, struct short_channel_id);
 		*scid = *failchannel;
 		sqlite3_bind_short_channel_id(stmt, 6, scid);
-	} else
+		sqlite3_bind_int(stmt, 9, faildirection);
+	} else {
 		sqlite3_bind_null(stmt, 6);
+		sqlite3_bind_null(stmt, 9);
+	}
 	if (failupdate)
 		sqlite3_bind_blob(stmt, 7,
 				  failupdate, tal_count(failupdate),
@@ -1930,7 +1956,7 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 			  faildetail, strlen(faildetail),
 			  SQLITE_TRANSIENT);
 
-	sqlite3_bind_sha256(stmt, 9, payment_hash);
+	sqlite3_bind_sha256(stmt, 10, payment_hash);
 
 	db_exec_prepared(wallet->db, stmt);
 }

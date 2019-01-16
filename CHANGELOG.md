@@ -6,6 +6,37 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+
+### Added
+
+- plugins: fully enabled, and ready for you to write some!
+- lightning-cli: `help <cmd>` finds man pages even if `make install` not run.
+- JSON API: `waitsendpay` now has an `erring_direction` field.
+- JSON API: `listpeers` now has a `direction` field in `channels`.
+- JSON API: `listchannels` now takes a `source` option to filter by node id.
+
+### Changed
+
+- The `short_channel_id` separator has been changed to be `x` to match the specification.
+
+### Deprecated
+
+Note: You should always set `allow-deprecated-apis=false` to test for
+changes.
+
+### Removed
+
+### Fixed
+
+- Protocol: handling `query_channel_range` for large numbers of blocks
+  (eg. 4 billion) was slow due to a bug.
+
+### Security
+
+## [0.6.3] - 2019-01-09: "The Smallblock Conspiracy"
+
+This release named by @molxyz and [@ctrlbreak](https://twitter.com/ctrlbreak).
+
 ### Added
 
 - JSON API: New command `check` checks the validity of a JSON API call without running it.
@@ -14,7 +45,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - JSON API: use `\n\n` to terminate responses, for simplified parsing (pylightning now relies on this)
 - JSON API: `fundchannel` now includes an `announce` option, when false it will keep channel private. Defaults to true.
 - JSON API: `listpeers`'s `channels` now includes a `private` flag to indicate if channel is announced or not.
-- Plugins: Added plugins to `lightningd`, including option passthrough and JSON-RPC passthrough.
+- JSON API: `invoice` route hints may now include private channels if you have no public ones, unless new option `exposeprivatechannels` is false.
+- Plugins: experimental plugin support for `lightningd`, including option passthrough and JSON-RPC passthrough.
 
 ### Changed
 
@@ -40,6 +72,8 @@ changes.
 - JSON API: commands are once again read even if one hasn't responded yet (broken in 0.6.2).
 - Protocol: allow lnd to send `update_fee` before `funding_locked`.
 - Protocol: fix limit on how much funder can send (fee was 1000x too small)
+- Protocol: don't send invalid onion errors if peer says onion was bad.
+- Protocol: don't crash when peer sends a 0-block-expiry HTLC.
 - pylightning: handle multiple simultanous RPC replies reliably.
 
 
@@ -80,6 +114,8 @@ changes.
 - JSON RPC: `global_features` and `local_features` fields: use `globalfeatures` and `localfeatures` as per BOLT #1.
 
 ### Removed
+
+- JSON API: the optional 'seed' parameter to `getroute` was removed.
 
 ### Fixed
 
@@ -227,7 +263,8 @@ There predate the BOLT specifications, and are only of vague historic interest:
 6. [0.5.1] - 2016-10-21
 7. [0.5.2] - 2016-11-21: "Bitcoin Savings & Trust Daily Interest II"
 
-[Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.3
 [0.6.2]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.2
 [0.6.1]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.1
 [0.6]: https://github.com/ElementsProject/lightning/releases/tag/v0.6
