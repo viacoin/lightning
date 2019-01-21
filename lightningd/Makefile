@@ -79,11 +79,11 @@ LIGHTNINGD_SRC :=				\
 	lightningd/opening_control.c		\
 	lightningd/options.c			\
 	lightningd/pay.c			\
-	lightningd/payalgo.c			\
 	lightningd/peer_control.c		\
 	lightningd/peer_htlcs.c			\
 	lightningd/ping.c			\
 	lightningd/plugin.c			\
+	lightningd/plugin_hook.c		\
 	lightningd/subd.c			\
 	lightningd/watch.c
 

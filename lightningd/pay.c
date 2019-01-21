@@ -981,8 +981,8 @@ static struct command_result *json_sendpay(struct command *cmd,
 					   const jsmntok_t *params)
 {
 	const jsmntok_t *routetok;
-	const jsmntok_t *t, *end;
-	size_t n_hops;
+	const jsmntok_t *t;
+	size_t i;
 	struct sha256 *rhash;
 	struct route_hop *route;
 	u64 *msatoshi;
@@ -996,35 +996,31 @@ static struct command_result *json_sendpay(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	end = json_next(routetok);
-	n_hops = 0;
-	route = tal_arr(cmd, struct route_hop, n_hops);
+	if (routetok->size == 0)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Empty route");
 
-	for (t = routetok + 1; t < end; t = json_next(t)) {
+	route = tal_arr(cmd, struct route_hop, routetok->size);
+	json_for_each_arr(i, t, routetok) {
 		u64 *amount;
 		struct pubkey *id;
 		struct short_channel_id *channel;
-		unsigned *delay;
+		unsigned *delay, *direction;
 
 		if (!param(cmd, buffer, t,
 			   p_req("msatoshi", param_u64, &amount),
 			   p_req("id", param_pubkey, &id),
 			   p_req("delay", param_number, &delay),
 			   p_req("channel", param_short_channel_id, &channel),
+			   p_opt("direction", param_number, &direction),
 			   NULL))
 			return command_param_failed();
 
-		tal_resize(&route, n_hops + 1);
-
-		route[n_hops].amount = *amount;
-		route[n_hops].nodeid = *id;
-		route[n_hops].delay = *delay;
-		route[n_hops].channel_id = *channel;
-		n_hops++;
-	}
-
-	if (n_hops == 0) {
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Empty route");
+		route[i].amount = *amount;
+		route[i].nodeid = *id;
+		route[i].delay = *delay;
+		route[i].channel_id = *channel;
+		/* FIXME: Actually ignored by sending code! */
+		route[i].direction = direction ? *direction : 0;
 	}
 
 	/* The given msatoshi is the actual payment that the payee is
@@ -1033,8 +1029,8 @@ static struct command_result *json_sendpay(struct command *cmd,
 
 	/* if not: msatoshi <= finalhop.amount <= 2 * msatoshi, fail. */
 	if (msatoshi) {
-		if (!(*msatoshi <= route[n_hops-1].amount &&
-		      route[n_hops-1].amount <= 2 * *msatoshi)) {
+		if (!(*msatoshi <= route[routetok->size-1].amount &&
+		      route[routetok->size-1].amount <= 2 * *msatoshi)) {
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "msatoshi %"PRIu64" out of range",
 					    *msatoshi);
@@ -1042,7 +1038,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 	}
 
 	if (send_payment(cmd, cmd->ld, rhash, route,
-			 msatoshi ? *msatoshi : route[n_hops-1].amount,
+			 msatoshi ? *msatoshi : route[routetok->size-1].amount,
 			 description,
 			 &json_sendpay_on_resolve, cmd))
 		return command_still_pending(cmd);

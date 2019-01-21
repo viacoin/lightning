@@ -59,6 +59,47 @@ def test_pay(node_factory):
     assert len(payments) == 1 and payments[0]['payment_preimage'] == preimage
 
 
+def test_pay_limits(node_factory):
+    """Test that we enforce fee max percentage and max delay"""
+    l1, l2, l3 = node_factory.line_graph(3, wait_for_announce=True)
+
+    # FIXME: pylightning should define these!
+    PAY_ROUTE_TOO_EXPENSIVE = 206
+
+    inv = l3.rpc.invoice("any", "any", 'description')
+
+    # Fee too high.
+    with pytest.raises(RpcError, match=r'Route wanted fee of .* msatoshis') as err:
+        l1.rpc.call('pay', {'bolt11': inv['bolt11'], 'msatoshi': 100000, 'maxfeepercent': 0.0001, 'exemptfee': 0})
+
+    assert err.value.error['code'] == PAY_ROUTE_TOO_EXPENSIVE
+
+    # It should have retried (once without routehint, too)
+    status = l1.rpc.call('paystatus', {'bolt11': inv['bolt11']})['pay'][0]['attempts']
+    assert len(status) == 3
+    assert status[0]['strategy'] == "Initial attempt"
+    assert status[1]['strategy'].startswith("Excluded expensive channel ")
+    assert status[2]['strategy'] == "Removed route hint"
+
+    # Delay too high.
+    with pytest.raises(RpcError, match=r'Route wanted delay of .* blocks') as err:
+        l1.rpc.call('pay', {'bolt11': inv['bolt11'], 'msatoshi': 100000, 'maxdelay': 0})
+
+    assert err.value.error['code'] == PAY_ROUTE_TOO_EXPENSIVE
+    # Should also have retried.
+    status = l1.rpc.call('paystatus', {'bolt11': inv['bolt11']})['pay'][1]['attempts']
+    assert len(status) == 3
+    assert status[0]['strategy'] == "Initial attempt"
+    assert status[1]['strategy'].startswith("Excluded delaying channel ")
+    assert status[2]['strategy'] == "Removed route hint"
+
+    # This works, because fee is less than exemptfee.
+    l1.rpc.call('pay', {'bolt11': inv['bolt11'], 'msatoshi': 100000, 'maxfeepercent': 0.0001, 'exemptfee': 2000})
+    status = l1.rpc.call('paystatus', {'bolt11': inv['bolt11']})['pay'][2]['attempts']
+    assert len(status) == 1
+    assert status[0]['strategy'] == "Initial attempt"
+
+
 def test_pay0(node_factory):
     """Test paying 0 amount
     """
@@ -1119,3 +1160,200 @@ def test_pay_variants(node_factory):
     b11 = 'LIGHTNING:' + l2.rpc.invoice(123000, 'test_pay_variants upper with prefix', 'description')['bolt11'].upper()
     l1.rpc.decodepay(b11)
     l1.rpc.pay(b11)
+
+
+def test_pay_retry(node_factory, bitcoind):
+    """Make sure pay command retries properly. """
+    def exhaust_channel(funder, fundee, scid, already_spent=0):
+        """Spend all available capacity (10^6 - 1%) of channel"""
+        maxpay = (10**6 - 10**6 // 100 - 13440) * 1000 - already_spent
+        inv = fundee.rpc.invoice(maxpay,
+                                 ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(20)),
+                                 "exhaust_channel")
+        routestep = {
+            'msatoshi': maxpay,
+            'id': fundee.info['id'],
+            'delay': 10,
+            'channel': scid
+        }
+        funder.rpc.sendpay([routestep], inv['payment_hash'])
+        funder.rpc.waitsendpay(inv['payment_hash'])
+
+    # We connect every node to l5; in a line and individually.
+    # Keep fixed fees so we can easily calculate exhaustion
+    l1, l2, l3, l4, l5 = node_factory.line_graph(5, fundchannel=False,
+                                                 opts={'feerates': (7500, 7500, 7500)})
+
+    # scid12
+    l1.fund_channel(l2, 10**6, wait_for_active=False)
+    # scid23
+    l2.fund_channel(l3, 10**6, wait_for_active=False)
+    # scid34
+    l3.fund_channel(l4, 10**6, wait_for_active=False)
+    scid45 = l4.fund_channel(l5, 10**6, wait_for_active=False)
+
+    l1.rpc.connect(l5.info['id'], 'localhost', l5.port)
+    scid15 = l1.fund_channel(l5, 10**6, wait_for_active=False)
+    l2.rpc.connect(l5.info['id'], 'localhost', l5.port)
+    scid25 = l2.fund_channel(l5, 10**6, wait_for_active=False)
+    l3.rpc.connect(l5.info['id'], 'localhost', l5.port)
+    scid35 = l3.fund_channel(l5, 10**6, wait_for_active=False)
+
+    # Make sure l1 sees all 7 channels
+    bitcoind.generate_block(5)
+    wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 14)
+
+    # Exhaust shortcut channels one at a time, to force retries.
+    exhaust_channel(l1, l5, scid15)
+    exhaust_channel(l2, l5, scid25)
+    exhaust_channel(l3, l5, scid35)
+
+    # Pay l1->l5 should succeed via straight line (eventually)
+    l1.rpc.pay(l5.rpc.invoice(10**8, 'test_retry', 'test_retry')['bolt11'])
+
+    # This should make it fail.
+    exhaust_channel(l4, l5, scid45, 10**8)
+
+    with pytest.raises(RpcError):
+        l1.rpc.pay(l5.rpc.invoice(10**8, 'test_retry2', 'test_retry2')['bolt11'])
+
+
+@unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 otherwise gossip takes 5 minutes!")
+def test_pay_routeboost(node_factory, bitcoind):
+    """Make sure we can use routeboost information. """
+    # l1->l2->l3--private-->l4
+    l1, l2 = node_factory.line_graph(2, announce_channels=True, wait_for_announce=True)
+    l3, l4, l5 = node_factory.line_graph(3, announce_channels=False, wait_for_announce=False)
+    l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
+    scidl2l3 = l2.fund_channel(l3, 10**6)
+
+    # Make sure l1 knows about the 2->3 channel.
+    bitcoind.generate_block(5)
+    l1.daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
+                             .format(scidl2l3),
+                             r'update for channel {}/1 now ACTIVE'
+                             .format(scidl2l3)])
+    # Make sure l4 knows about 2->3 channel too so it's not a dead-end.
+    l4.daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
+                             .format(scidl2l3),
+                             r'update for channel {}/1 now ACTIVE'
+                             .format(scidl2l3)])
+
+    # Get an l4 invoice; it should put the private channel in routeboost.
+    inv = l4.rpc.invoice(10**5, 'test_pay_routeboost', 'test_pay_routeboost',
+                         exposeprivatechannels=True)
+    assert 'warning_capacity' not in inv
+    assert 'warning_offline' not in inv
+    assert only_one(only_one(l1.rpc.decodepay(inv['bolt11'])['routes']))
+
+    # Now we should be able to pay it.
+    start = time.time()
+    l1.rpc.pay(inv['bolt11'])
+    end = time.time()
+
+    # Status should show all the gory details.
+    status = l1.rpc.call('paystatus', [inv['bolt11']])
+    assert only_one(status['pay'])['bolt11'] == inv['bolt11']
+    assert only_one(status['pay'])['msatoshi'] == 10**5
+    assert only_one(status['pay'])['destination'] == l4.info['id']
+    assert 'description' not in only_one(status['pay'])
+    assert 'routehint_modifications' not in only_one(status['pay'])
+    assert 'local_exclusions' not in only_one(status['pay'])
+    attempt = only_one(only_one(status['pay'])['attempts'])
+    assert attempt['age_in_seconds'] <= time.time() - start
+    assert attempt['duration_in_seconds'] <= end - start
+    assert only_one(attempt['routehint'])
+    assert only_one(attempt['routehint'])['id'] == l3.info['id']
+    assert only_one(attempt['routehint'])['msatoshi'] == 10**5 + 1 + 10**5 // 100000
+    assert only_one(attempt['routehint'])['delay'] == 5 + 6
+
+    # With dev-route option we can test longer routehints.
+    if DEVELOPER:
+        scid34 = only_one(l3.rpc.listpeers(l4.info['id'])['peers'])['channels'][0]['short_channel_id']
+        scid45 = only_one(l4.rpc.listpeers(l5.info['id'])['peers'])['channels'][0]['short_channel_id']
+        routel3l4l5 = [{'id': l3.info['id'],
+                        'short_channel_id': scid34,
+                        'fee_base_msat': 1000,
+                        'fee_proportional_millionths': 10,
+                        'cltv_expiry_delta': 6},
+                       {'id': l4.info['id'],
+                        'short_channel_id': scid45,
+                        'fee_base_msat': 1000,
+                        'fee_proportional_millionths': 10,
+                        'cltv_expiry_delta': 6}]
+        inv = l5.rpc.call('invoice', {'msatoshi': 10**5,
+                                      'label': 'test_pay_routeboost2',
+                                      'description': 'test_pay_routeboost2',
+                                      'dev-routes': [routel3l4l5]})
+        l1.rpc.pay(inv['bolt11'])
+        status = l1.rpc.call('paystatus', [inv['bolt11']])
+        assert len(only_one(status['pay'])['attempts']) == 1
+        assert 'failure' not in only_one(status['pay'])['attempts'][0]
+        assert 'success' in only_one(status['pay'])['attempts'][0]
+
+        # Now test that it falls back correctly to not using routeboost
+        # if it can't route to the node mentioned
+        routel4l3 = [{'id': l4.info['id'],
+                      'short_channel_id': scid34,
+                      'fee_base_msat': 1000,
+                      'fee_proportional_millionths': 10,
+                      'cltv_expiry_delta': 6}]
+        inv = l3.rpc.call('invoice', {'msatoshi': 10**5,
+                                      'label': 'test_pay_routeboost3',
+                                      'description': 'test_pay_routeboost3',
+                                      'dev-routes': [routel4l3]})
+        l1.rpc.pay(inv['bolt11'])
+        status = l1.rpc.call('paystatus', [inv['bolt11']])
+        assert len(only_one(status['pay'])['attempts']) == 2
+        assert 'failure' in only_one(status['pay'])['attempts'][0]
+        assert 'success' not in only_one(status['pay'])['attempts'][0]
+        routehint = only_one(status['pay'])['attempts'][0]['routehint']
+        assert [h['channel'] for h in routehint] == [r['short_channel_id'] for r in routel4l3]
+        assert 'failure' not in only_one(status['pay'])['attempts'][1]
+        assert 'success' in only_one(status['pay'])['attempts'][1]
+        assert 'routehint' not in only_one(status['pay'])['attempts'][1]
+
+        # Similarly if it can route, but payment fails.
+        routel2bad = [{'id': l2.info['id'],
+                       'short_channel_id': scid34,  # Invalid scid
+                       'fee_base_msat': 1000,
+                       'fee_proportional_millionths': 10,
+                       'cltv_expiry_delta': 6}]
+        inv = l3.rpc.call('invoice', {'msatoshi': 10**5,
+                                      'label': 'test_pay_routeboost4',
+                                      'description': 'test_pay_routeboost4',
+                                      'dev-routes': [routel2bad]})
+        l1.rpc.pay(inv['bolt11'])
+
+        # Finally, it should fall back to second routehint if first fails.
+        # (Note, this is not public because it's not 6 deep)
+        l3.rpc.connect(l5.info['id'], 'localhost', l5.port)
+        scid35 = l3.fund_channel(l5, 10**6)
+        l4.stop()
+        routel3l5 = [{'id': l3.info['id'],
+                      'short_channel_id': scid35,
+                      'fee_base_msat': 1000,
+                      'fee_proportional_millionths': 10,
+                      'cltv_expiry_delta': 6}]
+        inv = l5.rpc.call('invoice', {'msatoshi': 10**5,
+                                      'label': 'test_pay_routeboost5',
+                                      'description': 'test_pay_routeboost5',
+                                      'dev-routes': [routel3l4l5, routel3l5]})
+        l1.rpc.pay(inv['bolt11'], description="paying test_pay_routeboost5")
+
+        status = l1.rpc.call('paystatus', [inv['bolt11']])
+        assert only_one(status['pay'])['bolt11'] == inv['bolt11']
+        assert only_one(status['pay'])['msatoshi'] == 10**5
+        assert only_one(status['pay'])['destination'] == l5.info['id']
+        assert only_one(status['pay'])['description'] == "paying test_pay_routeboost5"
+        assert 'routehint_modifications' not in only_one(status['pay'])
+        assert 'local_exclusions' not in only_one(status['pay'])
+        attempts = only_one(status['pay'])['attempts']
+
+        # First failed, second succeeded.
+        assert len(attempts) == 2
+        assert 'success' not in attempts[0]
+        assert 'success' in attempts[1]
+
+        assert [h['channel'] for h in attempts[0]['routehint']] == [r['short_channel_id'] for r in routel3l4l5]
+        assert [h['channel'] for h in attempts[1]['routehint']] == [r['short_channel_id'] for r in routel3l5]

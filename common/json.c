@@ -128,6 +128,26 @@ bool json_to_bool(const char *buffer, const jsmntok_t *tok, bool *b)
 	return false;
 }
 
+u8 *json_tok_bin_from_hex(const tal_t *ctx, const char *buffer, const jsmntok_t *tok)
+{
+	u8 *result;
+	size_t hexlen, rawlen;
+	hexlen = tok->end - tok->start;
+	rawlen = hex_data_size(hexlen);
+
+	result = tal_arr(ctx, u8, rawlen);
+	if (!hex_decode(buffer + tok->start, hexlen, result, rawlen))
+		return tal_free(result);
+
+	return result;
+}
+
+bool json_to_preimage(const char *buffer, const jsmntok_t *tok, struct preimage *preimage)
+{
+	size_t hexlen = tok->end - tok->start;
+	return hex_decode(buffer + tok->start, hexlen, preimage->r, sizeof(preimage->r));
+}
+
 bool json_tok_is_num(const char *buffer, const jsmntok_t *tok)
 {
 	if (tok->type != JSMN_PRIMITIVE)
@@ -160,13 +180,13 @@ const jsmntok_t *json_next(const jsmntok_t *tok)
 const jsmntok_t *json_get_member(const char *buffer, const jsmntok_t tok[],
 				 const char *label)
 {
-	const jsmntok_t *t, *end;
+	const jsmntok_t *t;
+	size_t i;
 
 	if (tok->type != JSMN_OBJECT)
 		return NULL;
 
-	end = json_next(tok);
-	for (t = tok + 1; t < end; t = json_next(t+1))
+	json_for_each_obj(i, t, tok)
 		if (json_tok_streq(buffer, t, label))
 			return t + 1;
 
@@ -175,13 +195,13 @@ const jsmntok_t *json_get_member(const char *buffer, const jsmntok_t tok[],
 
 const jsmntok_t *json_get_arr(const jsmntok_t tok[], size_t index)
 {
-	const jsmntok_t *t, *end;
+	const jsmntok_t *t;
+	size_t i;
 
 	if (tok->type != JSMN_ARRAY)
 		return NULL;
 
-	end = json_next(tok);
-	for (t = tok + 1; t < end; t = json_next(t)) {
+	json_for_each_arr(i, t, tok) {
 		if (index == 0)
 			return t;
 		index--;
