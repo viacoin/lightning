@@ -30,10 +30,14 @@ changes.
 
 ### Removed
 
+- JSON API: the `waitsendpay` command error return no longer includes `channel_update`
+
 ### Fixed
 
 - Protocol: handling `query_channel_range` for large numbers of blocks
   (eg. 4 billion) was slow due to a bug.
+- Fixed occasional deadlock with peers when exchanging huge amounts of gossip.
+- You can no longer make giant unpayable "wumbo" invoices.
 
 ### Security
 
