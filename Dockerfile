@@ -53,7 +53,9 @@ RUN mkdir /opt/viacoin && cd /opt/viacoin \
 ENV LIGHTNINGD_VERSION=master
 
 WORKDIR /opt/lightningd
-COPY . .
+COPY . /tmp/lightning
+RUN git clone --recursive /tmp/lightning . && \
+    git checkout $(git --work-tree=/tmp/lightning --git-dir=/tmp/lightning/.git rev-parse HEAD)
 
 ARG DEVELOPER=0
 RUN ./configure && make -j3 DEVELOPER=${DEVELOPER} && cp lightningd/lightning* cli/lightning-cli /usr/bin/

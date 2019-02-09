@@ -11,22 +11,28 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 - plugins: fully enabled, and ready for you to write some!
 - plugins: `pay` is now a plugin.
+- protocol: `pay` will now use routehints in invoices if it needs to.
 - lightning-cli: `help <cmd>` finds man pages even if `make install` not run.
 - JSON API: `waitsendpay` now has an `erring_direction` field.
 - JSON API: `listpeers` now has a `direction` field in `channels`.
 - JSON API: `listchannels` now takes a `source` option to filter by node id.
 - JSON API: New command `paystatus` gives detailed information on `pay` commands.
+- JSON API: `getroute` `riskfactor` argument is simplified; `pay` now defaults to setting it to 10.
 
 ### Changed
 
 - The `short_channel_id` separator has been changed to be `x` to match the specification.
 - JSON API: `listpeers` now includes `funding_allocation_msat`, which returns a map of the amounts initially funded to the channel by each peer, indexed by channel id.
 - `option_data_loss_protect` is now enabled by default.
+- JSON API: `help` with a `command` argument gives a JSON array, like other commands.
+- build: we'll use the system libbase58 and libsodium if found suitable.
 
 ### Deprecated
 
 Note: You should always set `allow-deprecated-apis=false` to test for
 changes.
+
+- JSON API: `short_channel_id` fields in JSON commands with `:` separators (use `x` instead).
 
 ### Removed
 
@@ -38,6 +44,8 @@ changes.
   (eg. 4 billion) was slow due to a bug.
 - Fixed occasional deadlock with peers when exchanging huge amounts of gossip.
 - You can no longer make giant unpayable "wumbo" invoices.
+- CLTV of total route now correctly evaluated when finding best route.
+- `riskfactor` arguments to `pay` and `getroute` now have an effect.
 
 ### Security
 
