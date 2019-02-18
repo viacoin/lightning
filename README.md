@@ -13,7 +13,14 @@ http://lightning.network.
 
 ## Project Status
 
-[![Build Status](https://travis-ci.com/viacoin/lightning.svg?branch=master)](https://travis-ci.com/viacoin/lightning)
+[![Build Status][travis-ci]][travis-ci-link]
+[![Pull Requests Welcome][prs]][prs-link]
+[![Documentation Status](https://readthedocs.org/projects/lightning/badge/?version=docs)](https://lightning.readthedocs.io/)
+
+[travis-ci]: https://travis-ci.org/viacoin/lightning.svg?branch=master
+[travis-ci-link]: https://travis-ci.org/viacoin/lightning
+[prs]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat
+[prs-link]: http://makeapullrequest.com
 
 This implementation is still very much a work in progress.
 It can be used for testing, but __it should not be used for real funds__.
