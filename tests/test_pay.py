@@ -1374,6 +1374,9 @@ def test_pay_direct(node_factory, bitcoind):
     # Let channels lock in.
     bitcoind.generate_block(5)
 
+    # Make l1 sees it, so it doesn't produce bad CLTVs.
+    sync_blockheight(bitcoind, [l1])
+
     # Make sure l0 knows the l2->l3 channel.
     # Without DEVELOPER, channel lockin can take 30 seconds to detect,
     # and gossip 2 minutes to propagate
@@ -1385,7 +1388,7 @@ def test_pay_direct(node_factory, bitcoind):
     # Try multiple times to ensure that route randomization
     # will not override our preference for direct route.
     for i in range(8):
-        inv = l3.rpc.invoice(15000000, 'pay{}'.format(i), 'desc')['bolt11']
+        inv = l3.rpc.invoice(20000000, 'pay{}'.format(i), 'desc')['bolt11']
 
         l0.rpc.pay(inv)
 

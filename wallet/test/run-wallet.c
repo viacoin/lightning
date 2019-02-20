@@ -215,6 +215,9 @@ void json_add_hex_talarr(struct json_stream *result UNNEEDED,
 void json_add_log(struct json_stream *result UNNEEDED,
 		  const struct log_book *lr UNNEEDED, enum log_level minlevel UNNEEDED)
 { fprintf(stderr, "json_add_log called!\n"); abort(); }
+/* Generated stub for json_add_null */
+void json_add_null(struct json_stream *stream UNNEEDED, const char *fieldname UNNEEDED)
+{ fprintf(stderr, "json_add_null called!\n"); abort(); }
 /* Generated stub for json_add_num */
 void json_add_num(struct json_stream *result UNNEEDED, const char *fieldname UNNEEDED,
 		  unsigned int value UNNEEDED)
@@ -254,6 +257,10 @@ void json_array_start(struct json_stream *js UNNEEDED, const char *fieldname UNN
 struct json_escaped *json_escaped_string_(const tal_t *ctx UNNEEDED,
 					  const void *bytes UNNEEDED, size_t len UNNEEDED)
 { fprintf(stderr, "json_escaped_string_ called!\n"); abort(); }
+/* Generated stub for json_get_member */
+const jsmntok_t *json_get_member(const char *buffer UNNEEDED, const jsmntok_t tok[] UNNEEDED,
+				 const char *label UNNEEDED)
+{ fprintf(stderr, "json_get_member called!\n"); abort(); }
 /* Generated stub for json_object_end */
 void json_object_end(struct json_stream *js UNNEEDED)
 { fprintf(stderr, "json_object_end called!\n"); abort(); }
@@ -273,6 +280,9 @@ const char *json_tok_full(const char *buffer UNNEEDED, const jsmntok_t *t UNNEED
 /* Generated stub for json_tok_full_len */
 int json_tok_full_len(const jsmntok_t *t UNNEEDED)
 { fprintf(stderr, "json_tok_full_len called!\n"); abort(); }
+/* Generated stub for json_tok_streq */
+bool json_tok_streq(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED, const char *str UNNEEDED)
+{ fprintf(stderr, "json_tok_streq called!\n"); abort(); }
 /* Generated stub for json_to_pubkey */
 bool json_to_pubkey(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED,
 		    struct pubkey *pubkey UNNEEDED)
@@ -407,6 +417,10 @@ void peer_start_openingd(struct peer *peer UNNEEDED,
 			 int peer_fd UNNEEDED, int gossip_fd UNNEEDED,
 			 const u8 *msg UNNEEDED)
 { fprintf(stderr, "peer_start_openingd called!\n"); abort(); }
+/* Generated stub for plugin_hook_call_ */
+void plugin_hook_call_(struct lightningd *ld UNNEEDED, const struct plugin_hook *hook UNNEEDED,
+		       void *payload UNNEEDED, void *cb_arg UNNEEDED)
+{ fprintf(stderr, "plugin_hook_call_ called!\n"); abort(); }
 /* Generated stub for process_onionpacket */
 struct route_step *process_onionpacket(
 	const tal_t * ctx UNNEEDED,
