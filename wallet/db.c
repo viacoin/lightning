@@ -356,6 +356,8 @@ char *dbmigrations[] = {
     ");",
     /* Add a direction for failed payments. */
     "ALTER TABLE payments ADD faildirection INTEGER;", /* erring_direction */
+    /* Fix dangling peers with no channels. */
+    "DELETE FROM peers WHERE id NOT IN (SELECT peer_id FROM channels);",
     NULL,
 };
 
@@ -942,4 +944,32 @@ bool sqlite3_bind_json_escaped(sqlite3_stmt *stmt, int col,
 {
 	int err = sqlite3_bind_text(stmt, col, esc->s, strlen(esc->s), SQLITE_TRANSIENT);
 	return err == SQLITE_OK;
+}
+
+struct amount_msat sqlite3_column_amount_msat(sqlite3_stmt *stmt, int col)
+{
+	struct amount_msat msat;
+
+	msat.millisatoshis = sqlite3_column_int64(stmt, col); /* Raw: low level function */
+	return msat;
+}
+
+struct amount_sat sqlite3_column_amount_sat(sqlite3_stmt *stmt, int col)
+{
+	struct amount_sat sat;
+
+	sat.satoshis = sqlite3_column_int64(stmt, col); /* Raw: low level function */
+	return sat;
+}
+
+void sqlite3_bind_amount_msat(sqlite3_stmt *stmt, int col,
+			      struct amount_msat msat)
+{
+	sqlite3_bind_int64(stmt, col, msat.millisatoshis); /* Raw: low level function */
+}
+
+void sqlite3_bind_amount_sat(sqlite3_stmt *stmt, int col,
+			     struct amount_sat sat)
+{
+	sqlite3_bind_int64(stmt, col, sat.satoshis); /* Raw: low level function */
 }

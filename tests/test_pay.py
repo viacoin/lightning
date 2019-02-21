@@ -1,5 +1,5 @@
 from fixtures import *  # noqa: F401,F403
-from lightning import RpcError
+from lightning import RpcError, Millisatoshi
 from utils import DEVELOPER, wait_for, only_one, sync_blockheight, SLOW_MACHINE
 
 
@@ -59,6 +59,22 @@ def test_pay(node_factory):
     assert len(payments) == 1 and payments[0]['payment_preimage'] == preimage
 
 
+def test_pay_amounts(node_factory):
+    l1, l2 = node_factory.line_graph(2)
+    inv = l2.rpc.invoice(Millisatoshi("123sat"), 'test_pay_amounts', 'description')['bolt11']
+
+    invoice = only_one(l2.rpc.listinvoices('test_pay_amounts')['invoices'])
+
+    assert isinstance(invoice['amount_msat'], Millisatoshi)
+    assert invoice['amount_msat'] == Millisatoshi(123000)
+
+    l1.rpc.pay(inv)
+
+    invoice = only_one(l2.rpc.listinvoices('test_pay_amounts')['invoices'])
+    assert isinstance(invoice['amount_received_msat'], Millisatoshi)
+    assert invoice['amount_received_msat'] >= Millisatoshi(123000)
+
+
 def test_pay_limits(node_factory):
     """Test that we enforce fee max percentage and max delay"""
     l1, l2, l3 = node_factory.line_graph(3, wait_for_announce=True)
@@ -69,7 +85,7 @@ def test_pay_limits(node_factory):
     inv = l3.rpc.invoice("any", "any", 'description')
 
     # Fee too high.
-    with pytest.raises(RpcError, match=r'Route wanted fee of .* msatoshis') as err:
+    with pytest.raises(RpcError, match=r'Route wanted fee of .*msat') as err:
         l1.rpc.call('pay', {'bolt11': inv['bolt11'], 'msatoshi': 100000, 'maxfeepercent': 0.0001, 'exemptfee': 0})
 
     assert err.value.error['code'] == PAY_ROUTE_TOO_EXPENSIVE
@@ -573,6 +589,7 @@ def test_decodepay(node_factory):
     )
     assert b11['currency'] == 'bc'
     assert b11['msatoshi'] == 2500 * 10**11 // 1000000
+    assert b11['amount_msat'] == Millisatoshi(2500 * 10**11 // 1000000)
     assert b11['created_at'] == 1496314658
     assert b11['payment_hash'] == '0001020304050607080900010203040506070809000102030405060708090102'
     assert b11['description'] == '1 cup coffee'
@@ -606,6 +623,7 @@ def test_decodepay(node_factory):
     )
     assert b11['currency'] == 'bc'
     assert b11['msatoshi'] == 20 * 10**11 // 1000
+    assert b11['amount_msat'] == Millisatoshi(str(20 * 10**11 // 1000) + 'msat')
     assert b11['created_at'] == 1496314658
     assert b11['payment_hash'] == '0001020304050607080900010203040506070809000102030405060708090102'
     assert b11['expiry'] == 3600
@@ -638,6 +656,7 @@ def test_decodepay(node_factory):
     )
     assert b11['currency'] == 'tb'
     assert b11['msatoshi'] == 20 * 10**11 // 1000
+    assert b11['amount_msat'] == Millisatoshi(20 * 10**11 // 1000)
     assert b11['created_at'] == 1496314658
     assert b11['payment_hash'] == '0001020304050607080900010203040506070809000102030405060708090102'
     assert b11['expiry'] == 3600
@@ -669,6 +688,7 @@ def test_decodepay(node_factory):
     b11 = l1.rpc.decodepay('lnbc20m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsfpp3qjmp7lwpagxun9pygexvgpjdc4jdj85fr9yq20q82gphp2nflc7jtzrcazrra7wwgzxqc8u7754cdlpfrmccae92qgzqvzq2ps8pqqqqqqpqqqqq9qqqvpeuqafqxu92d8lr6fvg0r5gv0heeeqgcrqlnm6jhphu9y00rrhy4grqszsvpcgpy9qqqqqqgqqqqq7qqzqj9n4evl6mr5aj9f58zp6fyjzup6ywn3x6sk8akg5v4tgn2q8g4fhx05wf6juaxu9760yp46454gpg5mtzgerlzezqcqvjnhjh8z3g2qqdhhwkj', 'One piece of chocolate cake, one icecream cone, one pickle, one slice of swiss cheese, one slice of salami, one lollypop, one piece of cherry pie, one sausage, one cupcake, and one slice of watermelon')
     assert b11['currency'] == 'bc'
     assert b11['msatoshi'] == 20 * 10**11 // 1000
+    assert b11['amount_msat'] == Millisatoshi(20 * 10**11 // 1000)
     assert b11['created_at'] == 1496314658
     assert b11['payment_hash'] == '0001020304050607080900010203040506070809000102030405060708090102'
     assert b11['expiry'] == 3600
@@ -711,6 +731,7 @@ def test_decodepay(node_factory):
     b11 = l1.rpc.decodepay('lnbc20m1pvjluezhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqfppj3a24vwu6r8ejrss3axul8rxldph2q7z9kmrgvr7xlaqm47apw3d48zm203kzcq357a4ls9al2ea73r8jcceyjtya6fu5wzzpe50zrge6ulk4nvjcpxlekvmxl6qcs9j3tz0469gq5g658y', 'One piece of chocolate cake, one icecream cone, one pickle, one slice of swiss cheese, one slice of salami, one lollypop, one piece of cherry pie, one sausage, one cupcake, and one slice of watermelon')
     assert b11['currency'] == 'bc'
     assert b11['msatoshi'] == 20 * 10**11 // 1000
+    assert b11['amount_msat'] == Millisatoshi(20 * 10**11 // 1000)
     assert b11['created_at'] == 1496314658
     assert b11['payment_hash'] == '0001020304050607080900010203040506070809000102030405060708090102'
     assert b11['expiry'] == 3600
@@ -737,6 +758,7 @@ def test_decodepay(node_factory):
     b11 = l1.rpc.decodepay('lnbc20m1pvjluezhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqfppqw508d6qejxtdg4y5r3zarvary0c5xw7kepvrhrm9s57hejg0p662ur5j5cr03890fa7k2pypgttmh4897d3raaq85a293e9jpuqwl0rnfuwzam7yr8e690nd2ypcq9hlkdwdvycqa0qza8', 'One piece of chocolate cake, one icecream cone, one pickle, one slice of swiss cheese, one slice of salami, one lollypop, one piece of cherry pie, one sausage, one cupcake, and one slice of watermelon')
     assert b11['currency'] == 'bc'
     assert b11['msatoshi'] == 20 * 10**11 // 1000
+    assert b11['amount_msat'] == Millisatoshi(20 * 10**11 // 1000)
     assert b11['created_at'] == 1496314658
     assert b11['payment_hash'] == '0001020304050607080900010203040506070809000102030405060708090102'
     assert b11['expiry'] == 3600
@@ -763,6 +785,7 @@ def test_decodepay(node_factory):
     b11 = l1.rpc.decodepay('lnbc20m1pvjluezhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqfp4qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q28j0v3rwgy9pvjnd48ee2pl8xrpxysd5g44td63g6xcjcu003j3qe8878hluqlvl3km8rm92f5stamd3jw763n3hck0ct7p8wwj463cql26ava', 'One piece of chocolate cake, one icecream cone, one pickle, one slice of swiss cheese, one slice of salami, one lollypop, one piece of cherry pie, one sausage, one cupcake, and one slice of watermelon')
     assert b11['currency'] == 'bc'
     assert b11['msatoshi'] == 20 * 10**11 // 1000
+    assert b11['amount_msat'] == Millisatoshi(20 * 10**11 // 1000)
     assert b11['created_at'] == 1496314658
     assert b11['payment_hash'] == '0001020304050607080900010203040506070809000102030405060708090102'
     assert b11['expiry'] == 3600
@@ -951,9 +974,9 @@ def test_forward_different_fees_and_cltv(node_factory, bitcoind):
 
     # We add one to the blockcount for a bit of fuzz (FIXME: Shadowroute would fix this!)
     shadow_route = 1
-    l1.daemon.wait_for_log("Adding HTLC 0 msat=5010198 cltv={} gave CHANNEL_ERR_ADD_OK"
+    l1.daemon.wait_for_log("Adding HTLC 0 amount=5010198msat cltv={} gave CHANNEL_ERR_ADD_OK"
                            .format(bitcoind.rpc.getblockcount() + 20 + 9 + shadow_route))
-    l2.daemon.wait_for_log("Adding HTLC 0 msat=4999999 cltv={} gave CHANNEL_ERR_ADD_OK"
+    l2.daemon.wait_for_log("Adding HTLC 0 amount=4999999msat cltv={} gave CHANNEL_ERR_ADD_OK"
                            .format(bitcoind.rpc.getblockcount() + 9 + shadow_route))
     l3.daemon.wait_for_log("test_forward_different_fees_and_cltv: Actual amount 4999999msat, HTLC expiry {}"
                            .format(bitcoind.rpc.getblockcount() + 9 + shadow_route))
@@ -1009,8 +1032,10 @@ def test_forward_pad_fees_and_cltv(node_factory, bitcoind):
 
     # Modify so we overpay, overdo the cltv.
     route[0]['msatoshi'] += 2000
+    route[0]['amount_msat'] = Millisatoshi(route[0]['msatoshi'])
     route[0]['delay'] += 20
     route[1]['msatoshi'] += 1000
+    route[1]['amount_msat'] = Millisatoshi(route[1]['msatoshi'])
     route[1]['delay'] += 10
 
     # This should work.
@@ -1261,6 +1286,7 @@ def test_pay_routeboost(node_factory, bitcoind):
     status = l1.rpc.call('paystatus', [inv['bolt11']])
     assert only_one(status['pay'])['bolt11'] == inv['bolt11']
     assert only_one(status['pay'])['msatoshi'] == 10**5
+    assert only_one(status['pay'])['amount_msat'] == Millisatoshi(10**5)
     assert only_one(status['pay'])['destination'] == l4.info['id']
     assert 'description' not in only_one(status['pay'])
     assert 'routehint_modifications' not in only_one(status['pay'])
@@ -1278,12 +1304,14 @@ def test_pay_routeboost(node_factory, bitcoind):
     assert attempts[1]['duration_in_seconds'] <= end - start
     assert only_one(attempts[1]['routehint'])
     assert only_one(attempts[1]['routehint'])['id'] == l3.info['id']
-    assert only_one(attempts[1]['routehint'])['msatoshi'] == 10**5 + 1 + 10**5 // 100000
-    assert only_one(attempts[1]['routehint'])['delay'] == 5 + 6
+    scid34 = only_one(l3.rpc.listpeers(l4.info['id'])['peers'])['channels'][0]['short_channel_id']
+    assert only_one(attempts[1]['routehint'])['channel'] == scid34
+    assert only_one(attempts[1]['routehint'])['fee_base_msat'] == 1
+    assert only_one(attempts[1]['routehint'])['fee_proportional_millionths'] == 10
+    assert only_one(attempts[1]['routehint'])['cltv_expiry_delta'] == 6
 
     # With dev-route option we can test longer routehints.
     if DEVELOPER:
-        scid34 = only_one(l3.rpc.listpeers(l4.info['id'])['peers'])['channels'][0]['short_channel_id']
         scid45 = only_one(l4.rpc.listpeers(l5.info['id'])['peers'])['channels'][0]['short_channel_id']
         routel3l4l5 = [{'id': l3.info['id'],
                         'short_channel_id': scid34,

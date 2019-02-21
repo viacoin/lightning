@@ -8,6 +8,7 @@
 #include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
+#include <common/amount.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
 
@@ -241,8 +242,6 @@ char *fromwire_wirestring(const tal_t *ctx, const u8 **cursor, size_t *max)
 	return NULL;
 }
 
-REGISTER_TYPE_TO_STRING(short_channel_id, short_channel_id_to_str);
-REGISTER_TYPE_TO_STRING(short_channel_id_dir, short_channel_id_dir_to_str);
 REGISTER_TYPE_TO_HEXSTR(channel_id);
 
 /* BOLT #2:
@@ -272,3 +271,20 @@ void fromwire_siphash_seed(const u8 **cursor, size_t *max,
 {
 	fromwire(cursor, max, seed, sizeof(*seed));
 }
+
+struct amount_msat fromwire_amount_msat(const u8 **cursor, size_t *max)
+{
+	struct amount_msat msat;
+
+	msat.millisatoshis = fromwire_u64(cursor, max); /* Raw: primitive */
+	return msat;
+}
+
+struct amount_sat fromwire_amount_sat(const u8 **cursor, size_t *max)
+{
+	struct amount_sat sat;
+
+	sat.satoshis = fromwire_u64(cursor, max); /* Raw: primitive */
+	return sat;
+}
+
