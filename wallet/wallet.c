@@ -65,7 +65,7 @@ struct wallet *wallet_new(struct lightningd *ld,
 #define UTXO_FIELDS							\
 	"prev_out_tx, prev_out_index, value, type, status, keyindex, "	\
 	"channel_id, peer_id, commitment_point, confirmation_height, "	\
-	"spend_height"
+	"spend_height, scriptpubkey"
 
 /* We actually use the db constraints to uniquify, so OK if this fails. */
 bool wallet_add_utxo(struct wallet *w, struct utxo *utxo,
@@ -75,7 +75,7 @@ bool wallet_add_utxo(struct wallet *w, struct utxo *utxo,
 
 	stmt = db_prepare(w->db, "INSERT INTO outputs ("
 			  UTXO_FIELDS
-			  ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);");
+			  ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);");
 	sqlite3_bind_blob(stmt, 1, &utxo->txid, sizeof(utxo->txid), SQLITE_TRANSIENT);
 	sqlite3_bind_int(stmt, 2, utxo->outnum);
 	sqlite3_bind_amount_sat(stmt, 3, utxo->amount);
@@ -101,6 +101,13 @@ bool wallet_add_utxo(struct wallet *w, struct utxo *utxo,
 		sqlite3_bind_int(stmt, 11, *utxo->spendheight);
 	else
 		sqlite3_bind_null(stmt, 11);
+
+	if (utxo->scriptPubkey)
+		sqlite3_bind_blob(stmt, 12, utxo->scriptPubkey,
+				  tal_bytelen(utxo->scriptPubkey),
+				  SQLITE_TRANSIENT);
+	else
+		sqlite3_bind_null(stmt, 12);
 
 	/* May fail if we already know about the tx, e.g., because
 	 * it's change or some internal tx. */
@@ -131,6 +138,7 @@ static struct utxo *wallet_stmt2output(const tal_t *ctx, sqlite3_stmt *stmt)
 
 	utxo->blockheight = NULL;
 	utxo->spendheight = NULL;
+	utxo->scriptPubkey = NULL;
 
 	if (sqlite3_column_type(stmt, 9) != SQLITE_NULL) {
 		blockheight = tal(utxo, u32);
@@ -142,6 +150,12 @@ static struct utxo *wallet_stmt2output(const tal_t *ctx, sqlite3_stmt *stmt)
 		spendheight = tal(utxo, u32);
 		*spendheight = sqlite3_column_int(stmt, 10);
 		utxo->spendheight = spendheight;
+	}
+
+	if (sqlite3_column_type(stmt, 11) != SQLITE_NULL) {
+		utxo->scriptPubkey =
+		    tal_dup_arr(utxo, u8, sqlite3_column_blob(stmt, 11),
+				sqlite3_column_bytes(stmt, 11), 0);
 	}
 
 	return utxo;
@@ -254,6 +268,7 @@ static const struct utxo **wallet_select(const tal_t *ctx, struct wallet *w,
 					 const u32 feerate_per_kw,
 					 size_t outscriptlen,
 					 bool may_have_change,
+					 u32 maxheight,
 					 struct amount_sat *satoshi_in,
 					 struct amount_sat *fee_estimate)
 {
@@ -282,6 +297,13 @@ static const struct utxo **wallet_select(const tal_t *ctx, struct wallet *w,
 		size_t input_weight;
 		struct amount_sat needed;
 		struct utxo *u = tal_steal(utxos, available[i]);
+
+		/* If we require confirmations check that we have a
+		 * confirmation height and that it is below the required
+		 * maxheight (current_height - minconf */
+		if (maxheight != 0 &&
+		    (!u->blockheight || *u->blockheight > maxheight))
+			continue;
 
 		tal_arr_expand(&utxos, u);
 
@@ -332,6 +354,7 @@ const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
 					struct amount_sat sat,
 					const u32 feerate_per_kw,
 					size_t outscriptlen,
+					u32 maxheight,
 					struct amount_sat *fee_estimate,
 					struct amount_sat *change)
 {
@@ -339,7 +362,7 @@ const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
 	const struct utxo **utxo;
 
 	utxo = wallet_select(ctx, w, sat, feerate_per_kw,
-			     outscriptlen, true,
+			     outscriptlen, true, maxheight,
 			     &satoshi_in, fee_estimate);
 
 	/* Couldn't afford it? */
@@ -353,6 +376,7 @@ const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
 const struct utxo **wallet_select_all(const tal_t *ctx, struct wallet *w,
 				      const u32 feerate_per_kw,
 				      size_t outscriptlen,
+				      u32 maxheight,
 				      struct amount_sat *value,
 				      struct amount_sat *fee_estimate)
 {
@@ -361,7 +385,7 @@ const struct utxo **wallet_select_all(const tal_t *ctx, struct wallet *w,
 
 	/* Huge value, but won't overflow on addition */
 	utxo = wallet_select(ctx, w, AMOUNT_SAT(1ULL << 56), feerate_per_kw,
-			     outscriptlen, false,
+			     outscriptlen, false, maxheight,
 			     &satoshi_in, fee_estimate);
 
 	/* Can't afford fees? */
@@ -1152,6 +1176,7 @@ int wallet_extract_owned_outputs(struct wallet *w, const struct bitcoin_tx *tx,
 
 		utxo->blockheight = blockheight ? blockheight : NULL;
 		utxo->spendheight = NULL;
+		utxo->scriptPubkey = tx->output[output].script;
 
 		log_debug(w->log, "Owning output %zu %s (%s) txid %s%s",
 			  output,
@@ -1697,8 +1722,9 @@ void wallet_payment_store(struct wallet *wallet,
 		"  route_nodes,"
 		"  route_channels,"
 		"  msatoshi_sent,"
-		"  description"
-		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);");
+		"  description,"
+		"  bolt11"
+		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);");
 
 	sqlite3_bind_int(stmt, 1, payment->status);
 	sqlite3_bind_sha256(stmt, 2, &payment->payment_hash);
@@ -1713,12 +1739,19 @@ void wallet_payment_store(struct wallet *wallet,
 					    payment->route_channels);
 	sqlite3_bind_amount_msat(stmt, 9, payment->msatoshi_sent);
 
-	if (payment->description != NULL)
-		sqlite3_bind_text(stmt, 10, payment->description,
-				  strlen(payment->description),
+	if (payment->label != NULL)
+		sqlite3_bind_text(stmt, 10, payment->label,
+				  strlen(payment->label),
 				  SQLITE_TRANSIENT);
 	else
 		sqlite3_bind_null(stmt, 10);
+
+	if (payment->bolt11 != NULL)
+		sqlite3_bind_text(stmt, 11, payment->bolt11,
+				  strlen(payment->bolt11),
+				  SQLITE_TRANSIENT);
+	else
+		sqlite3_bind_null(stmt, 11);
 
 	db_exec_prepared(wallet->db, stmt);
 
@@ -1774,10 +1807,16 @@ static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
 	payment->msatoshi_sent = sqlite3_column_amount_msat(stmt, 10);
 
 	if (sqlite3_column_type(stmt, 11) != SQLITE_NULL)
-		payment->description = tal_strdup(
+		payment->label = tal_strdup(
 		    payment, (const char *)sqlite3_column_text(stmt, 11));
 	else
-		payment->description = NULL;
+		payment->label = NULL;
+
+	if (sqlite3_column_type(stmt, 12) != SQLITE_NULL)
+		payment->bolt11 = tal_strdup(payment,
+					     (const char *)sqlite3_column_text(stmt, 12));
+	else
+		payment->bolt11 = NULL;
 
 	return payment;
 }
@@ -1786,7 +1825,7 @@ static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
 #define PAYMENT_FIELDS                                                         \
 	"id, status, destination, msatoshi, payment_hash, timestamp, "         \
 	"payment_preimage, path_secrets, route_nodes, route_channels, "        \
-	"msatoshi_sent, description "
+	"msatoshi_sent, description, bolt11 "
 
 struct wallet_payment *
 wallet_payment_by_hash(const tal_t *ctx, struct wallet *wallet,

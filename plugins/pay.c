@@ -1,4 +1,5 @@
 #include <ccan/array_size/array_size.h>
+#include <ccan/cast/cast.h>
 #include <ccan/intmap/intmap.h>
 #include <ccan/tal/str/str.h>
 #include <ccan/time/time.h>
@@ -40,7 +41,7 @@ struct pay_status {
 	struct list_node list;
 
 	/* Description user provided (if any) */
-	const char *desc;
+	const char *label;
 	/* Amount they wanted to pay. */
 	struct amount_msat msat;
 	/* CLTV delay required by destination. */
@@ -79,7 +80,7 @@ struct pay_command {
 	const char *payment_hash;
 
 	/* Description, if any. */
-	const char *desc;
+	const char *label;
 
 	/* Chatty description of attempts. */
 	struct pay_status *ps;
@@ -505,15 +506,16 @@ static struct command_result *getroute_done(struct command *cmd,
 		return next_routehint(cmd, pc);
 	}
 
-	if (pc->desc)
-		json_desc = tal_fmt(pc, ", 'description': '%s'", pc->desc);
+	if (pc->label)
+		json_desc = tal_fmt(pc, ", 'label': '%s'", pc->label);
 	else
 		json_desc = "";
 
 	return send_outreq(cmd, "sendpay", sendpay_done, sendpay_error, pc,
-			   "'route': %s, 'payment_hash': '%s'%s",
+			   "'route': %s, 'payment_hash': '%s', 'bolt11': '%s'%s",
 			   attempt->route,
 			   pc->payment_hash,
+			   pc->ps->bolt11,
 			   json_desc);
 
 }
@@ -833,7 +835,7 @@ static struct pay_status *add_pay_status(struct pay_command *pc,
 
 	/* The pay_status outlives the pc, so it simply takes field ownership */
 	ps->dest = tal_steal(ps, pc->dest);
-	ps->desc = tal_steal(ps, pc->desc);
+	ps->label = tal_steal(ps, pc->label);
 	ps->msat = pc->msat;
 	ps->final_cltv = pc->final_cltv;
 	ps->bolt11 = tal_steal(ps, b11str);
@@ -846,13 +848,13 @@ static struct pay_status *add_pay_status(struct pay_command *pc,
 	return ps;
 }
 
-static struct command_result *handle_pay(struct command *cmd,
-					 const char *buf,
-					 const jsmntok_t *params)
+static struct command_result *json_pay(struct command *cmd,
+				       const char *buf,
+				       const jsmntok_t *params)
 {
 	struct amount_msat *msat;
 	struct bolt11 *b11;
-	const char *b11str;
+	const char *b11str, *description_deprecated;
 	char *fail;
 	double *riskfactor;
 	unsigned int *retryfor;
@@ -861,22 +863,54 @@ static struct command_result *handle_pay(struct command *cmd,
 	unsigned int *maxdelay;
 	struct amount_msat *exemptfee;
 
-	setup_locale();
+	/* If params is array, label takes place of description.  For
+	 * keywords, its a separate parameter. */
+	if (!params || params->type == JSMN_ARRAY) {
+		if (!param(cmd, buf, params,
+			   p_req("bolt11", param_string, &b11str),
+			   p_opt("msatoshi", param_msat, &msat),
+			   p_opt("label", param_string, &pc->label),
+			   p_opt_def("riskfactor", param_double, &riskfactor, 10),
+			   p_opt_def("maxfeepercent", param_percent, &maxfeepercent, 0.5),
+			   p_opt_def("retry_for", param_number, &retryfor, 60),
+			   p_opt_def("maxdelay", param_number, &maxdelay,
+				     maxdelay_default),
+			   p_opt_def("exemptfee", param_msat, &exemptfee, AMOUNT_MSAT(5000)),
+			   NULL))
+			return NULL;
 
-	if (!param(cmd, buf, params,
-		   p_req("bolt11", param_string, &b11str),
-		   p_opt("msatoshi", param_msat, &msat),
-		   p_opt("description", param_string, &pc->desc),
-		   p_opt_def("riskfactor", param_double, &riskfactor, 10),
-		   p_opt_def("maxfeepercent", param_percent, &maxfeepercent, 0.5),
-		   p_opt_def("retry_for", param_number, &retryfor, 60),
-		   p_opt_def("maxdelay", param_number, &maxdelay,
-			     maxdelay_default),
-		   p_opt_def("exemptfee", param_msat, &exemptfee, AMOUNT_MSAT(5000)),
-		   NULL))
+		/* This works because bolt11_decode ignores unneeded descriptions */
+		if (deprecated_apis)
+			description_deprecated = pc->label;
+		else
+			description_deprecated = NULL;
+	} else {
+		/* If by keyword, treat description and label as
+		 * separate parameters. */
+		if (!param(cmd, buf, params,
+			   p_req("bolt11", param_string, &b11str),
+			   p_opt("msatoshi", param_msat, &msat),
+			   p_opt("description", param_string,
+				 &description_deprecated),
+			   p_opt_def("riskfactor", param_double, &riskfactor, 10),
+			   p_opt_def("maxfeepercent", param_percent, &maxfeepercent, 0.5),
+			   p_opt_def("retry_for", param_number, &retryfor, 60),
+			   p_opt_def("maxdelay", param_number, &maxdelay,
+				     maxdelay_default),
+			   p_opt_def("exemptfee", param_msat, &exemptfee, AMOUNT_MSAT(5000)),
+			   p_opt("label", param_string, &pc->label),
+			   NULL))
 		return NULL;
 
-	b11 = bolt11_decode(cmd, b11str, pc->desc, &fail);
+		if (description_deprecated && !deprecated_apis)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Deprecated parameter description, use label");
+		if (description_deprecated && pc->label)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Cannot specify both description and label");
+	}
+
+	b11 = bolt11_decode(cmd, b11str, description_deprecated, &fail);
 	if (!b11) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Invalid bolt11: %s", fail);
@@ -1001,9 +1035,9 @@ static void add_attempt(char **ret,
 	tal_append_fmt(ret, "}");
 }
 
-static struct command_result *handle_paystatus(struct command *cmd,
-						const char *buf,
-						const jsmntok_t *params)
+static struct command_result *json_paystatus(struct command *cmd,
+					     const char *buf,
+					     const jsmntok_t *params)
 {
 	struct pay_status *ps;
 	const char *b11str;
@@ -1033,8 +1067,8 @@ static struct command_result *handle_paystatus(struct command *cmd,
 			       ps->msat.millisatoshis, /* Raw: JSON */
 			       type_to_string(tmpctx, struct amount_msat,
 					      &ps->msat), ps->dest);
-		if (ps->desc)
-			tal_append_fmt(&ret, ", 'description': '%s'", ps->desc);
+		if (ps->label)
+			tal_append_fmt(&ret, ", 'label': '%s'", ps->label);
 		if (ps->routehint_modifications)
 			tal_append_fmt(&ret, ", 'routehint_modifications': '%s'",
 				       ps->routehint_modifications);
@@ -1060,6 +1094,90 @@ static struct command_result *handle_paystatus(struct command *cmd,
 	return command_success(cmd, ret);
 }
 
+static const jsmntok_t *copy_member(char **ret,
+				    const char *buf,
+				    const jsmntok_t *result,
+				    const char *membername,
+				    const char *term)
+{
+	const jsmntok_t *m = json_get_member(buf, result, membername);
+	if (m)
+		tal_append_fmt(ret, "'%s': %.*s%s",
+			       membername,
+			       json_tok_full_len(m), json_tok_full(buf, m),
+			       term);
+	return m;
+}
+
+static struct command_result *listsendpays_done(struct command *cmd,
+						const char *buf,
+						const jsmntok_t *result,
+						char *b11str)
+{
+	size_t i;
+	const jsmntok_t *t, *arr;
+	char *ret;
+	bool some = false;
+
+	arr = json_get_member(buf, result, "payments");
+	if (!arr || arr->type != JSMN_ARRAY)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Unexpected non-array result from listsendpays");
+
+	ret = tal_fmt(cmd, "{ 'pays': [");
+	json_for_each_arr(i, t, arr) {
+		const jsmntok_t *status;
+
+		if (some)
+			tal_append_fmt(&ret, ",\n");
+		some = true;
+
+		tal_append_fmt(&ret, "{");
+		/* Old payments didn't have bolt11 field */
+		if (!copy_member(&ret, buf, t, "bolt11", ",")) {
+			if (b11str) {
+				/* If it's a single query, we can fake it */
+				tal_append_fmt(&ret, "'bolt11': '%s',", b11str);
+			} else {
+				copy_member(&ret, buf, t, "payment_hash", ",");
+				copy_member(&ret, buf, t, "destination", ",");
+				copy_member(&ret, buf, t, "amount_msat", ",");
+			}
+		}
+
+		status = copy_member(&ret, buf, t, "status", ",");
+		if (status && json_tok_streq(buf, status, "complete"))
+			copy_member(&ret, buf, t, "payment_preimage", ",");
+		copy_member(&ret, buf, t, "label", ",");
+		copy_member(&ret, buf, t, "amount_sent_msat", "");
+		tal_append_fmt(&ret, "}");
+	}
+	tal_append_fmt(&ret, "] }");
+	return command_success(cmd, ret);
+}
+
+static struct command_result *json_listpays(struct command *cmd,
+					    const char *buf,
+					    const jsmntok_t *params)
+{
+	const char *b11str, *paramstr;
+
+	/* FIXME: would be nice to parse as a bolt11 so check worked in future */
+	if (!param(cmd, buf, params,
+		   p_opt("bolt11", param_string, &b11str),
+		   NULL))
+		return NULL;
+
+	if (b11str)
+		paramstr = tal_fmt(tmpctx, "'bolt11' : '%s'", b11str);
+	else
+		paramstr = "";
+	return send_outreq(cmd, "listsendpays",
+			   listsendpays_done, forward_error,
+			   cast_const(char *, b11str),
+			   "%s", paramstr);
+}
+
 static void init(struct plugin_conn *rpc)
 {
 	const char *field;
@@ -1078,16 +1196,22 @@ static const struct plugin_command commands[] = { {
 		"pay",
 		"Send payment specified by {bolt11} with {amount}",
 		"Try to send a payment, retrying {retry_for} seconds before giving up",
-		handle_pay
+		json_pay
 	}, {
 		"paystatus",
 		"Detail status of attempts to pay {bolt11}, or all",
 		"Covers both old payments and current ones.",
-		handle_paystatus
+		json_paystatus
+	}, {
+		"listpays",
+		"List result of payment {bolt11}, or all",
+		"Covers old payments (failed and succeeded) and current ones.",
+		json_listpays
 	}
 };
 
 int main(int argc, char *argv[])
 {
+	setup_locale();
 	plugin_main(argv, init, commands, ARRAY_SIZE(commands));
 }

@@ -101,6 +101,7 @@ static struct command_result *json_withdraw(struct command *cmd,
 	struct pubkey pubkey;
 	enum address_parse_result addr_parse;
 	struct command_result *res;
+	u32 *minconf, maxheight;
 
 	withdraw->cmd = cmd;
 	wtx_init(cmd, &withdraw->wtx, AMOUNT_SAT(-1ULL));
@@ -109,6 +110,7 @@ static struct command_result *json_withdraw(struct command *cmd,
 		   p_req("destination", param_tok, &desttok),
 		   p_req("satoshi", param_wtx, &withdraw->wtx),
 		   p_opt("feerate", param_feerate, &feerate_per_kw),
+		   p_opt_def("minconf", param_number, &minconf, 1),
 		   NULL))
 		return command_param_failed();
 
@@ -138,8 +140,9 @@ static struct command_result *json_withdraw(struct command *cmd,
 				    get_chainparams(cmd->ld)->network_name);
 	}
 
+	maxheight = minconf_to_maxheight(*minconf, cmd->ld);
 	res = wtx_select_utxos(&withdraw->wtx, *feerate_per_kw,
-			       tal_count(withdraw->destination));
+			       tal_count(withdraw->destination), maxheight);
 	if (res)
 		return res;
 
@@ -180,10 +183,14 @@ static struct command_result *json_withdraw(struct command *cmd,
 }
 
 static const struct json_command withdraw_command = {
-	"withdraw",
-	json_withdraw,
-	"Send to {destination} address {satoshi} (or 'all') amount via Bitcoin transaction, at optional {feerate}",
-	false, "Send funds from the internal wallet to the specified address. Either specify a number of satoshis to send or 'all' to sweep all funds in the internal wallet to the address."
+    "withdraw", json_withdraw,
+    "Send to {destination} address {satoshi} (or 'all') amount via Bitcoin "
+    "transaction, at optional {feerate}",
+    false,
+    "Send funds from the internal wallet to the specified address. Either "
+    "specify a number of satoshis to send or 'all' to sweep all funds in the "
+    "internal wallet to the address. Only use outputs that have at least "
+    "{minconf} confirmations."
 };
 AUTODATA(json_command, &withdraw_command);
 
@@ -236,6 +243,26 @@ encode_pubkey_to_addr(const tal_t *ctx,
 	else
 		tal_free(redeemscript);
 
+	return out;
+}
+
+/* Returns NULL if the script is not a P2WPKH */
+static char *
+encode_scriptpubkey_to_addr(const tal_t *ctx,
+			    const struct lightningd *ld,
+			    const u8 *scriptPubkey)
+{
+	char *out;
+	const char *hrp;
+	size_t scriptLen = tal_bytelen(scriptPubkey);
+	bool ok;
+	if (scriptLen != 22 || scriptPubkey[0] != 0x00 || scriptPubkey[1] != 0x14)
+		return NULL;
+	hrp = get_chainparams(ld)->bip173_name;
+	out = tal_arr(ctx, char, 73 + strlen(hrp));
+	ok = segwit_addr_encode(out, hrp, 0, scriptPubkey + 2, scriptLen - 2);
+	if (!ok)
+		return tal_free(out);
 	return out;
 }
 
@@ -438,7 +465,13 @@ static struct command_result *json_listfunds(struct command *cmd,
 						    "p2wpkh address encoding failure.");
 			}
 		        json_add_string(response, "address", out);
+		} else if (utxos[i]->scriptPubkey != NULL) {
+			out = encode_scriptpubkey_to_addr(
+			    cmd, cmd->ld, utxos[i]->scriptPubkey);
+			if (out)
+				json_add_string(response, "address", out);
 		}
+
 		if (utxos[i]->spendheight)
 			json_add_string(response, "status", "spent");
 		else if (utxos[i]->blockheight)

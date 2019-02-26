@@ -224,9 +224,11 @@ struct wallet_payment {
 	struct secret *path_secrets;
 	struct pubkey *route_nodes;
 	struct short_channel_id *route_channels;
+	/* bolt11 string; NULL for old payments. */
+	const char *bolt11;
 
-	/* The description of the payment. Must support `tal_len` */
-	const char *description;
+	/* The label of the payment. Must support `tal_len` */
+	const char *label;
 };
 
 struct outpoint {
@@ -319,14 +321,16 @@ const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
 					struct amount_sat value,
 					const u32 feerate_per_kw,
 					size_t outscriptlen,
+					u32 maxheight,
 					struct amount_sat *fee_estimate,
 					struct amount_sat *change_satoshi);
 
 const struct utxo **wallet_select_all(const tal_t *ctx, struct wallet *w,
-					const u32 feerate_per_kw,
-					size_t outscriptlen,
-					struct amount_sat *sat,
-					struct amount_sat *fee_estimate);
+				      const u32 feerate_per_kw,
+				      size_t outscriptlen,
+				      u32 maxheight,
+				      struct amount_sat *sat,
+				      struct amount_sat *fee_estimate);
 
 /**
  * wallet_confirm_utxos - Once we've spent a set of utxos, mark them confirmed.

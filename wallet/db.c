@@ -334,6 +334,7 @@ char *dbmigrations[] = {
     "DELETE FROM blocks WHERE height IS NULL;",
     /* -- End of  PR #1398 -- */
     "ALTER TABLE invoices ADD description TEXT;",
+    /* FIXME: payments table 'description' is really a 'label' */
     "ALTER TABLE payments ADD description TEXT;",
     /* future_per_commitment_point if other side proves we're out of date -- */
     "ALTER TABLE channels ADD future_per_commitment_point BLOB;",
@@ -358,6 +359,9 @@ char *dbmigrations[] = {
     "ALTER TABLE payments ADD faildirection INTEGER;", /* erring_direction */
     /* Fix dangling peers with no channels. */
     "DELETE FROM peers WHERE id NOT IN (SELECT peer_id FROM channels);",
+    "ALTER TABLE outputs ADD scriptpubkey BLOB;",
+    /* Keep bolt11 string for payments. */
+    "ALTER TABLE payments ADD bolt11 TEXT;",
     NULL,
 };
 
