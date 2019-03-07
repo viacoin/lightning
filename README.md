@@ -90,6 +90,7 @@ services:
       - --bitcoin-rpcconnect=bitcoind
       - --bitcoin-rpcuser=rpcuser
       - --bitcoin-rpcpassword=rpcpass
+      - --plugin-dir=/usr/libexec/c-lightning/plugins
       - --network=testnet
       - --alias=myawesomenode
       - --log-level=debug
@@ -244,7 +245,6 @@ the file, for example:
 ```
 alias=SLEEPYDRAGON
 rgb=008000
-port=9735
 network=testnet
 ```
 
@@ -270,7 +270,7 @@ JSON-RPC interface is documented in the following manual pages:
 * [getroute](doc/lightning-getroute.7.txt)
 * [sendpay](doc/lightning-sendpay.7.txt)
 * [pay](doc/lightning-pay.7.txt)
-* [listpayments](doc/lightning-listpayments.7.txt)
+* [listpays](doc/lightning-listpays.7.txt)
 * [decodepay](doc/lightning-decodepay.7.txt)
 
 For simple access to the JSON-RPC interface you can use the
