@@ -23,6 +23,8 @@ changes.
 
 ### Fixed
 
+- `--bind-addr=<path>` fixed for nodes using local sockets (eg. testing).
+
 ### Security
 
 ## [0.7.0] - 2019-02-28: "Actually an Altcoin"
@@ -57,6 +59,7 @@ This release named by Mark Beckwith @wythe.
 - JSON API: `listpayments` is now `listsendpays`.
 - lightning-cli: `help <cmd>` finds man pages even if `make install` not run.
 - pylightning: New class 'Millisatoshi' can be used for JSON API, and new '_msat' fields are turned into this on reading.
+- JSON API: New command `setchannelfee` sets channel specific routing fees.
 
 ### Changed
 
