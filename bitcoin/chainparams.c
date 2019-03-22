@@ -3,6 +3,13 @@
 #include <ccan/str/str.h>
 #include <string.h>
 
+/* Version codes for BIP32 extended keys in libwally-core.
+ * Stolen from wally_bip32.h in libwally-core*/
+#define BIP32_VER_MAIN_PUBLIC  0x0488B21E
+#define BIP32_VER_MAIN_PRIVATE 0x0488ADE4
+#define BIP32_VER_TEST_PUBLIC  0x043587CF
+#define BIP32_VER_TEST_PRIVATE 0x04358394
+
 const struct chainparams networks[] = {
     {.network_name = "bitcoin",
      .bip173_name = "bc",
@@ -21,7 +28,8 @@ const struct chainparams networks[] = {
      .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
      /* "Lightning Charge Powers Developers & Blockstream Store" */
      .when_lightning_became_cool = 504500,
-     .testnet = false},
+     .testnet = false,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC, .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE}},
     {.network_name = "regtest",
      .bip173_name = "bcrt",
      .genesis_blockhash = {{{.u.u8 = {0x06, 0x22, 0x6e, 0x46, 0x11, 0x1a, 0x0b, 0x59, 0xca, 0xaf, 0x12, 0x60, 0x43, 0xeb, 0x5b, 0xbf, 0x28, 0xc3, 0x4f, 0x3a, 0x5e, 0x33, 0x2a, 0x1f, 0xc7, 0xb2, 0xb7, 0x3c, 0xf1, 0x88, 0x91, 0x0f}}}},
@@ -32,7 +40,8 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
      .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
      .when_lightning_became_cool = 1,
-     .testnet = true},
+     .testnet = true,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE}},
     {.network_name = "testnet",
      .bip173_name = "tb",
      .genesis_blockhash = {{{.u.u8 = {0x43, 0x49, 0x7f, 0xd7, 0xf8, 0x26, 0x95, 0x71, 0x08, 0xf4, 0xa3, 0x0f, 0xd9, 0xce, 0xc3, 0xae, 0xba, 0x79, 0x97, 0x20, 0x84, 0xe9, 0x0e, 0xad, 0x01, 0xea, 0x33, 0x09, 0x00, 0x00, 0x00, 0x00}}}},
@@ -43,6 +52,7 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
      .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
      .testnet = true},
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC, .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE}},
     {.network_name = "viacoin",
      .bip173_name = "via",
      .genesis_blockhash = {{{.u.u8 = {0xa1, 0x0b, 0x40, 0x9a, 0x53, 0xa1, 0x1d, 0x97, 0x79, 0x0d, 0x97, 0x70, 0x5a, 0xe3, 0xab, 0xea, 0x15, 0x15, 0x33, 0xc0, 0x8e, 0x12, 0x30, 0x98, 0x04, 0x76, 0x99, 0x1f, 0x00, 0x54, 0x9b, 0x4e }}}},
@@ -54,6 +64,7 @@ const struct chainparams networks[] = {
      .max_payment = AMOUNT_MSAT_INIT(60 * 0xFFFFFFFFULL),
      .when_lightning_became_cool = 1320000,
      .testnet = false},
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC, .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE}},
      {.network_name = "viacoin-testnet",
      .bip173_name = "tvia",
      .genesis_blockhash = {{{.u.u8 = { 0xa0, 0x29, 0x3e, 0x4e, 0xeb, 0x3d, 0xa6, 0xe6, 0xf5, 0x6f, 0x81, 0xed, 0x59, 0x5f, 0x57, 0x88, 0x0d, 0x1a, 0x21, 0x56, 0x9e, 0x13, 0xee, 0xfd, 0xd9, 0x51, 0x28, 0x4b, 0x5a, 0x62, 0x66, 0x49 }}}},
@@ -64,7 +75,8 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT_INIT(60 * ((1 << 24) - 1)),
      .max_payment = AMOUNT_MSAT_INIT(60 * 0xFFFFFFFFULL),
      .when_lightning_became_cool = 1,
-     .testnet = true}
+     .testnet = true,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE}}
 };
 
 const struct chainparams *chainparams_for_network(const char *network_name)
