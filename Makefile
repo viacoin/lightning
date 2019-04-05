@@ -15,12 +15,12 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := 3fef98d10695462edecc63cba05e4a96374f4664
+BOLTVERSION := da71867c840abe057d7a68f358dd9493e0e79110
 
 -include config.vars
 
 ifneq ($(VALGRIND),0)
-VG=valgrind -q --error-exitcode=7
+VG=VALGRIND=1 valgrind -q --error-exitcode=7
 VG_TEST_ARGS = --track-origins=yes --leak-check=full --show-reachable=yes --errors-for-leak-kinds=all
 endif
 
