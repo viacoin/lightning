@@ -27,6 +27,7 @@ closing_init,,channel_reestablish_len,u16
 closing_init,,channel_reestablish,channel_reestablish_len*u8
 closing_init,,final_scriptpubkey_len,u16
 closing_init,,final_scriptpubkey,final_scriptpubkey_len*u8
+closing_init,,last_remote_secret,struct secret
 
 # We received an offer, save signature.
 closing_received_signature,2002
@@ -34,6 +35,7 @@ closing_received_signature,,signature,struct bitcoin_signature
 closing_received_signature,,tx,struct bitcoin_tx
 
 closing_received_signature_reply,2102
+closing_received_signature_reply,,closing_txid,struct bitcoin_txid
 
 # Negotiations complete, we're exiting.
 closing_complete,2004

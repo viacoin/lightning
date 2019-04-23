@@ -112,11 +112,36 @@ static void do_reconnect(struct crypto_state *cs,
 			 const u64 next_index[NUM_SIDES],
 			 u64 revocations_received,
 			 const u8 *channel_reestablish,
-			 const u8 *final_scriptpubkey)
+			 const u8 *final_scriptpubkey,
+			 const struct secret *last_remote_per_commit_secret)
 {
 	u8 *msg;
 	struct channel_id their_channel_id;
 	u64 next_local_commitment_number, next_remote_revocation_number;
+	struct pubkey my_current_per_commitment_point;
+	struct secret *s;
+
+	/* Our current per-commitment point is the commitment point in the last
+	 * received signed commitment; HSM gives us that and the previous
+	 * secret (which we don't need). */
+	msg = towire_hsm_get_per_commitment_point(NULL,
+						  next_index[LOCAL]-1);
+	if (!wire_sync_write(HSM_FD, take(msg)))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Writing get_per_commitment_point to HSM: %s",
+			      strerror(errno));
+
+	msg = wire_sync_read(tmpctx, HSM_FD);
+	if (!msg)
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Reading resp get_per_commitment_point reply: %s",
+			      strerror(errno));
+	if (!fromwire_hsm_get_per_commitment_point_reply(tmpctx, msg,
+					&my_current_per_commitment_point,
+					&s))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Bad per_commitment_point reply %s",
+			      tal_hex(tmpctx, msg));
 
 	/* BOLT #2:
 	 *
@@ -135,14 +160,28 @@ static void do_reconnect(struct crypto_state *cs,
 	 *   - MUST set `next_remote_revocation_number` to the commitment number
 	 *     of the next `revoke_and_ack` message it expects to receive.
 	 */
-	msg = towire_channel_reestablish(NULL, channel_id,
+
+	/* We're always allowed to send extra fields, so we send dataloss_protect
+	 * even if we didn't negotiate it */
+	msg = towire_channel_reestablish_option_data_loss_protect(NULL, channel_id,
 					 next_index[LOCAL],
-					 revocations_received);
+					 revocations_received,
+					 last_remote_per_commit_secret,
+					 &my_current_per_commitment_point);
 	sync_crypto_write(cs, PEER_FD, take(msg));
 
 	/* They might have already send reestablish, which triggered us */
-	if (!channel_reestablish)
-		channel_reestablish = closing_read_peer_msg(tmpctx, cs, channel_id);
+	if (!channel_reestablish) {
+		do {
+			tal_free(channel_reestablish);
+			channel_reestablish = closing_read_peer_msg(tmpctx, cs,
+								    channel_id);
+			/* They *should* send reestablish first, but lnd
+			 * sends other messages, which we can ignore since
+			 * we're closing anyway... */
+		} while (fromwire_peektype(channel_reestablish)
+			 != WIRE_CHANNEL_REESTABLISH);
+	}
 
 	if (!fromwire_channel_reestablish(channel_reestablish, &their_channel_id,
 					  &next_local_commitment_number,
@@ -229,7 +268,8 @@ static void send_offer(struct crypto_state *cs,
 }
 
 static void tell_master_their_offer(const struct bitcoin_signature *their_sig,
-				    const struct bitcoin_tx *tx)
+				    const struct bitcoin_tx *tx,
+				    struct bitcoin_txid *tx_id)
 {
 	u8 *msg = towire_closing_received_signature(NULL, their_sig, tx);
 	if (!wire_sync_write(REQ_FD, take(msg)))
@@ -239,7 +279,7 @@ static void tell_master_their_offer(const struct bitcoin_signature *their_sig,
 
 	/* Wait for master to ack, to make sure it's in db. */
 	msg = wire_sync_read(NULL, REQ_FD);
-	if (!fromwire_closing_received_signature_reply(msg))
+	if (!fromwire_closing_received_signature_reply(msg, tx_id))
 		master_badmsg(WIRE_CLOSING_RECEIVED_SIGNATURE_REPLY, msg);
 	tal_free(msg);
 }
@@ -257,7 +297,8 @@ receive_offer(struct crypto_state *cs,
 	      const struct amount_sat out[NUM_SIDES],
 	      enum side funder,
 	      struct amount_sat our_dust_limit,
-	      struct amount_sat min_fee_to_accept)
+	      struct amount_sat min_fee_to_accept,
+	      struct bitcoin_txid *closing_txid)
 {
 	u8 *msg;
 	struct channel_id their_channel_id;
@@ -360,7 +401,7 @@ receive_offer(struct crypto_state *cs,
 	/* Master sorts out what is best offer, we just tell it any above min */
 	if (amount_sat_greater_eq(received_fee, min_fee_to_accept)) {
 		status_trace("...offer is reasonable");
-		tell_master_their_offer(&their_sig, tx);
+		tell_master_their_offer(&their_sig, tx, closing_txid);
 	}
 
 	return received_fee;
@@ -496,7 +537,7 @@ int main(int argc, char *argv[])
 	const tal_t *ctx = tal(NULL, char);
 	u8 *msg;
 	struct pubkey funding_pubkey[NUM_SIDES];
-	struct bitcoin_txid funding_txid;
+	struct bitcoin_txid funding_txid, closing_txid;
 	u16 funding_txout;
 	struct amount_sat funding, out[NUM_SIDES];
 	struct amount_sat our_dust_limit;
@@ -509,6 +550,7 @@ int main(int argc, char *argv[])
 	u64 next_index[NUM_SIDES], revocations_received;
 	enum side whose_turn;
 	u8 *channel_reestablish;
+	struct secret last_remote_per_commit_secret;
 
 	subdaemon_setup(argc, argv);
 
@@ -534,7 +576,8 @@ int main(int argc, char *argv[])
 				   &next_index[REMOTE],
 				   &revocations_received,
 				   &channel_reestablish,
-				   &final_scriptpubkey))
+				   &final_scriptpubkey,
+				   &last_remote_per_commit_secret))
 		master_badmsg(WIRE_CLOSING_INIT, msg);
 
 	status_trace("out = %s/%s",
@@ -553,7 +596,8 @@ int main(int argc, char *argv[])
 	if (reconnected)
 		do_reconnect(&cs, &channel_id,
 			     next_index, revocations_received,
-			     channel_reestablish, final_scriptpubkey);
+			     channel_reestablish, final_scriptpubkey,
+			     &last_remote_per_commit_secret);
 
 	/* We don't need this any more */
 	tal_free(final_scriptpubkey);
@@ -601,7 +645,8 @@ int main(int argc, char *argv[])
 						funding_txout, funding,
 						out, funder,
 						our_dust_limit,
-						min_fee_to_accept);
+						min_fee_to_accept,
+						&closing_txid);
 		}
 	}
 
@@ -642,14 +687,16 @@ int main(int argc, char *argv[])
 						funding_txout, funding,
 						out, funder,
 						our_dust_limit,
-						min_fee_to_accept);
+						min_fee_to_accept,
+						&closing_txid);
 		}
 
 		whose_turn = !whose_turn;
 	}
 
-	peer_billboard(true, "We agreed on a closing fee of %"PRIu64" satoshi",
-		       offer[LOCAL]);
+	peer_billboard(true, "We agreed on a closing fee of %"PRIu64" satoshi for tx:%s",
+		       offer[LOCAL],
+		       type_to_string(tmpctx, struct bitcoin_txid, &closing_txid));
 
 #if DEVELOPER
 	/* We don't listen for master commands, so always check memleak here */

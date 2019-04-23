@@ -343,17 +343,19 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 			       ld->wallet->bip32_base);
 
 	log_debug(fc->uc->log, "Funding tx has %zi inputs, %zu outputs:",
-		  tal_count(fundingtx->input),
-		  tal_count(fundingtx->output));
+		  fundingtx->wtx->num_inputs,
+		  fundingtx->wtx->num_outputs);
 
-	for (size_t i = 0; i < tal_count(fundingtx->input); i++) {
+	for (size_t i = 0; i < fundingtx->wtx->num_inputs; i++) {
+		struct bitcoin_txid tmptxid;
+		bitcoin_tx_input_get_txid(fundingtx, i, &tmptxid);
 		log_debug(fc->uc->log, "%zi: %s (%s) %s\n",
 			  i,
 			  type_to_string(tmpctx, struct amount_sat,
 					 &fc->wtx.utxos[i]->amount),
 			  fc->wtx.utxos[i]->is_p2sh ? "P2SH" : "SEGWIT",
 			  type_to_string(tmpctx, struct bitcoin_txid,
-					 &fundingtx->input[i].txid));
+					 &tmptxid));
 	}
 
 	bitcoin_txid(fundingtx, &funding_txid);
@@ -433,8 +435,8 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	/* Make sure we recognize our change output by its scriptpubkey in
 	 * future. This assumes that we have only two outputs, may not be true
 	 * if we add support for multifundchannel */
-	if (tal_count(fundingtx->output) == 2)
-		txfilter_add_scriptpubkey(ld->owned_txfilter, fundingtx->output[!funding_outnum].script);
+	if (fundingtx->wtx->num_outputs == 2)
+		txfilter_add_scriptpubkey(ld->owned_txfilter, bitcoin_tx_output_get_script(tmpctx, fundingtx, !funding_outnum));
 
 	/* We need these to compose cmd's response in funding_broadcast_success */
 	fc->hextx = tal_hex(fc, linearize_tx(fc->cmd, fundingtx));
@@ -636,7 +638,7 @@ new_uncommitted_channel(struct peer *peer)
 	uc->transient_billboard = NULL;
 	uc->dbid = wallet_get_channel_dbid(ld->wallet);
 
-	idname = type_to_string(uc, struct pubkey, &uc->peer->id);
+	idname = type_to_string(uc, struct node_id, &uc->peer->id);
 	uc->log = new_log(uc, uc->peer->log_book, "%s chan #%"PRIu64":",
 			  idname, uc->dbid);
 	tal_free(idname);
@@ -658,10 +660,26 @@ static void channel_config(struct lightningd *ld,
 			   u32 *max_to_self_delay,
 			   struct amount_msat *min_effective_htlc_capacity)
 {
+	struct amount_msat dust_limit;
+
 	/* FIXME: depend on feerate. */
 	*max_to_self_delay = ld->config.locktime_max;
-	/* This is 1c at $1000/BTC */
-	*min_effective_htlc_capacity = AMOUNT_MSAT(1000000);
+
+	/* Take minimal effective capacity from config min_capacity_sat */
+	if (!amount_msat_from_sat_u64(min_effective_htlc_capacity,
+				ld->config.min_capacity_sat))
+		fatal("amount_msat overflow for config.min_capacity_sat");
+	/* Substract 2 * dust_limit, so fundchannel with min value is possible */
+	if (!amount_sat_to_msat(&dust_limit, get_chainparams(ld)->dust_limit))
+		fatal("amount_msat overflow for dustlimit");
+	if (!amount_msat_sub(min_effective_htlc_capacity,
+				*min_effective_htlc_capacity,
+				dust_limit))
+		*min_effective_htlc_capacity = AMOUNT_MSAT(0);
+	if (!amount_msat_sub(min_effective_htlc_capacity,
+				*min_effective_htlc_capacity,
+				dust_limit))
+		*min_effective_htlc_capacity = AMOUNT_MSAT(0);
 
 	/* BOLT #2:
 	 *
@@ -829,7 +847,7 @@ static struct command_result *json_fund_channel(struct command *cmd,
 {
 	struct command_result *res;
 	struct funding_channel * fc = tal(cmd, struct funding_channel);
-	struct pubkey *id;
+	struct node_id *id;
 	struct peer *peer;
 	struct channel *channel;
 	u32 *feerate_per_kw, *minconf, maxheight;
@@ -843,7 +861,7 @@ static struct command_result *json_fund_channel(struct command *cmd,
 	fc->uc = NULL;
 	wtx_init(cmd, &fc->wtx, max_funding_satoshi);
 	if (!param(fc->cmd, buffer, params,
-		   p_req("id", param_pubkey, &id),
+		   p_req("id", param_node_id, &id),
 		   p_req("satoshi", param_wtx, &fc->wtx),
 		   p_opt("feerate", param_feerate, &feerate_per_kw),
 		   p_opt_def("announce", param_bool, &announce_channel, true),
@@ -890,7 +908,7 @@ static struct command_result *json_fund_channel(struct command *cmd,
 	if (!*announce_channel) {
 		fc->channel_flags &= ~CHANNEL_FLAGS_ANNOUNCE_CHANNEL;
 		log_info(peer->ld->log, "Will open private channel with node %s",
-			type_to_string(fc, struct pubkey, id));
+			type_to_string(fc, struct node_id, id));
 	}
 
 	maxheight = minconf_to_maxheight(*minconf, cmd->ld);

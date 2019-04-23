@@ -70,6 +70,14 @@ static void lockin_complete(struct channel *channel)
 	assert(channel->scid);
 	/* We set this once they're locked in. */
 	assert(channel->remote_funding_locked);
+
+	/* We might have already started shutting down */
+	if (channel->state != CHANNELD_AWAITING_LOCKIN) {
+		log_debug(channel->log, "Lockin complete, but state %s",
+			  channel_state_name(channel));
+		return;
+	}
+
 	channel_set_state(channel, CHANNELD_AWAITING_LOCKIN, CHANNELD_NORMAL);
 
 	/* Fees might have changed (and we use IMMEDIATE once we're funded),
@@ -222,7 +230,7 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 
 	/* And we never get these from channeld. */
 	case WIRE_CHANNEL_INIT:
-	case WIRE_CHANNEL_FUNDING_LOCKED:
+	case WIRE_CHANNEL_FUNDING_DEPTH:
 	case WIRE_CHANNEL_OFFER_HTLC:
 	case WIRE_CHANNEL_FULFILL_HTLC:
 	case WIRE_CHANNEL_FAIL_HTLC:
@@ -341,6 +349,7 @@ void peer_start_channeld(struct channel *channel,
 				      &channel->funding_txid,
 				      channel->funding_outnum,
 				      channel->funding,
+				      channel->minimum_depth,
 				      &channel->our_config,
 				      &channel->channel_info.their_config,
 				      channel->channel_info.feerate_per_kw,
@@ -393,32 +402,38 @@ void peer_start_channeld(struct channel *channel,
 		try_update_feerates(ld, channel);
 }
 
-bool channel_tell_funding_locked(struct lightningd *ld,
+bool channel_tell_depth(struct lightningd *ld,
 				 struct channel *channel,
 				 const struct bitcoin_txid *txid,
 				 u32 depth)
 {
+	const char *txidstr;
+
+	txidstr = type_to_string(tmpctx, struct bitcoin_txid, txid);
+
 	/* If not awaiting lockin/announce, it doesn't care any more */
 	if (channel->state != CHANNELD_AWAITING_LOCKIN
 	    && channel->state != CHANNELD_NORMAL) {
 		log_debug(channel->log,
-			  "Funding tx confirmed, but peer in state %s",
-			  channel_state_name(channel));
+			  "Funding tx %s confirmed, but peer in state %s",
+			  txidstr, channel_state_name(channel));
 		return true;
 	}
 
 	if (!channel->owner) {
 		log_debug(channel->log,
-			  "Funding tx confirmed, but peer disconnected");
+			  "Funding tx %s confirmed, but peer disconnected",
+			  txidstr);
 		return false;
 	}
 
 	subd_send_msg(channel->owner,
-		      take(towire_channel_funding_locked(NULL, channel->scid,
+		      take(towire_channel_funding_depth(NULL, channel->scid,
 							 depth)));
 
 	if (channel->remote_funding_locked
-	    && channel->state == CHANNELD_AWAITING_LOCKIN)
+	    && channel->state == CHANNELD_AWAITING_LOCKIN
+	    && depth >= channel->minimum_depth)
 		lockin_complete(channel);
 
 	return true;

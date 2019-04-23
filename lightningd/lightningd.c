@@ -116,6 +116,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_disconnect_fd = -1;
 	ld->dev_subdaemon_fail = false;
 	ld->dev_allow_localhost = false;
+	ld->dev_gossip_time = 0;
+	ld->dev_unknown_channel_satoshis = NULL;
 #endif
 
 	/*~ These are CCAN lists: an embedded double-linked list.  It's not
@@ -801,7 +803,7 @@ int main(int argc, char *argv[])
 	 * so it can use tal_bytelen() to get the length. */
 	log_info(ld->log, "--------------------------------------------------");
 	log_info(ld->log, "Server started with public key %s, alias %s (color #%s) and lightningd %s",
-		 type_to_string(tmpctx, struct pubkey, &ld->id),
+		 type_to_string(tmpctx, struct node_id, &ld->id),
 		 json_escape(tmpctx, (const char *)ld->alias)->s,
 		 tal_hex(tmpctx, ld->rgb), version());
 

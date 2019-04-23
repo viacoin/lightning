@@ -8,9 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- JSON API: New command `setchannelfee` sets channel specific routing fees.
 - JSON API: `newaddr` outputs `bech32` or `p2sh-segwit`, or both with new `all` parameter (#2390)
+- JSON API: `listpeers` status now shows how many confirmations until channel is open (#2405)
+- Config: Adds parameter `min-capacity-sat` to reject tiny channels.
+- JSON API: `listforwards` now includes the time an HTLC was received and when it was resolved. Both are expressed as UNIX timestamps to facilitate parsing (Issue [#2491](https://github.com/ElementsProject/lightning/issues/2491), PR [#2528](https://github.com/ElementsProject/lightning/pull/2528))
+- JSON API: new plugin `invoice_payment` hook for intercepting invoices before they're paid.
+- plugin: the `connected` hook can now send an `error_message` to the rejected peer.
 
 ### Changed
+
+- JSON API: `invoice` expiry defaults to 7 days, and can have s/m/h/d/w suffixes.
+- Config: Increased default amount for minimal channel capacity from 1k sat to 10k sat.
 
 ### Deprecated
 
@@ -21,9 +30,17 @@ changes.
 
 ### Removed
 
+- JSON RPC: `global_features` and `local_features` fields and `listchannels`' `flags` field.  (Deprecated since 0.6.2).
+
 ### Fixed
 
+- protocol: reconnection during closing negotiation now supports
+  `option_data_loss_protect` properly.
 - `--bind-addr=<path>` fixed for nodes using local sockets (eg. testing).
+- Unannounced local channels were forgotten for routing on restart until reconnection occurred.
+- lightning-cli: arguments containing `"` now succeed, rather than causing JSON errors.
+- protocol: handle lnd sending more messages before `reestablish`; don't fail channel, and handle older lnd's spurious empty commitments.
+- Fixed `fundchannel` crash when we have many UTXOs and we skip unconfirmed ones.
 
 ### Security
 
@@ -59,7 +76,6 @@ This release named by Mark Beckwith @wythe.
 - JSON API: `listpayments` is now `listsendpays`.
 - lightning-cli: `help <cmd>` finds man pages even if `make install` not run.
 - pylightning: New class 'Millisatoshi' can be used for JSON API, and new '_msat' fields are turned into this on reading.
-- JSON API: New command `setchannelfee` sets channel specific routing fees.
 
 ### Changed
 

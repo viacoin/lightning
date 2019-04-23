@@ -397,33 +397,37 @@ def test_gossip_persistence(node_factory, bitcoind):
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
     l3.rpc.connect(l4.info['id'], 'localhost', l4.port)
 
-    l1.fund_channel(l2, 10**6)
-    l2.fund_channel(l3, 10**6)
+    scid12 = l1.fund_channel(l2, 10**6)
+    scid23 = l2.fund_channel(l3, 10**6)
 
     # Make channels public, except for l3 -> l4, which is kept local-only for now
     bitcoind.generate_block(5)
-    l3.fund_channel(l4, 10**6)
+    scid34 = l3.fund_channel(l4, 10**6)
     bitcoind.generate_block(1)
 
-    def count_active(node):
+    def active(node):
         chans = node.rpc.listchannels()['channels']
-        active = [c for c in chans if c['active']]
-        return len(active)
+        return sorted([c['short_channel_id'] for c in chans if c['active']])
+
+    def non_public(node):
+        chans = node.rpc.listchannels()['channels']
+        return sorted([c['short_channel_id'] for c in chans if not c['public']])
 
     # Channels should be activated
-    wait_for(lambda: count_active(l1) == 4)
-    wait_for(lambda: count_active(l2) == 4)
-    wait_for(lambda: count_active(l3) == 6)  # 4 public + 2 local
+    wait_for(lambda: active(l1) == [scid12, scid12, scid23, scid23])
+    wait_for(lambda: active(l2) == [scid12, scid12, scid23, scid23])
+    # This one sees its private channel
+    wait_for(lambda: active(l3) == [scid12, scid12, scid23, scid23, scid34, scid34])
 
     # l1 restarts and doesn't connect, but loads from persisted store, all
     # local channels should be disabled, leaving only the two l2 <-> l3
     # directions
     l1.restart()
-    wait_for(lambda: count_active(l1) == 2)
+    wait_for(lambda: active(l1) == [scid23, scid23])
 
     # Now reconnect, they should re-enable the two l1 <-> l2 directions
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    wait_for(lambda: count_active(l1) == 4)
+    wait_for(lambda: active(l1) == [scid12, scid12, scid23, scid23])
 
     # Now spend the funding tx, generate a block and see others deleting the
     # channel from their network view
@@ -431,32 +435,26 @@ def test_gossip_persistence(node_factory, bitcoind):
     time.sleep(1)
     bitcoind.generate_block(1)
 
-    wait_for(lambda: count_active(l1) == 2)
-    wait_for(lambda: count_active(l2) == 2)
-    wait_for(lambda: count_active(l3) == 4)  # 2 public + 2 local
-
-    # We should have one local-only channel
-    def count_non_public(node):
-        chans = node.rpc.listchannels()['channels']
-        nonpublic = [c for c in chans if not c['public']]
-        return len(nonpublic)
+    wait_for(lambda: active(l1) == [scid23, scid23])
+    wait_for(lambda: active(l2) == [scid23, scid23])
+    wait_for(lambda: active(l3) == [scid23, scid23, scid34, scid34])
 
     # The channel l3 -> l4 should be known only to them
-    assert count_non_public(l1) == 0
-    assert count_non_public(l2) == 0
-    wait_for(lambda: count_non_public(l3) == 2)
-    wait_for(lambda: count_non_public(l4) == 2)
+    assert non_public(l1) == []
+    assert non_public(l2) == []
+    wait_for(lambda: non_public(l3) == [scid34, scid34])
+    wait_for(lambda: non_public(l4) == [scid34, scid34])
 
     # Finally, it should also remember the deletion after a restart
     l3.restart()
     l4.restart()
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
     l3.rpc.connect(l4.info['id'], 'localhost', l4.port)
-    wait_for(lambda: count_active(l3) == 4)  # 2 public + 2 local
+    wait_for(lambda: active(l3) == [scid23, scid23, scid34, scid34])
 
     # Both l3 and l4 should remember their local-only channel
-    wait_for(lambda: count_non_public(l3) == 2)
-    wait_for(lambda: count_non_public(l4) == 2)
+    wait_for(lambda: non_public(l3) == [scid34, scid34])
+    wait_for(lambda: non_public(l4) == [scid34, scid34])
 
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
@@ -879,7 +877,7 @@ def test_gossip_store_load(node_factory):
 
     l1.start()
     # May preceed the Started msg waited for in 'start'.
-    wait_for(lambda: l1.daemon.is_in_log('gossip_store: Read 1/1/1/0 cannounce/cupdate/nannounce/cdelete from store in 744 bytes'))
+    wait_for(lambda: l1.daemon.is_in_log('gossip_store: Read 1/1/1/0 cannounce/cupdate/nannounce/cdelete from store in 756 bytes'))
     assert not l1.daemon.is_in_log('gossip_store.*truncating')
 
 
@@ -1031,3 +1029,53 @@ def test_getroute_exclude(node_factory, bitcoind):
     # This doesn't
     with pytest.raises(RpcError):
         l1.rpc.getroute(l4.info['id'], 1, 1, exclude=[chan_l2l3, chan_l2l4])
+
+
+@unittest.skipIf(not DEVELOPER, "need dev-compact-gossip-store")
+def test_gossip_store_local_channels(node_factory, bitcoind):
+    l1, l2 = node_factory.line_graph(2, wait_for_announce=False)
+
+    # We see this channel, even though it's not announced, because it's local.
+    wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 2)
+
+    l2.stop()
+    l1.restart()
+
+    # We should still see local channels!
+    time.sleep(3)  # Make sure store is loaded
+    chans = l1.rpc.listchannels()['channels']
+    assert len(chans) == 2
+
+    # Now compact store
+    l1.rpc.call('dev-compact-gossip-store')
+    l1.restart()
+
+    time.sleep(3)  # Make sure store is loaded
+    # We should still see local channels!
+    chans = l1.rpc.listchannels()['channels']
+    assert len(chans) == 2
+
+
+@unittest.skipIf(not DEVELOPER, "need dev-compact-gossip-store")
+def test_gossip_store_private_channels(node_factory, bitcoind):
+    l1, l2 = node_factory.line_graph(2, announce_channels=False)
+
+    # We see this channel, even though it's not announced, because it's local.
+    wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 2)
+
+    l2.stop()
+    l1.restart()
+
+    # We should still see local channels!
+    time.sleep(3)  # Make sure store is loaded
+    chans = l1.rpc.listchannels()['channels']
+    assert len(chans) == 2
+
+    # Now compact store
+    l1.rpc.call('dev-compact-gossip-store')
+    l1.restart()
+
+    time.sleep(3)  # Make sure store is loaded
+    # We should still see local channels!
+    chans = l1.rpc.listchannels()['channels']
+    assert len(chans) == 2

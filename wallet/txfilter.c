@@ -59,7 +59,7 @@ void txfilter_add_scriptpubkey(struct txfilter *filter, const u8 *script TAKES)
 }
 
 void txfilter_add_derkey(struct txfilter *filter,
-			 const u8 derkey[PUBKEY_DER_LEN])
+			 const u8 derkey[PUBKEY_CMPR_LEN])
 {
 	u8 *skp, *p2sh;
 
@@ -73,8 +73,8 @@ void txfilter_add_derkey(struct txfilter *filter,
 
 bool txfilter_match(const struct txfilter *filter, const struct bitcoin_tx *tx)
 {
-	for (size_t i = 0; i < tal_count(tx->output); i++) {
-		u8 *oscript = tx->output[i].script;
+	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
+		const u8 *oscript = bitcoin_tx_output_get_script(tmpctx, tx, i);
 
 		for (size_t j = 0; j < tal_count(filter->scriptpubkeys); j++) {
 			if (scripteq(oscript, filter->scriptpubkeys[j]))

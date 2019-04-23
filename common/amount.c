@@ -370,6 +370,19 @@ bool amount_msat_to_u32(struct amount_msat msat, u32 *millisatoshis)
 	return true;
 }
 
+void amount_msat_from_u64(struct amount_msat *msat, u64 millisatoshis)
+{
+	msat->millisatoshis = millisatoshis;
+}
+
+WARN_UNUSED_RESULT bool amount_msat_from_sat_u64(struct amount_msat *msat, u64 satoshis)
+{
+	if (mul_overflows_u64(satoshis, MSAT_PER_SAT))
+		return false;
+	msat->millisatoshis = satoshis * MSAT_PER_SAT;
+	return true;
+}
+
 bool amount_msat_fee(struct amount_msat *fee,
 		     struct amount_msat amt,
 		     u32 fee_base_msat,

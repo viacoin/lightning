@@ -38,6 +38,9 @@ struct channel {
 	/* satoshis in from commitment tx */
 	struct amount_sat funding;
 
+	/* confirmations needed for locking funding */
+	u32 minimum_depth;
+
 	/* Who is paying fees. */
 	enum side funder;
 
@@ -69,6 +72,7 @@ struct channel {
  * @chain_hash: Which blockchain are we talking about?
  * @funding_txid: The commitment transaction id.
  * @funding_txout: The commitment transaction output number.
+ * @minimum_depth: The minimum confirmations needed for funding transaction.
  * @funding_satoshis: The commitment transaction amount.
  * @local_msatoshi: The amount for the local side (remainder goes to remote)
  * @feerate_per_kw: feerate per kiloweight (satoshis) for the commitment
@@ -87,6 +91,7 @@ struct channel *new_initial_channel(const tal_t *ctx,
 				    const struct bitcoin_blkid *chain_hash,
 				    const struct bitcoin_txid *funding_txid,
 				    unsigned int funding_txout,
+				    u32 minimum_depth,
 				    struct amount_sat funding,
 				    struct amount_msat local_msatoshi,
 				    u32 feerate_per_kw,
@@ -106,6 +111,7 @@ struct channel *new_initial_channel(const tal_t *ctx,
  * @channel: The channel to evaluate
  * @per_commitment_point: Per-commitment point to determine keys
  * @side: which side to get the commitment transaction for
+ * @err_reason: When NULL is returned, this will point to a human readable reason.
  *
  * Returns the unsigned initial commitment transaction for @side, or NULL
  * if the channel size was insufficient to cover fees or reserves.
@@ -114,6 +120,7 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				      const u8 **wscript,
 				      const struct channel *channel,
 				      const struct pubkey *per_commitment_point,
-				      enum side side);
+				      enum side side,
+				      char** err_reason);
 
 #endif /* LIGHTNING_COMMON_INITIAL_CHANNEL_H */

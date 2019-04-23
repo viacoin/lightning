@@ -376,6 +376,9 @@ static void config_register_opts(struct lightningd *ld)
 	opt_register_arg("--fee-per-satoshi", opt_set_u32, opt_show_u32,
 			 &ld->config.fee_per_satoshi,
 			 "Microsatoshi fee for every satoshi in HTLC");
+	opt_register_arg("--min-capacity-sat", opt_set_u64, opt_show_u64,
+			 &ld->config.min_capacity_sat,
+			 "Minimum capacity in satoshis for accepting channels");
 	opt_register_arg("--addr", opt_add_addr, NULL,
 			 ld,
 			 "Set an IP address (v4 or v6) to listen on and announce to the network for incoming connections");
@@ -443,6 +446,15 @@ static char *opt_subprocess_debug(const char *optarg, struct lightningd *ld)
 	return NULL;
 }
 
+static char *opt_set_dev_unknown_channel_satoshis(const char *optarg,
+						  struct lightningd *ld)
+{
+	tal_free(ld->dev_unknown_channel_satoshis);
+	ld->dev_unknown_channel_satoshis = tal(ld, struct amount_sat);
+	return opt_set_u64(optarg,
+			   &ld->dev_unknown_channel_satoshis->satoshis); /* Raw: dev code */
+}
+
 static void dev_register_opts(struct lightningd *ld)
 {
 	opt_register_noarg("--dev-no-reconnect", opt_set_invbool,
@@ -475,6 +487,13 @@ static void dev_register_opts(struct lightningd *ld)
 	    "--dev-channel-update-interval=<s>", opt_set_u32, opt_show_u32,
 	    &ld->config.channel_update_interval,
 	    "Time in seconds between channel updates for our own channels.");
+
+	opt_register_arg("--dev-gossip-time", opt_set_u32, opt_show_u32,
+			 &ld->dev_gossip_time,
+			 "UNIX time to override gossipd to use.");
+	opt_register_arg("--dev-unknown-channel-satoshis",
+			 opt_set_dev_unknown_channel_satoshis, NULL, ld,
+			 "Amount to pretend is in channels which we can't find funding tx for.");
 }
 #endif
 
@@ -528,6 +547,9 @@ static const struct config testnet_config = {
 	.max_fee_multiplier = 10,
 
 	.use_dns = true,
+
+	/* Sets min_effective_htlc_capacity - at 1000$/BTC this is 10ct */
+	.min_capacity_sat = 10000,
 };
 
 /* aka. "Dude, where's my coins?" */
@@ -591,6 +613,9 @@ static const struct config mainnet_config = {
 	.max_fee_multiplier = 10,
 
 	.use_dns = true,
+
+	/* Sets min_effective_htlc_capacity - at 1000$/BTC this is 10ct */
+	.min_capacity_sat = 10000,
 };
 
 static void check_config(struct lightningd *ld)
@@ -820,19 +845,16 @@ static const char *codename_noun[]
 
 void setup_color_and_alias(struct lightningd *ld)
 {
-	u8 der[PUBKEY_DER_LEN];
-	pubkey_to_der(der, &ld->id);
-
 	if (!ld->rgb)
 		/* You can't get much red by default */
-		ld->rgb = tal_dup_arr(ld, u8, der, 3, 0);
+		ld->rgb = tal_dup_arr(ld, u8, ld->id.k, 3, 0);
 
 	if (!ld->alias) {
 		u64 adjective, noun;
 		char *name;
 
-		memcpy(&adjective, der+3, sizeof(adjective));
-		memcpy(&noun, der+3+sizeof(adjective), sizeof(noun));
+		memcpy(&adjective, ld->id.k+3, sizeof(adjective));
+		memcpy(&noun, ld->id.k+3+sizeof(adjective), sizeof(noun));
 		noun %= ARRAY_SIZE(codename_noun);
 		adjective %= ARRAY_SIZE(codename_adjective);
 

@@ -12,6 +12,7 @@ struct channel *new_initial_channel(const tal_t *ctx,
 				    const struct bitcoin_blkid *chain_hash,
 				    const struct bitcoin_txid *funding_txid,
 				    unsigned int funding_txout,
+				    u32 minimum_depth,
 				    struct amount_sat funding,
 				    struct amount_msat local_msatoshi,
 				    u32 feerate_per_kw,
@@ -29,6 +30,7 @@ struct channel *new_initial_channel(const tal_t *ctx,
 	channel->funding_txid = *funding_txid;
 	channel->funding_txout = funding_txout;
 	channel->funding = funding;
+	channel->minimum_depth = minimum_depth;
 	if (!amount_sat_sub_msat(&remote_msatoshi,
 				 channel->funding, local_msatoshi))
 		return tal_free(channel);
@@ -71,7 +73,8 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				      const u8 **wscript,
 				      const struct channel *channel,
 				      const struct pubkey *per_commitment_point,
-				      enum side side)
+				      enum side side,
+				      char** err_reason)
 {
 	struct keyset keyset;
 
@@ -81,8 +84,10 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 	if (!derive_keyset(per_commitment_point,
 			   &channel->basepoints[side],
 			   &channel->basepoints[!side],
-			   &keyset))
+			   &keyset)){
+		*err_reason = "Cannot derive keyset";
 		return NULL;
+	}
 
 	*wscript = bitcoin_redeem_2of2(ctx,
 				       &channel->funding_pubkey[side],
@@ -101,7 +106,8 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				 channel->view[side].owed[!side],
 				 channel->config[!side].channel_reserve,
 				 0 ^ channel->commitment_number_obscurer,
-				 side);
+				 side,
+				 err_reason);
 }
 
 static char *fmt_channel_view(const tal_t *ctx, const struct channel_view *view)

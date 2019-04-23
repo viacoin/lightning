@@ -595,6 +595,16 @@ def test_address(node_factory):
     l2 = node_factory.get_node()
     l2.rpc.connect(l1.info['id'], l1.daemon.opts['bind-addr'])
 
+    # 'addr' with local socket works too.
+    l1.stop()
+    del l1.daemon.opts['bind-addr']
+    l1.daemon.opts['addr'] = os.path.join(l1.daemon.lightning_dir, "sock")
+    # start expects a port, so we open-code here.
+    l1.daemon.start()
+
+    l2 = node_factory.get_node()
+    l2.rpc.connect(l1.info['id'], l1.daemon.opts['addr'])
+
 
 def test_listconfigs(node_factory, bitcoind):
     l1 = node_factory.get_node()
@@ -779,6 +789,27 @@ def test_cli(node_factory):
                                        'sendpay']).decode('utf-8')
     except Exception:
         pass
+
+    # Test it escapes JSON properly in both method and params.
+    out = subprocess.run(['cli/lightning-cli',
+                          '--lightning-dir={}'
+                          .format(l1.daemon.lightning_dir),
+                          'x"[]{}'],
+                         stdout=subprocess.PIPE)
+    assert 'Unknown command \'x\\"[]{}\'' in out.stdout.decode('utf-8')
+
+    subprocess.check_output(['cli/lightning-cli',
+                             '--lightning-dir={}'
+                             .format(l1.daemon.lightning_dir),
+                             'invoice', '123000', 'l"[]{}', 'd"[]{}']).decode('utf-8')
+    # Check label is correct, and also that cli's keyword parsing works.
+    out = subprocess.check_output(['cli/lightning-cli',
+                                   '--lightning-dir={}'
+                                   .format(l1.daemon.lightning_dir),
+                                   '-k',
+                                   'listinvoices', 'label=l"[]{}']).decode('utf-8')
+    j = json.loads(out)
+    assert only_one(j['invoices'])['label'] == 'l"[]{}'
 
 
 def test_daemon_option(node_factory):

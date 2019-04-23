@@ -28,6 +28,9 @@ void fromwire_bitcoin_txid(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
 /* Generated stub for fromwire_bool */
 bool fromwire_bool(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_bool called!\n"); abort(); }
+/* Generated stub for fromwire_node_id */
+void fromwire_node_id(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct node_id *id UNNEEDED)
+{ fprintf(stderr, "fromwire_node_id called!\n"); abort(); }
 /* Generated stub for fromwire_pubkey */
 void fromwire_pubkey(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct pubkey *pubkey UNNEEDED)
 { fprintf(stderr, "fromwire_pubkey called!\n"); abort(); }
@@ -46,6 +49,9 @@ void towire_bitcoin_txid(u8 **pptr UNNEEDED, const struct bitcoin_txid *txid UNN
 /* Generated stub for towire_bool */
 void towire_bool(u8 **pptr UNNEEDED, bool v UNNEEDED)
 { fprintf(stderr, "towire_bool called!\n"); abort(); }
+/* Generated stub for towire_node_id */
+void towire_node_id(u8 **pptr UNNEEDED, const struct node_id *id UNNEEDED)
+{ fprintf(stderr, "towire_node_id called!\n"); abort(); }
 /* Generated stub for towire_pubkey */
 void towire_pubkey(u8 **pptr UNNEEDED, const struct pubkey *pubkey UNNEEDED)
 { fprintf(stderr, "towire_pubkey called!\n"); abort(); }
@@ -97,9 +103,10 @@ int main(void)
 	const struct utxo **utxomap;
 	struct amount_sat funding_sat;
 	u16 funding_outnum;
-	u8 *subscript;
+	u8 *subscript, *script;
 	struct bitcoin_signature sig;
 	struct bitcoin_address addr;
+	struct amount_sat tmpamt;
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
 						 | SECP256K1_CONTEXT_SIGN);
@@ -170,9 +177,11 @@ int main(void)
 			     &inputkey, NULL);
 	printf("# fee: %s\n",
 	       type_to_string(tmpctx, struct amount_sat, &fee));
+
+	tmpamt = bitcoin_tx_output_get_amount(funding, !funding_outnum);
 	printf("change: %s\n",
 	       type_to_string(tmpctx, struct amount_sat,
-			      &funding->output[!funding_outnum].amount));
+			      &tmpamt));
 
 	printf("funding output: %u\n", funding_outnum);
 
@@ -181,8 +190,8 @@ int main(void)
 	sign_tx_input(funding, 0, subscript, NULL, &input_privkey, &inputkey,
 		      SIGHASH_ALL, &sig);
 
-	funding->input[0].script = bitcoin_redeem_p2pkh(funding, &inputkey,
-							&sig);
+	script = bitcoin_redeem_p2pkh(funding, &inputkey, &sig);
+	bitcoin_tx_input_set_script(funding, 0, script);
 	printf("funding tx: %s\n",
 	       tal_hex(tmpctx, linearize_tx(tmpctx, funding)));
 

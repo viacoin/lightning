@@ -3,7 +3,9 @@ from fixtures import *  # noqa: F401,F403
 from lightning import RpcError, Millisatoshi
 from utils import only_one
 
+import os
 import pytest
+import sqlite3
 import subprocess
 import time
 
@@ -162,6 +164,11 @@ def test_plugin_connected_hook(node_factory):
     l3.connect(l1)
     l1.daemon.wait_for_log(r"{} is in reject list".format(l3.info['id']))
 
+    # FIXME: this error occurs *after* connection, so we connect then drop.
+    l3.daemon.wait_for_log(r"lightning_openingd-{} chan #1: peer_in WIRE_ERROR"
+                           .format(l1.info['id']))
+    l3.daemon.wait_for_log(r"You are in reject list")
+
     peer = l1.rpc.listpeers(l3.info['id'])['peers']
     assert(peer == [] or not peer[0]['connected'])
 
@@ -190,6 +197,31 @@ def test_async_rpcmethod(node_factory, executor):
     assert [r.result() for r in results] == [42] * len(results)
 
 
+def test_db_hook(node_factory, executor):
+    """This tests the db hook."""
+    dbfile = os.path.join(node_factory.directory, "dblog.sqlite3")
+    l1 = node_factory.get_node(options={'plugin': 'tests/plugins/dblog.py',
+                                        'dblog-file': dbfile})
+
+    # It should see the db being created, and sometime later actually get
+    # initted.
+    # This precedes startup, so needle already past
+    assert l1.daemon.is_in_log('plugin-dblog.py deferring 1 commands')
+    l1.daemon.logsearch_start = 0
+    l1.daemon.wait_for_log('plugin-dblog.py replaying pre-init data:')
+    l1.daemon.wait_for_log('plugin-dblog.py PRAGMA foreign_keys = ON;')
+    l1.daemon.wait_for_log('plugin-dblog.py CREATE TABLE version \\(version INTEGER\\)')
+    l1.daemon.wait_for_log('plugin-dblog.py initialized')
+
+    l1.stop()
+
+    # Databases should be identical.
+    db1 = sqlite3.connect(os.path.join(l1.daemon.lightning_dir, 'lightningd.sqlite3'))
+    db2 = sqlite3.connect(dbfile)
+
+    assert [x for x in db1.iterdump()] == [x for x in db2.iterdump()]
+
+
 def test_utf8_passthrough(node_factory, executor):
     l1 = node_factory.get_node(options={'plugin': 'tests/plugins/utf8.py',
                                         'log-level': 'io'})
@@ -205,4 +237,31 @@ def test_utf8_passthrough(node_factory, executor):
                                    .format(l1.daemon.lightning_dir),
                                    'utf8', 'ナンセンス 1杯']).decode('utf-8')
     assert '\\u' not in out
-    assert out == '{"utf8": "ナンセンス 1杯"}\n'
+    assert out == '{\n   "utf8" : "ナンセンス 1杯"\n}\n'
+
+
+def test_invoice_payment_hook(node_factory):
+    """ l1 uses the reject-payment plugin to reject invoices with odd preimages.
+    """
+    opts = [{}, {'plugin': 'tests/plugins/reject_some_invoices.py'}]
+    l1, l2 = node_factory.line_graph(2, opts=opts)
+
+    # This one works
+    inv1 = l2.rpc.invoice(123000, 'label', 'description', preimage='1' * 64)
+    l1.rpc.pay(inv1['bolt11'])
+
+    l2.daemon.wait_for_log('label=label')
+    l2.daemon.wait_for_log('msat=')
+    l2.daemon.wait_for_log('preimage=' + '1' * 64)
+
+    # This one will be rejected.
+    inv2 = l2.rpc.invoice(123000, 'label2', 'description', preimage='0' * 64)
+    with pytest.raises(RpcError):
+        l1.rpc.pay(inv2['bolt11'])
+
+    pstatus = l1.rpc.call('paystatus', [inv2['bolt11']])['pay'][0]
+    assert pstatus['attempts'][0]['failure']['data']['failcodename'] == 'WIRE_TEMPORARY_NODE_FAILURE'
+
+    l2.daemon.wait_for_log('label=label2')
+    l2.daemon.wait_for_log('msat=')
+    l2.daemon.wait_for_log('preimage=' + '0' * 64)

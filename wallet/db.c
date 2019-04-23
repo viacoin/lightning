@@ -3,12 +3,15 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/tal/str/str.h>
 #include <common/json_escaped.h>
+#include <common/node_id.h>
 #include <common/version.h>
 #include <inttypes.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/plugin_hook.h>
 
 #define DB_FILE "lightningd.sqlite3"
+#define NSEC_IN_SEC 1000000000
 
 /* For testing, we want to catch fatal messages. */
 #ifndef db_fatal
@@ -373,6 +376,9 @@ static struct migration dbmigrations[] = {
 	{ "ALTER TABLE channels ADD feerate_base INTEGER;", NULL },
 	{ "ALTER TABLE channels ADD feerate_ppm INTEGER;", NULL },
 	{ NULL, migrate_pr2342_feerate_per_channel },
+	{ "ALTER TABLE channel_htlcs ADD received_time INTEGER", NULL },
+	{ "ALTER TABLE forwarded_payments ADD received_time INTEGER", NULL },
+	{ "ALTER TABLE forwarded_payments ADD resolved_time INTEGER", NULL },
 };
 
 /* Leak tracking. */
@@ -434,12 +440,58 @@ void db_assert_no_outstanding_statements(void)
 }
 #endif
 
+#if !HAVE_SQLITE3_EXPANDED_SQL
+/* Prior to sqlite3 v3.14, we have to use tracing to dump statements */
+static void trace_sqlite3(void *dbv, const char *stmt)
+{
+	struct db *db = dbv;
+
+	/* We get a "COMMIT;" after we've sent our changes. */
+	if (!db->changes) {
+		assert(streq(stmt, "COMMIT;"));
+		return;
+	}
+
+	tal_arr_expand(&db->changes, tal_strdup(db->changes, stmt));
+}
+#endif
+
 void db_stmt_done(sqlite3_stmt *stmt)
 {
 	dev_statement_end(stmt);
 	sqlite3_finalize(stmt);
 }
 
+sqlite3_stmt *db_select_prepare_(const char *location, struct db *db, const char *query)
+{
+	int err;
+	sqlite3_stmt *stmt;
+	const char *full_query = tal_fmt(db, "SELECT %s", query);
+
+	assert(db->in_transaction);
+
+	err = sqlite3_prepare_v2(db->sql, full_query, -1, &stmt, NULL);
+
+	if (err != SQLITE_OK)
+		db_fatal("%s: %s: %s", location, full_query, sqlite3_errmsg(db->sql));
+
+	dev_statement_start(stmt, location);
+	tal_free(full_query);
+	return stmt;
+}
+
+bool db_select_step_(const char *location, struct db *db, struct sqlite3_stmt *stmt)
+{
+	int ret;
+
+	ret = sqlite3_step(stmt);
+	if (ret == SQLITE_ROW)
+		return true;
+	if (ret != SQLITE_DONE)
+		db_fatal("%s: %s", location, sqlite3_errmsg(db->sql));
+	db_stmt_done(stmt);
+	return false;
+}
 sqlite3_stmt *db_prepare_(const char *location, struct db *db, const char *query)
 {
 	int err;
@@ -463,6 +515,13 @@ void db_exec_prepared_(const char *caller, struct db *db, sqlite3_stmt *stmt)
 	if (sqlite3_step(stmt) !=  SQLITE_DONE)
 		db_fatal("%s: %s", caller, sqlite3_errmsg(db->sql));
 
+#if HAVE_SQLITE3_EXPANDED_SQL
+	char *expanded_sql;
+	expanded_sql = sqlite3_expanded_sql(stmt);
+	tal_arr_expand(&db->changes,
+		       tal_strdup(db->changes, expanded_sql));
+	sqlite3_free(expanded_sql);
+#endif
 	db_stmt_done(stmt);
 }
 
@@ -478,6 +537,9 @@ static void db_do_exec(const char *caller, struct db *db, const char *cmd)
 		/* Only reached in testing */
 		sqlite3_free(errmsg);
 	}
+#if HAVE_SQLITE3_EXPANDED_SQL
+	tal_arr_expand(&db->changes, tal_strdup(db->changes, cmd));
+#endif
 }
 
 static void PRINTF_FMT(3, 4)
@@ -496,39 +558,39 @@ static void PRINTF_FMT(3, 4)
 	tal_free(cmd);
 }
 
-bool db_exec_prepared_mayfail_(const char *caller UNUSED, struct db *db, sqlite3_stmt *stmt)
+/* This one can fail: returns NULL if so */
+static sqlite3_stmt *db_query(const char *location,
+			      struct db *db, const char *query)
 {
+	sqlite3_stmt *stmt;
+
 	assert(db->in_transaction);
 
-	if (sqlite3_step(stmt) != SQLITE_DONE) {
-		goto fail;
-	}
-
-	db_stmt_done(stmt);
-	return true;
-fail:
-	db_stmt_done(stmt);
-	return false;
+	/* Sets stmt to NULL if not SQLITE_OK */
+	sqlite3_prepare_v2(db->sql, query, -1, &stmt, NULL);
+	if (stmt)
+		dev_statement_start(stmt, location);
+	return stmt;
 }
 
 sqlite3_stmt *PRINTF_FMT(3, 4)
-    db_query_(const char *location, struct db *db, const char *fmt, ...)
+    db_select_(const char *location, struct db *db, const char *fmt, ...)
 {
 	va_list ap;
-	char *query;
+	char *query = tal_strdup(db, "SELECT ");
 	sqlite3_stmt *stmt;
 
 	assert(db->in_transaction);
 
 	va_start(ap, fmt);
-	query = tal_vfmt(db, fmt, ap);
+ 	tal_append_vfmt(&query, fmt, ap);
 	va_end(ap);
 
-	/* Sets stmt to NULL if not SQLITE_OK */
-	sqlite3_prepare_v2(db->sql, query, -1, &stmt, NULL);
+	stmt = db_query(location, db, query);
+	if (!stmt)
+		db_fatal("%s:%s:%s", location, query, sqlite3_errmsg(db->sql));
 	tal_free(query);
-	if (stmt)
-		dev_statement_start(stmt, location);
+
 	return stmt;
 }
 
@@ -538,21 +600,65 @@ static void destroy_db(struct db *db)
 	sqlite3_close(db->sql);
 }
 
+/* We expect min changes (ie. BEGIN TRANSACTION): report if more.
+ * Optionally add "final" at the end (ie. COMMIT). */
+static void db_report_changes(struct db *db, const char *final, size_t min)
+{
+	assert(db->changes);
+	assert(tal_count(db->changes) >= min);
+
+	if (tal_count(db->changes) > min)
+		plugin_hook_db_sync(db, db->changes, final);
+	db->changes = tal_free(db->changes);
+}
+
+static void db_prepare_for_changes(struct db *db)
+{
+	assert(!db->changes);
+	db->changes = tal_arr(db, const char *, 0);
+}
+
 void db_begin_transaction_(struct db *db, const char *location)
 {
 	if (db->in_transaction)
 		db_fatal("Already in transaction from %s", db->in_transaction);
 
+	db_prepare_for_changes(db);
 	db_do_exec(location, db, "BEGIN TRANSACTION;");
 	db->in_transaction = location;
 }
 
 void db_commit_transaction(struct db *db)
 {
+	int err;
+	char *errmsg;
+	const char *cmd = "COMMIT;";
+
 	assert(db->in_transaction);
 	db_assert_no_outstanding_statements();
-	db_exec(__func__, db, "COMMIT;");
+
+	/* We expect at least the BEGIN TRANSACTION */
+	db_report_changes(db, cmd, 1);
+
+	err = sqlite3_exec(db->sql, cmd, NULL, NULL, &errmsg);
+	if (err != SQLITE_OK)
+		db_fatal("%s:%s:%s:%s", __func__, sqlite3_errstr(err), cmd, errmsg);
+
 	db->in_transaction = NULL;
+}
+
+static void setup_open_db(struct db *db)
+{
+#if !HAVE_SQLITE3_EXPANDED_SQL
+	sqlite3_trace(db->sql, trace_sqlite3, db);
+#endif
+
+	/* This must be outside a transaction, so catch it */
+	assert(!db->in_transaction);
+
+	db_prepare_for_changes(db);
+	db_do_exec(__func__, db, "PRAGMA foreign_keys = ON;");
+	db_report_changes(db, NULL, 0);
 }
 
 /**
@@ -577,7 +683,9 @@ static struct db *db_open(const tal_t *ctx, char *filename)
 	db->sql = sql;
 	tal_add_destructor(db, destroy_db);
 	db->in_transaction = NULL;
-	db_do_exec(__func__, db, "PRAGMA foreign_keys = ON;");
+	db->changes = NULL;
+
+	setup_open_db(db);
 
 	return db;
 }
@@ -592,22 +700,19 @@ static struct db *db_open(const tal_t *ctx, char *filename)
  */
 static int db_get_version(struct db *db)
 {
-	int err;
-	u64 res = -1;
-	sqlite3_stmt *stmt = db_query(db, "SELECT version FROM version LIMIT 1");
+	int res;
+	sqlite3_stmt *stmt = db_query(__func__,
+				      db, "SELECT version FROM version LIMIT 1");
 
 	if (!stmt)
 		return -1;
 
-	err = sqlite3_step(stmt);
-	if (err != SQLITE_ROW) {
-		db_stmt_done(stmt);
+	if (!db_select_step(db, stmt))
 		return -1;
-	} else {
-		res = sqlite3_column_int64(stmt, 0);
-		db_stmt_done(stmt);
-		return res;
-	}
+
+	res = sqlite3_column_int64(stmt, 0);
+	db_stmt_done(stmt);
+	return res;
 }
 
 /**
@@ -680,26 +785,29 @@ void db_reopen_after_fork(struct db *db)
 		db_fatal("failed to re-open database %s: %s", db->filename,
 			 sqlite3_errstr(err));
 	}
-	db_do_exec(__func__, db, "PRAGMA foreign_keys = ON;");
+	setup_open_db(db);
 }
 
 s64 db_get_intvar(struct db *db, char *varname, s64 defval)
 {
-	int err;
-	s64 res = defval;
-	sqlite3_stmt *stmt =
-	    db_query(db,
-		     "SELECT val FROM vars WHERE name='%s' LIMIT 1", varname);
+	s64 res;
+	sqlite3_stmt *stmt;
+	const char *query;
+
+	query = tal_fmt(db, "SELECT val FROM vars WHERE name='%s' LIMIT 1", varname);
+	stmt = db_query(__func__, db, query);
+	tal_free(query);
 
 	if (!stmt)
 		return defval;
 
-	err = sqlite3_step(stmt);
-	if (err == SQLITE_ROW) {
+	if (db_select_step(db, stmt)) {
 		const unsigned char *stringvar = sqlite3_column_text(stmt, 0);
 		res = atol((const char *)stringvar);
-	}
-	db_stmt_done(stmt);
+		db_stmt_done(stmt);
+	} else
+		res = defval;
+
 	return res;
 }
 
@@ -836,15 +944,29 @@ bool sqlite3_column_signature(sqlite3_stmt *stmt, int col,
 
 bool sqlite3_column_pubkey(sqlite3_stmt *stmt, int col,  struct pubkey *dest)
 {
-	assert(sqlite3_column_bytes(stmt, col) == PUBKEY_DER_LEN);
-	return pubkey_from_der(sqlite3_column_blob(stmt, col), PUBKEY_DER_LEN, dest);
+	assert(sqlite3_column_bytes(stmt, col) == PUBKEY_CMPR_LEN);
+	return pubkey_from_der(sqlite3_column_blob(stmt, col), PUBKEY_CMPR_LEN, dest);
 }
 
 bool sqlite3_bind_pubkey(sqlite3_stmt *stmt, int col, const struct pubkey *pk)
 {
-	u8 der[PUBKEY_DER_LEN];
+	u8 der[PUBKEY_CMPR_LEN];
 	pubkey_to_der(der, pk);
 	int err = sqlite3_bind_blob(stmt, col, der, sizeof(der), SQLITE_TRANSIENT);
+	return err == SQLITE_OK;
+}
+
+bool sqlite3_column_node_id(sqlite3_stmt *stmt, int col, struct node_id *dest)
+{
+	assert(sqlite3_column_bytes(stmt, col) == sizeof(dest->k));
+	memcpy(dest->k, sqlite3_column_blob(stmt, col), sizeof(dest->k));
+	return node_id_valid(dest);
+}
+
+bool sqlite3_bind_node_id(sqlite3_stmt *stmt, int col, const struct node_id *id)
+{
+	assert(node_id_valid(id));
+	int err = sqlite3_bind_blob(stmt, col, id->k, sizeof(id->k), SQLITE_TRANSIENT);
 	return err == SQLITE_OK;
 }
 
@@ -861,10 +983,10 @@ bool sqlite3_bind_pubkey_array(sqlite3_stmt *stmt, int col,
 	}
 
 	n = tal_count(pks);
-	ders = tal_arr(NULL, u8, n * PUBKEY_DER_LEN);
+	ders = tal_arr(NULL, u8, n * PUBKEY_CMPR_LEN);
 
 	for (i = 0; i < n; ++i)
-		pubkey_to_der(&ders[i * PUBKEY_DER_LEN], &pks[i]);
+		pubkey_to_der(&ders[i * PUBKEY_CMPR_LEN], &pks[i]);
 	int err = sqlite3_bind_blob(stmt, col, ders, tal_count(ders), SQLITE_TRANSIENT);
 
 	tal_free(ders);
@@ -881,13 +1003,63 @@ struct pubkey *sqlite3_column_pubkey_array(const tal_t *ctx,
 	if (sqlite3_column_type(stmt, col) == SQLITE_NULL)
 		return NULL;
 
-	n = sqlite3_column_bytes(stmt, col) / PUBKEY_DER_LEN;
-	assert(n * PUBKEY_DER_LEN == (size_t)sqlite3_column_bytes(stmt, col));
+	n = sqlite3_column_bytes(stmt, col) / PUBKEY_CMPR_LEN;
+	assert(n * PUBKEY_CMPR_LEN == (size_t)sqlite3_column_bytes(stmt, col));
 	ret = tal_arr(ctx, struct pubkey, n);
 	ders = sqlite3_column_blob(stmt, col);
 
 	for (i = 0; i < n; ++i) {
-		if (!pubkey_from_der(&ders[i * PUBKEY_DER_LEN], PUBKEY_DER_LEN, &ret[i]))
+		if (!pubkey_from_der(&ders[i * PUBKEY_CMPR_LEN], PUBKEY_CMPR_LEN, &ret[i]))
+			return tal_free(ret);
+	}
+
+	return ret;
+}
+
+bool sqlite3_bind_node_id_array(sqlite3_stmt *stmt, int col,
+				const struct node_id *ids)
+{
+	size_t n;
+	u8 *arr;
+
+	if (!ids) {
+		int err = sqlite3_bind_null(stmt, col);
+		return err == SQLITE_OK;
+	}
+
+	/* Copy into contiguous array: ARM will add padding to struct node_id! */
+	n = tal_count(ids);
+	arr = tal_arr(NULL, u8, n * sizeof(ids[0].k));
+	for (size_t i = 0; i < n; ++i) {
+		assert(node_id_valid(&ids[i]));
+		memcpy(arr + sizeof(ids[i].k) * i,
+		       ids[i].k,
+		       sizeof(ids[i].k));
+	}
+	int err = sqlite3_bind_blob(stmt, col, arr, tal_count(arr), SQLITE_TRANSIENT);
+
+	tal_free(arr);
+	return err == SQLITE_OK;
+}
+
+struct node_id *sqlite3_column_node_id_array(const tal_t *ctx,
+					     sqlite3_stmt *stmt, int col)
+{
+	size_t n;
+	struct node_id *ret;
+	const u8 *arr;
+
+	if (sqlite3_column_type(stmt, col) == SQLITE_NULL)
+		return NULL;
+
+	n = sqlite3_column_bytes(stmt, col) / sizeof(ret->k);
+	assert(n * sizeof(ret->k) == (size_t)sqlite3_column_bytes(stmt, col));
+	ret = tal_arr(ctx, struct node_id, n);
+	arr = sqlite3_column_blob(stmt, col);
+
+	for (size_t i = 0; i < n; i++) {
+		memcpy(ret[i].k, arr + i * sizeof(ret[i].k), sizeof(ret[i].k));
+		if (!node_id_valid(&ret[i]))
 			return tal_free(ret);
 	}
 
@@ -986,4 +1158,20 @@ void migrate_pr2342_feerate_per_channel(struct lightningd *ld, struct db *db)
 			"UPDATE channels SET feerate_base = %u, feerate_ppm = %u;",
 			ld->config.fee_base,
 			ld->config.fee_per_satoshi);
+}
+
+void sqlite3_bind_timeabs(sqlite3_stmt *stmt, int col, struct timeabs t)
+{
+	u64 timestamp =  t.ts.tv_nsec + (t.ts.tv_sec * NSEC_IN_SEC);
+	sqlite3_bind_int64(stmt, col, timestamp);
+}
+
+struct timeabs sqlite3_column_timeabs(sqlite3_stmt *stmt, int col)
+{
+	struct timeabs t;
+	u64 timestamp = sqlite3_column_int64(stmt, col);
+	t.ts.tv_sec = timestamp / NSEC_IN_SEC;
+	t.ts.tv_nsec = timestamp % NSEC_IN_SEC;
+	return t;
+
 }

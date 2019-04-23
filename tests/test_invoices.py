@@ -176,12 +176,12 @@ def test_invoice_routeboost(node_factory, bitcoind):
 def test_invoice_routeboost_private(node_factory, bitcoind):
     """Test routeboost 'r' hint in bolt11 invoice for private channels
     """
-    l1, l2 = node_factory.line_graph(2, fundamount=10**6, announce_channels=False)
+    l1, l2 = node_factory.line_graph(2, fundamount=16777215, announce_channels=False)
 
     # Attach public channel to l1 so it doesn't look like a dead-end.
     l0 = node_factory.get_node()
     l0.rpc.connect(l1.info['id'], 'localhost', l1.port)
-    scid = l0.fund_channel(l1, 2 * (10**4))
+    scid = l0.fund_channel(l1, 2 * (10**5))
     bitcoind.generate_block(5)
 
     # Make sure channel is totally public.
@@ -209,7 +209,7 @@ def test_invoice_routeboost_private(node_factory, bitcoind):
     # the exposure of private channels.
     l3 = node_factory.get_node()
     l3.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    scid = l3.fund_channel(l2, (10**4))
+    scid = l3.fund_channel(l2, (10**5))
     bitcoind.generate_block(5)
 
     # Make sure channel is totally public.
@@ -296,6 +296,37 @@ def test_invoice_expiry(node_factory, executor):
     l2.rpc.delexpiredinvoice()
     # all invoices are expired and should be deleted
     assert len(l2.rpc.listinvoices()['invoices']) == 0
+
+    # Test expiry suffixes.
+    start = int(time.time())
+    inv = l2.rpc.invoice(msatoshi=123000, label='inv_s', description='description', expiry='1s')['bolt11']
+    end = int(time.time())
+    expiry = only_one(l2.rpc.listinvoices('inv_s')['invoices'])['expires_at']
+    assert expiry >= start + 1 and expiry <= end + 1
+
+    start = int(time.time())
+    inv = l2.rpc.invoice(msatoshi=123000, label='inv_m', description='description', expiry='1m')['bolt11']
+    end = int(time.time())
+    expiry = only_one(l2.rpc.listinvoices('inv_m')['invoices'])['expires_at']
+    assert expiry >= start + 60 and expiry <= end + 60
+
+    start = int(time.time())
+    inv = l2.rpc.invoice(msatoshi=123000, label='inv_h', description='description', expiry='1h')['bolt11']
+    end = int(time.time())
+    expiry = only_one(l2.rpc.listinvoices('inv_h')['invoices'])['expires_at']
+    assert expiry >= start + 3600 and expiry <= end + 3600
+
+    start = int(time.time())
+    inv = l2.rpc.invoice(msatoshi=123000, label='inv_d', description='description', expiry='1d')['bolt11']
+    end = int(time.time())
+    expiry = only_one(l2.rpc.listinvoices('inv_d')['invoices'])['expires_at']
+    assert expiry >= start + 24 * 3600 and expiry <= end + 24 * 3600
+
+    start = int(time.time())
+    inv = l2.rpc.invoice(msatoshi=123000, label='inv_w', description='description', expiry='1w')['bolt11']
+    end = int(time.time())
+    expiry = only_one(l2.rpc.listinvoices('inv_w')['invoices'])['expires_at']
+    assert expiry >= start + 7 * 24 * 3600 and expiry <= end + 7 * 24 * 3600
 
 
 @unittest.skipIf(not DEVELOPER, "Too slow without --dev-bitcoind-poll")

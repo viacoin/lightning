@@ -67,6 +67,9 @@ struct config {
 
 	/* Are we allowed to use DNS lookup for peers. */
 	bool use_dns;
+
+	/* Minimal amount of effective funding_satoshis for accepting channels */
+	u64 min_capacity_sat;
 };
 
 struct lightningd {
@@ -102,7 +105,7 @@ struct lightningd {
 	const char *logfile;
 
 	/* This is us. */
-	struct pubkey id;
+	struct node_id id;
 
 	/* My name is... my favorite color is... */
 	u8 *alias; /* At least 32 bytes (zero-filled) */
@@ -195,6 +198,12 @@ struct lightningd {
 
 	/* Allow and accept localhost node_announcement addresses */
 	bool dev_allow_localhost;
+
+	/* Timestamp to use for gossipd, iff non-zero */
+	u32 dev_gossip_time;
+
+	/* What to override unknown channels with, iff non-NULL */
+	struct amount_sat *dev_unknown_channel_satoshis;
 
 	/* Things we've marked as not leaking. */
 	const void **notleaks;
