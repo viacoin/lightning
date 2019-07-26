@@ -53,14 +53,17 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/daemon_conn.o			\
 	common/dev_disconnect.o			\
 	common/derive_basepoints.o		\
+	common/features.o			\
 	common/gen_peer_status_wire.o		\
 	common/gen_status_wire.o		\
+	common/gossip_store.o			\
 	common/htlc_wire.o			\
 	common/key_derive.o			\
 	common/memleak.o			\
 	common/msg_queue.o			\
 	common/peer_billboard.o			\
 	common/peer_failed.o			\
+	common/per_peer_state.o			\
 	common/permute_tx.o			\
 	common/read_peer_msg.o			\
 	common/socket_close.o			\
@@ -77,10 +80,10 @@ CLOSINGD_COMMON_OBJS :=				\
 	hsmd/gen_hsm_wire.o
 
 closingd/gen_closing_wire.h: $(WIRE_GEN) closingd/closing_wire.csv
-	$(WIRE_GEN) --header $@ closing_wire_type < closingd/closing_wire.csv > $@
+	$(WIRE_GEN) --page header $@ closing_wire_type < closingd/closing_wire.csv > $@
 
 closingd/gen_closing_wire.c: $(WIRE_GEN) closingd/closing_wire.csv
-	$(WIRE_GEN) ${@:.c=.h} closing_wire_type < closingd/closing_wire.csv > $@
+	$(WIRE_GEN) --page impl ${@:.c=.h} closing_wire_type < closingd/closing_wire.csv > $@
 
 LIGHTNINGD_CLOSING_OBJS := $(LIGHTNINGD_CLOSING_SRC:.c=.o) $(LIGHTNINGD_CLOSING_GEN_SRC:.c=.o)
 

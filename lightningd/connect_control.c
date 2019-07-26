@@ -70,9 +70,7 @@ static struct command_result *connect_cmd_succeed(struct command *cmd,
 						  const struct node_id *id)
 {
 	struct json_stream *response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_add_node_id(response, "id", id);
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 
@@ -175,6 +173,7 @@ static struct command_result *json_connect(struct command *cmd,
 
 static const struct json_command connect_command = {
 	"connect",
+	"network",
 	json_connect,
 	"Connect to {id} at {host} (which can end in ':port' if not default). "
 	"{id} can also be of the form id@host"
@@ -223,7 +222,7 @@ void delay_then_reconnect(struct channel *channel, u32 seconds_delay,
 
 	/* We fuzz the timer by up to 1 second, to avoid getting into
 	 * simultanous-reconnect deadlocks with peer. */
-	notleak(new_reltimer(&ld->timers, d,
+	notleak(new_reltimer(ld->timers, d,
 			     timerel_add(time_from_sec(seconds_delay),
 					 time_from_usec(pseudorand(1000000))),
 			     maybe_reconnect, d));
@@ -279,7 +278,7 @@ static void peer_please_disconnect(struct lightningd *ld, const u8 *msg)
 	if (uc)
 		kill_uncommitted_channel(uc, "Reconnected");
 	else if (c)
-		channel_fail_transient(c, "Reconnected");
+		channel_fail_reconnect(c, "Reconnected");
 }
 
 static unsigned connectd_msg(struct subd *connectd, const u8 *msg, const int *fds)
@@ -304,9 +303,9 @@ static unsigned connectd_msg(struct subd *connectd, const u8 *msg, const int *fd
 		break;
 
 	case WIRE_CONNECT_PEER_CONNECTED:
-		if (tal_count(fds) != 2)
-			return 2;
-		peer_connected(connectd->ld, msg, fds[0], fds[1]);
+		if (tal_count(fds) != 3)
+			return 3;
+		peer_connected(connectd->ld, msg, fds[0], fds[1], fds[2]);
 		break;
 
 	case WIRE_CONNECTCTL_CONNECT_FAILED:

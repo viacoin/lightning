@@ -15,7 +15,7 @@ variety of ways:
  - **Hooks** are a primitive that allows plugins to be notified about
    internal events in `lightningd` and alter its behavior or inject
    custom behaviors.
-   
+
 A plugin may be written in any language, and communicates with
 `lightningd` through the plugin's `stdin` and `stdout`. JSON-RPCv2 is
 used as protocol on top of the two streams, with the plugin acting as
@@ -27,20 +27,20 @@ executable (e.g. use `chmod a+x plugin_name`)
 During startup of `lightningd` you can use the `--plugin=` option to
 register one or more plugins that should be started. In case you wish
 to start several plugins you have to use the `--plugin=` argument
-once for each plugin. An example call might look like: 
+once for each plugin. An example call might look like:
 
 ```
 lightningd --plugin=/path/to/plugin1 --plugin=path/to/plugin2
 ```
 
 `lightningd` will write JSON-RPC requests to the plugin's `stdin` and
-will read replies from its `stdout`. To initialize the plugin two RPC 
+will read replies from its `stdout`. To initialize the plugin two RPC
 methods are required:
 
  - `getmanifest` asks the plugin for command line options and JSON-RPC
    commands that should be passed through
  - `init` is called after the command line options have been
-   parsed and passes them through with the real values. This is also
+   parsed and passes them through with the real values (if specified). This is also
    the signal that `lightningd`'s JSON-RPC over Unix Socket is now up
    and ready to receive incoming requests from the plugin.
 
@@ -81,6 +81,10 @@ this example:
 	"subscriptions": [
 		"connect",
 		"disconnect"
+	],
+	"hooks": [
+		"openchannel",
+		"htlc_accepted"
 	]
 }
 ```
@@ -88,7 +92,7 @@ this example:
 The `options` will be added to the list of command line options that
 `lightningd` accepts. The above will add a `--greeting` option with a
 default value of `World` and the specified description. *Notice that
-currently only string options are supported.*
+currently string, (unsigned) integers, and bool options are supported.*
 
 The `rpcmethods` are methods that will be exposed via `lightningd`'s
 JSON-RPC over Unix-Socket interface, just like the builtin
@@ -218,6 +222,50 @@ to a peer was lost.
 	"id": "02f6725f9c1c40333b67faea92fd211c183050f28df32cac3f9d69685fe9665432"
 }
 ```
+
+#### `invoice_payment`
+
+A notification for topic `invoice_payment` is sent every time an invoie is paid.
+
+```json
+{
+	"invoice_payment": {
+		"label": "unique-label-for-invoice",
+		"preimage": "0000000000000000000000000000000000000000000000000000000000000000",
+		"msat": "10000msat"
+	}
+}
+```
+
+
+#### `warning`
+
+A notification for topic `warning` is sent every time a new `BROKEN`
+/`UNUSUAL` level(in plugins, we use `error`/`warn`) log generated,
+which means an unusual/borken thing happens, such as channel failed,
+message resolving failed...
+
+```json
+{
+	"warning": {
+	"level": "warn",
+	"time": "1559743608.565342521",
+	"source": "lightningd(17652): 0821f80652fb840239df8dc99205792bba2e559a05469915804c08420230e23c7c chan #7854:",
+	"log": "Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: sent ERROR bad reestablish dataloss msg"
+  }
+}
+```
+1. `level` is `warn` or `error`: `warn` means something seems bad happened
+ and it's under control, but we'd better check it; `error` means something
+extremely bad is out of control, and it may lead to crash;
+2. `time` is the second since epoch;
+3. `source` means where the event happened, it may have the following
+forms:  
+`<node_id> chan #<db_id_of_channel>:`,`lightningd(<lightningd_pid>):`,
+`plugin-<plugin_name>:`, `<daemon_name>(<daemon_pid>):`, `jsonrpc:`,
+`jcon fd <error_fd_to_jsonrpc>:`, `plugin-manager`;
+4. `log` is the context of the original log entry.
+
 ## Hooks
 
 Hooks allow a plugin to define custom behavior for `lightningd`
@@ -314,6 +362,146 @@ It can return a non-zero `failure_code` field as defined for final
 nodes in [BOLT 4][bolt4-failure-codes], or otherwise an empty object
 to accept the payment.
 
+
+#### `openchannel`
+
+This hook is called whenever a remote peer tries to fund a channel to us,
+and it has passed basic sanity checks:
+
+```json
+{
+  "openchannel": {
+	"id": "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f",
+	"funding_satoshis": "100000000msat",
+	"push_msat": "0msat",
+	"dust_limit_satoshis": "546000msat",
+	"max_htlc_value_in_flight_msat": "18446744073709551615msat",
+	"channel_reserve_satoshis": "1000000msat",
+	"htlc_minimum_msat": "0msat",
+	"feerate_per_kw": 7500,
+	"to_self_delay": 5,
+	"max_accepted_htlcs": 483,
+	"channel_flags": 1
+  }
+}
+```
+
+There may be additional fields, including `shutdown_scriptpubkey` and
+a hex-string.  You can see the definitions of these fields in [BOLT 2's description of the open_channel message][bolt2-open-channel].
+
+The returned result must contain a `result` member which is either
+the string `reject` or `continue`.  If `reject` and
+there's a member `error_message`, that member is sent to the peer
+before disconnection.
+
+#### `htlc_accepted`
+
+The `htlc_accepted` hook is called whenever an incoming HTLC is accepted, and
+its result determines how `lightningd` should treat that HTLC.
+
+The payload of the hook call has the following format:
+
+```json
+{
+  "onion": {
+    "payload": "",
+    "per_hop_v0": {
+      "realm": "00",
+      "short_channel_id": "1x2x3",
+      "forward_amount": "42msat",
+      "outgoing_cltv_value": 500014
+    }
+  },
+  "next_onion": "[1365bytes of serialized onion]",
+  "shared_secret": "0000000000000000000000000000000000000000000000000000000000000000",
+  "htlc": {
+    "amount": "43msat",
+    "cltv_expiry": 500028,
+    "cltv_expiry_relative": 10,
+    "payment_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
+```
+
+The `per_hop_v0` will only be present if the per hop payload has format `0x00`
+as defined by the specification. If not present an object representing the
+type-length-vale (TLV) payload will be added (pending specification). For detailed information about each field please refer to [BOLT 04 of the specification][bolt4], the following is just a brief summary:
+
+ - `onion.payload` contains the unparsed payload that was sent to us from the
+   sender of the payment.
+ - `onion.per_hop_v0`:
+   - `realm` will always be `00` since that value determines that we are using
+     the `per_hop_v0` format.
+   - `short_channel_id` determines the channel that the sender is hinting
+     should be used next (set to `0x0x0` if we are the recipient of the
+     payment).
+   - `forward_amount` is the amount we should be forwarding to the next hop,
+     and should match the incoming funds in case we are the recipient.
+   - `outgoing_cltv_value` determines what the CLTV value for the HTLC that we
+     forward to the next hop should be.
+ - `next_onion` is the fully processed onion that we should be sending to the
+   next hop as part of the outgoing HTLC. Processed in this case means that we
+   took the incoming onion, decrypted it, extracted the payload destined for
+   us, and serialized the resulting onion again.
+ - `shared_secret` is the shared secret we used to decrypt the incoming
+   onion. It is shared with the sender that constructed the onion.
+ - `htlc`:
+   - `amount` is the amount that we received with the HTLC. This amount minus
+     the `forward_amount` is the fee that will stay with us.
+   - `cltv_expiry` determines when the HTLC reverts back to the
+     sender. `cltv_expiry` minus `outgoing_cltv_expiry` should be equal or
+     larger than our `cltv_delta` setting.
+   - `cltv_expiry_relative` hints how much time we still have to claim the
+     HTLC. It is the `cltv_expiry` minus the current `blockheight` and is
+     passed along mainly to avoid the plugin having to look up the current
+     blockheight.
+   - `payment_hash` is the hash whose `payment_preimage` will unlock the funds
+     and allow us to claim the HTLC.
+
+The hook response must have one of the following formats:
+
+```json
+{
+  "result": "continue"
+}
+```
+
+This means that the plugin does not want to do anything special and
+`lightningd` should continue processing it normally, i.e., resolve the payment
+if we're the recipient, or attempt to forward it otherwise. Notice that the
+usual checks such as sufficient fees and CLTV deltas are still enforced.
+
+```json
+{
+  "result": "fail",
+  "failure_code": 4301
+}
+```
+
+`fail` will tell `lightningd` to fail the HTLC with a given numeric
+`failure_code` (please refer to the [spec][bolt4-failure-codes] for details).
+
+```json
+{
+  "result": "resolve",
+  "payment_key": "0000000000000000000000000000000000000000000000000000000000000000"
+}
+```
+
+`resolve` instructs `lightningd` to claim the HTLC by providing the preimage
+matching the `payment_hash` presented in the call. Notice that the plugin must
+ensure that the `payment_key` really matches the `payment_hash` since
+`lightningd` will not check and the wrong value could result in the channel
+being closed.
+
+Warning: `lightningd` will replay the HTLCs for which it doesn't have a final
+verdict during startup. This means that, if the plugin response wasn't
+processed before the HTLC was forwarded, failed, or resolved, then the plugin
+may see the same HTLC again during startup. It is therefore paramount that the
+plugin is idempotent if it talks to an external system.
+
 [jsonrpc-spec]: https://www.jsonrpc.org/specification
 [jsonrpc-notification-spec]: https://www.jsonrpc.org/specification#notification
+[bolt4]: https://github.com/lightningnetwork/lightning-rfc/blob/master/04-onion-routing.md
 [bolt4-failure-codes]: https://github.com/lightningnetwork/lightning-rfc/blob/master/04-onion-routing.md#failure-messages
+[bolt2-open-channel]: https://github.com/lightningnetwork/lightning-rfc/blob/master/02-peer-protocol.md#the-open_channel-message

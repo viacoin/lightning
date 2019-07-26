@@ -14,7 +14,6 @@ LIGHTNINGD_TEST_COMMON_OBJS :=			\
 	common/htlc_state.o			\
 	common/io_lock.o			\
 	common/json.o				\
-	common/json_escaped.o			\
 	common/key_derive.o			\
 	common/pseudorand.o			\
 	common/memleak.o			\
@@ -26,8 +25,8 @@ LIGHTNINGD_TEST_COMMON_OBJS :=			\
 
 update-mocks: $(LIGHTNINGD_TEST_SRC:%=update-mocks/%)
 
-$(LIGHTNINGD_TEST_PROGRAMS): $(CCAN_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(LIBBASE58_OBJS) $(LIGHTNINGD_TEST_COMMON_OBJS)
+$(LIGHTNINGD_TEST_PROGRAMS): $(CCAN_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(LIGHTNINGD_TEST_COMMON_OBJS)
 
 $(LIGHTNINGD_TEST_OBJS): $(LIGHTNINGD_HEADERS) $(LIGHTNINGD_SRC)
 
-check: $(LIGHTNINGD_TEST_PROGRAMS:%=unittest/%)
+check-units: $(LIGHTNINGD_TEST_PROGRAMS:%=unittest/%)

@@ -18,8 +18,10 @@
 #include <ccan/tal/str/str.h>
 #include <common/crypto_sync.h>
 #include <common/derive_basepoints.h>
+#include <common/features.h>
 #include <common/funding_tx.h>
 #include <common/gen_peer_status_wire.h>
+#include <common/gossip_store.h>
 #include <common/initial_channel.h>
 #include <common/key_derive.h>
 #include <common/memleak.h>
@@ -34,6 +36,7 @@
 #include <common/version.h>
 #include <common/wire_error.h>
 #include <errno.h>
+#include <gossipd/gen_gossip_peerd_wire.h>
 #include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <openingd/gen_opening_wire.h>
@@ -46,17 +49,16 @@
 #include <wire/wire.h>
 #include <wire/wire_sync.h>
 
-/* stdin == lightningd, 3 == peer, 4 == gossipd, 5 = hsmd */
+/* stdin == lightningd, 3 == peer, 4 == gossipd, 5 = gossip_store, 6 = hsmd */
 #define REQ_FD STDIN_FILENO
-#define PEER_FD 3
-#define GOSSIP_FD 4
-#define HSM_FD 5
+#define HSM_FD 6
 
 /* Global state structure.  This is only for the one specific peer and channel */
 struct state {
-	/* Cryptographic state needed to exchange messages with the peer (as
-	 * featured in BOLT #8) */
-	struct crypto_state cs;
+	struct per_peer_state *pps;
+
+	/* Features they offered */
+	u8 *localfeatures;
 
 	/* Constraints on a channel they open. */
 	u32 minimum_depth;
@@ -71,6 +73,10 @@ struct state {
 	struct basepoints our_points;
 	struct pubkey our_funding_pubkey;
 
+	/* Information we need between funding_start and funding_complete */
+	struct basepoints their_points;
+	struct pubkey their_funding_pubkey;
+
 	/* hsmd gives us our first per-commitment point, and peer tells us
 	 * theirs */
 	struct pubkey first_per_commitment_point[NUM_SIDES];
@@ -84,6 +90,8 @@ struct state {
 	u32 feerate_per_kw;
 	struct bitcoin_txid funding_txid;
 	u16 funding_txout;
+	/* If set, this is the scriptpubkey they *must* close with */
+	u8 *remote_upfront_shutdown_script;
 
 	/* This is a cluster of fields in open_channel and accept_channel which
 	 * indicate the restrictions each side places on the channel. */
@@ -94,15 +102,20 @@ struct state {
 	 * as initial channels never have HTLCs. */
 	struct channel *channel;
 
-	/*~ We only allow one active channel at a time per peer.  Otherwise
-	 * all our per-peer daemons would have to handle multiple channels,
-	 * or we would need some other daemon to demux the messages.
-	 * Thus, lightningd tells is if/when there's no active channel. */
-	bool can_accept_channel;
-
 	/* Which chain we're on, so we can check/set `chain_hash` fields */
 	const struct chainparams *chainparams;
 };
+
+static const u8 *dev_upfront_shutdown_script(const tal_t *ctx)
+{
+#if DEVELOPER
+	/* This is a hack, for feature testing */
+	const char *e = getenv("DEV_OPENINGD_UPFRONT_SHUTDOWN_SCRIPT");
+	if (e)
+		return tal_hexdata(ctx, e, strlen(e));
+#endif
+	return NULL;
+}
 
 /*~ If we can't agree on parameters, we fail to open the channel.  If we're
  * the funder, we need to tell lightningd, otherwise it never really notices. */
@@ -144,7 +157,7 @@ static void negotiation_failed(struct state *state, bool am_funder,
 
 	msg = towire_errorfmt(NULL, &state->channel_id,
 			      "You gave bad parameters: %s", errmsg);
-	sync_crypto_write(&state->cs, PEER_FD, take(msg));
+	sync_crypto_write(state->pps, take(msg));
 
 	negotiation_aborted(state, am_funder, errmsg);
 }
@@ -299,11 +312,11 @@ static bool check_config_bounds(struct state *state,
 	return true;
 }
 
-/* We always set channel_reserve_satoshis to 1%, rounded up. */
+/* We always set channel_reserve_satoshis to 1%, rounded down. */
 static void set_reserve(struct state *state)
 {
 	state->localconf.channel_reserve.satoshis  /* Raw: rounding. */
-		= (state->funding.satoshis + 99) / 100;   /* Raw: rounding. */
+		= state->funding.satoshis / 100;   /* Raw: rounding. */
 
 	/* BOLT #2:
 	 *
@@ -353,20 +366,23 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state,
 		clean_tmpctx();
 
 		/* This helper routine polls both the peer and gossipd. */
-		msg = peer_or_gossip_sync_read(ctx, PEER_FD, GOSSIP_FD,
-					       &state->cs, &from_gossipd);
+		msg = peer_or_gossip_sync_read(ctx, state->pps, &from_gossipd);
 		/* Use standard helper for gossip msgs (forwards, if it's an
 		 * error, exits). */
 		if (from_gossipd) {
-			handle_gossip_msg(PEER_FD, &state->cs, take(msg));
+			handle_gossip_msg(state->pps, take(msg));
 			continue;
 		}
 
 		/* Some messages go straight to gossipd. */
 		if (is_msg_for_gossipd(msg)) {
-			wire_sync_write(GOSSIP_FD, take(msg));
+			wire_sync_write(state->pps->gossip_fd, take(msg));
 			continue;
 		}
+
+		/* Might be a timestamp filter request: handle. */
+		if (handle_timestamp_filter(state->pps, msg))
+			continue;
 
 		/* A helper which decodes an error. */
 		if (is_peer_error(tmpctx, msg, &state->channel_id,
@@ -390,8 +406,7 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state,
 									   err);
 					wire_sync_write(REQ_FD, take(msg));
 				}
-				peer_failed_received_errmsg(PEER_FD, GOSSIP_FD,
-							    &state->cs, err,
+				peer_failed_received_errmsg(state->pps, err,
 							    NULL);
 			}
 			negotiation_aborted(state, am_funder,
@@ -412,7 +427,7 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state,
 				     wire_type_name(fromwire_peektype(msg)),
 				     type_to_string(tmpctx, struct channel_id,
 						    &actual));
-			sync_crypto_write(&state->cs, PEER_FD,
+			sync_crypto_write(state->pps,
 					  take(towire_errorfmt(NULL, &actual,
 							       "Multiple channels"
 							       " unsupported")));
@@ -425,28 +440,8 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state,
 	}
 }
 
-/*~ OK, let's fund a channel!  Returns the reply for lightningd on success,
- * or NULL if something goes wrong. */
-static u8 *funder_channel(struct state *state,
-			  struct amount_sat change,
-			  u32 change_keyindex,
-			  u8 channel_flags,
-			  struct utxo **utxos TAKES,
-			  const struct ext_key *bip32_base)
+static bool setup_channel_funder(struct state *state)
 {
-	struct channel_id id_in;
-	u8 *msg;
-	struct bitcoin_tx *tx;
-	struct basepoints theirs;
-	struct pubkey their_funding_pubkey;
-	struct pubkey *changekey;
-	struct bitcoin_signature sig;
-	u32 minimum_depth;
-	struct bitcoin_tx *funding;
-	const u8 *wscript;
-	struct amount_msat local_msat;
-	char* err_reason;
-
 	/*~ For symmetry, we calculate our own reserve even though lightningd
 	 * could do it for the we-are-funding case. */
 	set_reserve(state);
@@ -461,28 +456,44 @@ static u8 *funder_channel(struct state *state,
 	 *...
 	 *   - MUST set `funding_satoshis` to less than 2^24 satoshi.
 	 */
-	if (amount_sat_greater(state->funding, state->chainparams->max_funding))
+	if (amount_sat_greater(state->funding, state->chainparams->max_funding)) {
 		status_failed(STATUS_FAIL_MASTER_IO,
 			      "funding_satoshis must be < %s, not %s",
 			      type_to_string(tmpctx, struct amount_sat,
 					     &state->chainparams->max_funding),
 			      type_to_string(tmpctx, struct amount_sat,
 					     &state->funding));
+		return false;
+	}
+
+	return true;
+}
+
+/* We start the 'fund a channel' negotation with the supplied peer, but
+ * stop when we get to the part where we need the funding txid */
+static u8 *funder_channel_start(struct state *state,
+				 u8 channel_flags)
+{
+	u8 *msg;
+	u8 *funding_output_script;
+	struct channel_id id_in;
+
+	if (!setup_channel_funder(state))
+		return NULL;
 
 	/* BOLT #2:
 	 *
-	 * The sending node:
-	 *...
-	 *  - MUST set `push_msat` to equal or less than 1000 *
-	 *   `funding_satoshis`.
+	 * - if both nodes advertised the `option_upfront_shutdown_script`
+	 *   feature:
+	 *   - MUST include either a valid `shutdown_scriptpubkey` as required
+	 *     by `shutdown` `scriptpubkey`, or a zero-length
+	 *     `shutdown_scriptpubkey`.
+	 * - otherwise:
+	 *   - MAY include a`shutdown_scriptpubkey`.
 	 */
-	if (!amount_sat_sub_msat(&local_msat, state->funding, state->push_msat))
-		status_failed(STATUS_FAIL_MASTER_IO,
-			      "push-msat must be < %s",
-			      type_to_string(tmpctx, struct amount_sat,
-					     &state->funding));
-
-	msg = towire_open_channel(NULL,
+	/* We don't use shutdown_scriptpubkey (at least for now), so leave it
+	 * NULL. */
+	msg = towire_open_channel_option_upfront_shutdown_script(NULL,
 				  &state->chainparams->genesis_blockhash,
 				  &state->channel_id,
 				  state->funding,
@@ -500,16 +511,22 @@ static u8 *funder_channel(struct state *state,
 				  &state->our_points.delayed_payment,
 				  &state->our_points.htlc,
 				  &state->first_per_commitment_point[LOCAL],
-				  channel_flags);
-	sync_crypto_write(&state->cs, PEER_FD, take(msg));
+				  channel_flags,
+				  dev_upfront_shutdown_script(tmpctx));
+	sync_crypto_write(state->pps, take(msg));
 
 	/* This is usually a very transient state... */
 	peer_billboard(false,
-		       "Funding channel: offered, now waiting for accept_channel");
+		       "Funding channel start: offered, now waiting for accept_channel");
+
 	/* ... since their reply should be immediate. */
 	msg = opening_negotiate_msg(tmpctx, state, true);
 	if (!msg)
-		goto fail;
+		return NULL;
+
+	/* Default is no shutdown_scriptpubkey: free any leftover one. */
+	state->remote_upfront_shutdown_script
+		= tal_free(state->remote_upfront_shutdown_script);
 
 	/* BOLT #2:
 	 *
@@ -519,21 +536,42 @@ static u8 *funder_channel(struct state *state,
 	 *    `payment_basepoint`, or `delayed_payment_basepoint` are not
 	 *    valid DER-encoded compressed secp256k1 pubkeys.
 	 */
-	if (!fromwire_accept_channel(msg, &id_in,
+	if (local_feature_negotiated(state->localfeatures,
+				     LOCAL_UPFRONT_SHUTDOWN_SCRIPT)) {
+		if (!fromwire_accept_channel_option_upfront_shutdown_script(state,
+				     msg, &id_in,
 				     &state->remoteconf.dust_limit,
 				     &state->remoteconf.max_htlc_value_in_flight,
 				     &state->remoteconf.channel_reserve,
 				     &state->remoteconf.htlc_minimum,
-				     &minimum_depth,
+				     &state->minimum_depth,
 				     &state->remoteconf.to_self_delay,
 				     &state->remoteconf.max_accepted_htlcs,
-				     &their_funding_pubkey,
-				     &theirs.revocation,
-				     &theirs.payment,
-				     &theirs.delayed_payment,
-				     &theirs.htlc,
+				     &state->their_funding_pubkey,
+				     &state->their_points.revocation,
+				     &state->their_points.payment,
+				     &state->their_points.delayed_payment,
+				     &state->their_points.htlc,
+				     &state->first_per_commitment_point[REMOTE],
+				     &state->remote_upfront_shutdown_script))
+			peer_failed(state->pps,
+				    &state->channel_id,
+				    "Parsing accept_channel with option_upfront_shutdown_script %s", tal_hex(msg, msg));
+	} else if (!fromwire_accept_channel(msg, &id_in,
+				     &state->remoteconf.dust_limit,
+				     &state->remoteconf.max_htlc_value_in_flight,
+				     &state->remoteconf.channel_reserve,
+				     &state->remoteconf.htlc_minimum,
+				     &state->minimum_depth,
+				     &state->remoteconf.to_self_delay,
+				     &state->remoteconf.max_accepted_htlcs,
+				     &state->their_funding_pubkey,
+				     &state->their_points.revocation,
+				     &state->their_points.payment,
+				     &state->their_points.delayed_payment,
+				     &state->their_points.htlc,
 				     &state->first_per_commitment_point[REMOTE]))
-		peer_failed(&state->cs,
+		peer_failed(state->pps,
 			    &state->channel_id,
 			    "Parsing accept_channel %s", tal_hex(msg, msg));
 
@@ -543,7 +581,420 @@ static u8 *funder_channel(struct state *state,
 	 * `temporary_channel_id` in the `open_channel` message. */
 	if (!channel_id_eq(&id_in, &state->channel_id))
 		/* In this case we exit, since we don't know what's going on. */
-		peer_failed(&state->cs,
+		peer_failed(state->pps,
+			    &state->channel_id,
+			    "accept_channel ids don't match: sent %s got %s",
+			    type_to_string(msg, struct channel_id, &id_in),
+			    type_to_string(msg, struct channel_id,
+					   &state->channel_id));
+
+	if (amount_sat_greater(state->remoteconf.dust_limit,
+			       state->localconf.channel_reserve)) {
+		negotiation_failed(state, true,
+				   "dust limit %s"
+				   " would be above our reserve %s",
+				   type_to_string(tmpctx, struct amount_sat,
+						  &state->remoteconf.dust_limit),
+				   type_to_string(tmpctx, struct amount_sat,
+						  &state->localconf.channel_reserve));
+		return NULL;
+	}
+
+	if (!check_config_bounds(state, &state->remoteconf, true))
+		return NULL;
+
+	funding_output_script =
+		scriptpubkey_p2wsh(tmpctx,
+				   bitcoin_redeem_2of2(tmpctx,
+						       &state->our_funding_pubkey,
+						       &state->their_funding_pubkey));
+
+	/* Update the billboard with our infos */
+	peer_billboard(false,
+		       "Funding channel start: awaiting funding_txid with output to %s",
+		       tal_hex(tmpctx, funding_output_script));
+	return towire_opening_funder_start_reply(state, funding_output_script);
+}
+
+static bool funder_finalize_channel_setup(struct state *state,
+			struct amount_msat local_msat,
+			struct bitcoin_signature *sig,
+			struct bitcoin_tx **tx)
+{
+	u8 *msg;
+	struct channel_id id_in;
+	const u8 *wscript;
+	char* err_reason;
+
+	/*~ Now we can initialize the `struct channel`.  This represents
+	 * the current channel state and is how we can generate the current
+	 * commitment transaction.
+	 *
+	 * The routines to support `struct channel` are split into a common
+	 * part (common/initial_channel) which doesn't support HTLCs and is
+	 * enough for us here, and the complete channel support required by
+	 * `channeld` which lives in channeld/full_channel. */
+	state->channel = new_initial_channel(state,
+					     &state->chainparams->genesis_blockhash,
+					     &state->funding_txid,
+					     state->funding_txout,
+					     state->minimum_depth,
+					     state->funding,
+					     local_msat,
+					     state->feerate_per_kw,
+					     &state->localconf,
+					     &state->remoteconf,
+					     &state->our_points,
+					     &state->their_points,
+					     &state->our_funding_pubkey,
+					     &state->their_funding_pubkey,
+					     /* Funder is local */
+					     LOCAL);
+	/* We were supposed to do enough checks above, but just in case,
+	 * new_initial_channel will fail to create absurd channels */
+	if (!state->channel)
+		peer_failed(state->pps,
+			    &state->channel_id,
+			    "could not create channel with given config");
+
+	/* BOLT #2:
+	 *
+	 * ### The `funding_created` Message
+	 *
+	 * This message describes the outpoint which the funder has created
+	 * for the initial commitment transactions.  After receiving the
+	 * peer's signature, via `funding_signed`, it will broadcast the funding
+	 * transaction.
+	 */
+	/* This gives us their first commitment transaction. */
+	*tx = initial_channel_tx(state, &wscript, state->channel,
+				&state->first_per_commitment_point[REMOTE],
+				REMOTE, &err_reason);
+	if (!*tx) {
+		/* This should not happen: we should never create channels we
+		 * can't afford the fees for after reserve. */
+		negotiation_failed(state, true,
+				   "Could not meet their fees and reserve: %s", err_reason);
+		goto fail;
+	}
+
+	/* We ask the HSM to sign their commitment transaction for us: it knows
+	 * our funding key, it just needs the remote funding key to create the
+	 * witness script.  It also needs the amount of the funding output,
+	 * as segwit signatures commit to that as well, even though it doesn't
+	 * explicitly appear in the transaction itself. */
+	msg = towire_hsm_sign_remote_commitment_tx(NULL,
+						   *tx,
+						   &state->channel->funding_pubkey[REMOTE],
+						   state->channel->funding);
+
+	wire_sync_write(HSM_FD, take(msg));
+	msg = wire_sync_read(tmpctx, HSM_FD);
+	if (!fromwire_hsm_sign_tx_reply(msg, sig))
+		status_failed(STATUS_FAIL_HSM_IO, "Bad sign_tx_reply %s",
+			      tal_hex(tmpctx, msg));
+
+	/* You can tell this has been a problem before, since there's a debug
+	 * message here: */
+	status_trace("signature %s on tx %s using key %s",
+		     type_to_string(tmpctx, struct bitcoin_signature, sig),
+		     type_to_string(tmpctx, struct bitcoin_tx, *tx),
+		     type_to_string(tmpctx, struct pubkey,
+				    &state->our_funding_pubkey));
+
+	/* Now we give our peer the signature for their first commitment
+	 * transaction. */
+	msg = towire_funding_created(state, &state->channel_id,
+				     &state->funding_txid,
+				     state->funding_txout,
+				     &sig->s);
+	sync_crypto_write(state->pps, msg);
+
+	/* BOLT #2:
+	 *
+	 * ### The `funding_signed` Message
+	 *
+	 * This message gives the funder the signature it needs for the first
+	 * commitment transaction, so it can broadcast the transaction knowing
+	 * that funds can be redeemed, if need be.
+	 */
+	peer_billboard(false,
+		       "Funding channel: create first tx, now waiting for their signature");
+
+	/* Now they send us their signature for that first commitment
+	 * transaction. */
+	msg = opening_negotiate_msg(tmpctx, state, true);
+	if (!msg)
+		goto fail;
+
+	sig->sighash_type = SIGHASH_ALL;
+	if (!fromwire_funding_signed(msg, &id_in, &sig->s))
+		peer_failed(state->pps,
+			    &state->channel_id,
+			    "Parsing funding_signed: %s", tal_hex(msg, msg));
+
+	/* BOLT #2:
+	 *
+	 * This message introduces the `channel_id` to identify the channel.
+	 * It's derived from the funding transaction by combining the
+	 * `funding_txid` and the `funding_output_index`, using big-endian
+	 * exclusive-OR (i.e. `funding_output_index` alters the last 2
+	 * bytes).
+	 */
+
+	/*~ Back in Milan, we chose to allow multiple channels between peers in
+	 * the protocol.  I insisted that we multiplex these over the same
+	 * socket, and (even though I didn't plan on implementing it anytime
+	 * soon) that we put it into the first version of the protocol
+	 * because it would be painful to add in later.
+	 *
+	 * My logic seemed sound: we treat new connections as an implication
+	 * that the old connection has disconnected, which happens more often
+	 * than you'd hope on modern networks.  However, supporting multiple
+	 * channels via multiple connections would be far easier for us to
+	 * support with our (introduced-since) separate daemon model.
+	 *
+	 * Let this be a lesson: beware premature specification, even if you
+	 * suspect "we'll need it later!". */
+	derive_channel_id(&state->channel_id,
+			  &state->funding_txid, state->funding_txout);
+
+	if (!channel_id_eq(&id_in, &state->channel_id))
+		peer_failed(state->pps, &id_in,
+			    "funding_signed ids don't match: expected %s got %s",
+			    type_to_string(msg, struct channel_id,
+					   &state->channel_id),
+			    type_to_string(msg, struct channel_id, &id_in));
+
+	/* BOLT #2:
+	 *
+	 * The recipient:
+	 *   - if `signature` is incorrect:
+	 *     - MUST fail the channel.
+	 */
+	/* So we create *our* initial commitment transaction, and check the
+	 * signature they sent against that. */
+	*tx = initial_channel_tx(state, &wscript, state->channel,
+				 &state->first_per_commitment_point[LOCAL],
+				 LOCAL, &err_reason);
+	if (!*tx) {
+		negotiation_failed(state, true,
+				   "Could not meet our fees and reserve: %s", err_reason);
+		goto fail;
+	}
+
+	if (!check_tx_sig(*tx, 0, NULL, wscript, &state->their_funding_pubkey, sig)) {
+		peer_failed(state->pps,
+			    &state->channel_id,
+			    "Bad signature %s on tx %s using key %s",
+			    type_to_string(tmpctx, struct bitcoin_signature,
+					   sig),
+			    type_to_string(tmpctx, struct bitcoin_tx, *tx),
+			    type_to_string(tmpctx, struct pubkey,
+					   &state->their_funding_pubkey));
+	}
+
+	peer_billboard(false, "Funding channel: opening negotiation succeeded");
+
+	return true;
+
+fail:
+	tal_free(wscript);
+	return false;
+}
+
+static u8 *funder_channel_complete(struct state *state)
+{
+	struct bitcoin_tx *tx;
+	struct bitcoin_signature sig;
+	struct amount_msat local_msat;
+
+	/* Update the billboard about what we're doing*/
+	peer_billboard(false,
+		       "Funding channel con't: continuing with funding_txid %s",
+		       type_to_string(tmpctx, struct bitcoin_txid, &state->funding_txid));
+
+	/* We recalculate the local_msat from cached values; should
+	 * succeed because we checked it earlier */
+	assert(amount_sat_sub_msat(&local_msat, state->funding, state->push_msat));
+
+	state->channel = new_initial_channel(state,
+					     &state->chainparams->genesis_blockhash,
+					     &state->funding_txid,
+					     state->funding_txout,
+					     state->minimum_depth,
+					     state->funding,
+					     local_msat,
+					     state->feerate_per_kw,
+					     &state->localconf,
+					     &state->remoteconf,
+					     &state->our_points,
+					     &state->their_points,
+					     &state->our_funding_pubkey,
+					     &state->their_funding_pubkey,
+					     /* Funder is local */
+					     LOCAL);
+	/* We were supposed to do enough checks above, but just in case,
+	 * new_initial_channel will fail to create absurd channels */
+	if (!state->channel)
+		peer_failed(state->pps,
+			    &state->channel_id,
+			    "could not create channel with given config");
+
+
+	if (!funder_finalize_channel_setup(state, local_msat, &sig, &tx))
+		return NULL;
+
+	return towire_opening_funder_reply(state,
+					   &state->remoteconf,
+					   tx,
+					   &sig,
+					   state->pps,
+					   &state->their_points.revocation,
+					   &state->their_points.payment,
+					   &state->their_points.htlc,
+					   &state->their_points.delayed_payment,
+					   &state->first_per_commitment_point[REMOTE],
+					   state->minimum_depth,
+					   &state->their_funding_pubkey,
+					   &state->funding_txid,
+					   state->funding_txout,
+					   state->feerate_per_kw,
+					   state->localconf.channel_reserve,
+					   state->remote_upfront_shutdown_script);
+}
+
+/*~ OK, let's fund a channel!  Returns the reply for lightningd on success,
+ * or NULL if something goes wrong. */
+static u8 *funder_channel(struct state *state,
+			  struct amount_sat change,
+			  u32 change_keyindex,
+			  u8 channel_flags,
+			  struct utxo **utxos TAKES,
+			  const struct ext_key *bip32_base)
+{
+	struct channel_id id_in;
+	u8 *msg;
+	struct pubkey *changekey;
+	struct bitcoin_signature sig;
+	struct bitcoin_tx *funding, *tx;
+	struct amount_msat local_msat;
+
+	if (!setup_channel_funder(state))
+		goto fail;
+
+	/* BOLT #2:
+	 *
+	 * The sending node:
+	 *...
+	 *  - MUST set `push_msat` to equal or less than 1000 *
+	 *   `funding_satoshis`.
+	 */
+	if (!amount_sat_sub_msat(&local_msat, state->funding, state->push_msat))
+		status_failed(STATUS_FAIL_MASTER_IO,
+			      "push-msat must be < %s",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &state->funding));
+	/* BOLT #2:
+	 *
+	 * - if both nodes advertised the `option_upfront_shutdown_script`
+	 *   feature:
+	 *   - MUST include either a valid `shutdown_scriptpubkey` as required
+	 *     by `shutdown` `scriptpubkey`, or a zero-length
+	 *     `shutdown_scriptpubkey`.
+	 * - otherwise:
+	 *   - MAY include a`shutdown_scriptpubkey`.
+	 */
+	/* We don't use shutdown_scriptpubkey (at least for now), so leave it
+	 * NULL. */
+	msg = towire_open_channel_option_upfront_shutdown_script(NULL,
+				  &state->chainparams->genesis_blockhash,
+				  &state->channel_id,
+				  state->funding,
+				  state->push_msat,
+				  state->localconf.dust_limit,
+				  state->localconf.max_htlc_value_in_flight,
+				  state->localconf.channel_reserve,
+				  state->localconf.htlc_minimum,
+				  state->feerate_per_kw,
+				  state->localconf.to_self_delay,
+				  state->localconf.max_accepted_htlcs,
+				  &state->our_funding_pubkey,
+				  &state->our_points.revocation,
+				  &state->our_points.payment,
+				  &state->our_points.delayed_payment,
+				  &state->our_points.htlc,
+				  &state->first_per_commitment_point[LOCAL],
+				  channel_flags,
+				  dev_upfront_shutdown_script(tmpctx));
+	sync_crypto_write(state->pps, take(msg));
+
+	/* This is usually a very transient state... */
+	peer_billboard(false,
+		       "Funding channel: offered, now waiting for accept_channel");
+	/* ... since their reply should be immediate. */
+	msg = opening_negotiate_msg(tmpctx, state, true);
+	if (!msg)
+		goto fail;
+
+	/* Default is no shutdown_scriptpubkey: free any leftover one. */
+	state->remote_upfront_shutdown_script
+		= tal_free(state->remote_upfront_shutdown_script);
+
+	/* BOLT #2:
+	 *
+	 * The receiving node MUST fail the channel if:
+	 *...
+	 *  - `funding_pubkey`, `revocation_basepoint`, `htlc_basepoint`,
+	 *    `payment_basepoint`, or `delayed_payment_basepoint` are not
+	 *    valid DER-encoded compressed secp256k1 pubkeys.
+	 */
+	if (local_feature_negotiated(state->localfeatures,
+				     LOCAL_UPFRONT_SHUTDOWN_SCRIPT)) {
+		if (!fromwire_accept_channel_option_upfront_shutdown_script(state,
+				     msg, &id_in,
+				     &state->remoteconf.dust_limit,
+				     &state->remoteconf.max_htlc_value_in_flight,
+				     &state->remoteconf.channel_reserve,
+				     &state->remoteconf.htlc_minimum,
+				     &state->minimum_depth,
+				     &state->remoteconf.to_self_delay,
+				     &state->remoteconf.max_accepted_htlcs,
+				     &state->their_funding_pubkey,
+				     &state->their_points.revocation,
+				     &state->their_points.payment,
+				     &state->their_points.delayed_payment,
+				     &state->their_points.htlc,
+				     &state->first_per_commitment_point[REMOTE],
+				     &state->remote_upfront_shutdown_script))
+			peer_failed(state->pps,
+				    &state->channel_id,
+				    "Parsing accept_channel with option_upfront_shutdown_script %s", tal_hex(msg, msg));
+	} else if (!fromwire_accept_channel(msg, &id_in,
+				     &state->remoteconf.dust_limit,
+				     &state->remoteconf.max_htlc_value_in_flight,
+				     &state->remoteconf.channel_reserve,
+				     &state->remoteconf.htlc_minimum,
+				     &state->minimum_depth,
+				     &state->remoteconf.to_self_delay,
+				     &state->remoteconf.max_accepted_htlcs,
+				     &state->their_funding_pubkey,
+				     &state->their_points.revocation,
+				     &state->their_points.payment,
+				     &state->their_points.delayed_payment,
+				     &state->their_points.htlc,
+				     &state->first_per_commitment_point[REMOTE]))
+		peer_failed(state->pps,
+			    &state->channel_id,
+			    "Parsing accept_channel %s", tal_hex(msg, msg));
+
+	/* BOLT #2:
+	 *
+	 * The `temporary_channel_id` MUST be the same as the
+	 * `temporary_channel_id` in the `open_channel` message. */
+	if (!channel_id_eq(&id_in, &state->channel_id))
+		/* In this case we exit, since we don't know what's going on. */
+		peer_failed(state->pps,
 			    &state->channel_id,
 			    "accept_channel ids don't match: sent %s got %s",
 			    type_to_string(msg, struct channel_id, &id_in),
@@ -556,12 +1007,12 @@ static u8 *funder_channel(struct state *state,
 	 *  - if `minimum_depth` is unreasonably large:
 	 *    - MAY reject the channel.
 	 */
-	if (minimum_depth > 10) {
+	if (state->minimum_depth > 10) {
 		/* negotiation_failed just tells peer and lightningd
 		 * (hence fundchannel call) that this opening failed. */
 		negotiation_failed(state, true,
 				   "minimum_depth %u larger than %u",
-				   minimum_depth, 10);
+				   state->minimum_depth, 10);
 		goto fail;
 	}
 
@@ -622,179 +1073,15 @@ static u8 *funder_channel(struct state *state,
 			     cast_const2(const struct utxo **, utxos),
 			     state->funding,
 			     &state->our_funding_pubkey,
-			     &their_funding_pubkey,
+			     &state->their_funding_pubkey,
 			     change, changekey,
 			     bip32_base);
 	bitcoin_txid(funding, &state->funding_txid);
 
-	/*~ Now we can initialize the `struct channel`.  This represents
-	 * the current channel state and is how we can generate the current
-	 * commitment transaction.
-	 *
-	 * The routines to support `struct channel` are split into a common
-	 * part (common/initial_channel) which doesn't support HTLCs and is
-	 * enough for us here, and the complete channel support required by
-	 * `channeld` which lives in channeld/full_channel. */
-	state->channel = new_initial_channel(state,
-					     &state->chainparams->genesis_blockhash,
-					     &state->funding_txid,
-					     state->funding_txout,
-					     minimum_depth,
-					     state->funding,
-					     local_msat,
-					     state->feerate_per_kw,
-					     &state->localconf,
-					     &state->remoteconf,
-					     &state->our_points, &theirs,
-					     &state->our_funding_pubkey,
-					     &their_funding_pubkey,
-					     /* Funder is local */
-					     LOCAL);
-	/* We were supposed to do enough checks above, but just in case,
-	 * new_initial_channel will fail to create absurd channels */
-	if (!state->channel)
-		peer_failed(&state->cs,
-			    &state->channel_id,
-			    "could not create channel with given config");
-
-	/* BOLT #2:
-	 *
-	 * ### The `funding_created` Message
-	 *
-	 * This message describes the outpoint which the funder has created
-	 * for the initial commitment transactions.  After receiving the
-	 * peer's signature, via `funding_signed`, it will broadcast the funding
-	 * transaction.
-	 */
-	/* This gives us their first commitment transaction. */
-	tx = initial_channel_tx(state, &wscript, state->channel,
-				&state->first_per_commitment_point[REMOTE],
-				REMOTE, &err_reason);
-	if (!tx) {
-		/* This should not happen: we should never create channels we
-		 * can't afford the fees for after reserve. */
-		negotiation_failed(state, true,
-				   "Could not meet their fees and reserve: %s", err_reason);
-		goto fail_2;
+	if (!funder_finalize_channel_setup(state, local_msat, &sig, &tx)) {
+		tal_free(funding);
+		goto fail;
 	}
-
-	/* We ask the HSM to sign their commitment transaction for us: it knows
-	 * our funding key, it just needs the remote funding key to create the
-	 * witness script.  It also needs the amount of the funding output,
-	 * as segwit signatures commit to that as well, even though it doesn't
-	 * explicitly appear in the transaction itself. */
-	msg = towire_hsm_sign_remote_commitment_tx(NULL,
-						   tx,
-						   &state->channel->funding_pubkey[REMOTE],
-						   state->channel->funding);
-
-	wire_sync_write(HSM_FD, take(msg));
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsm_sign_tx_reply(msg, &sig))
-		status_failed(STATUS_FAIL_HSM_IO, "Bad sign_tx_reply %s",
-			      tal_hex(tmpctx, msg));
-
-	/* You can tell this has been a problem before, since there's a debug
-	 * message here: */
-	status_trace("signature %s on tx %s using key %s",
-		     type_to_string(tmpctx, struct bitcoin_signature, &sig),
-		     type_to_string(tmpctx, struct bitcoin_tx, tx),
-		     type_to_string(tmpctx, struct pubkey,
-				    &state->our_funding_pubkey));
-
-	/* Now we give our peer the signature for their first commitment
-	 * transaction. */
-	msg = towire_funding_created(state, &state->channel_id,
-				     &state->funding_txid,
-				     state->funding_txout,
-				     &sig.s);
-	sync_crypto_write(&state->cs, PEER_FD, msg);
-
-	/* BOLT #2:
-	 *
-	 * ### The `funding_signed` Message
-	 *
-	 * This message gives the funder the signature it needs for the first
-	 * commitment transaction, so it can broadcast the transaction knowing
-	 * that funds can be redeemed, if need be.
-	 */
-	peer_billboard(false,
-		       "Funding channel: create first tx, now waiting for their signature");
-
-	/* Now they send us their signature for that first commitment
-	 * transaction. */
-	msg = opening_negotiate_msg(tmpctx, state, true);
-	if (!msg)
-		goto fail_2;
-
-	sig.sighash_type = SIGHASH_ALL;
-	if (!fromwire_funding_signed(msg, &id_in, &sig.s))
-		peer_failed(&state->cs,
-			    &state->channel_id,
-			    "Parsing funding_signed: %s", tal_hex(msg, msg));
-
-	/* BOLT #2:
-	 *
-	 * This message introduces the `channel_id` to identify the channel.
-	 * It's derived from the funding transaction by combining the
-	 * `funding_txid` and the `funding_output_index`, using big-endian
-	 * exclusive-OR (i.e. `funding_output_index` alters the last 2
-	 * bytes).
-	 */
-
-	/*~ Back in Milan, we chose to allow multiple channels between peers in
-	 * the protocol.  I insisted that we multiplex these over the same
-	 * socket, and (even though I didn't plan on implementing it anytime
-	 * soon) that we put it into the first version of the protocol
-	 * because it would be painful to add in later.
-	 *
-	 * My logic seemed sound: we treat new connections as an implication
-	 * that the old connection has disconnected, which happens more often
-	 * than you'd hope on modern networks.  However, supporting multiple
-	 * channels via multiple connections would be far easier for us to
-	 * support with our (introduced-since) separate daemon model.
-	 *
-	 * Let this be a lesson: beware premature specification, even if you
-	 * suspect "we'll need it later!". */
-	derive_channel_id(&state->channel_id,
-			  &state->funding_txid, state->funding_txout);
-
-	if (!channel_id_eq(&id_in, &state->channel_id))
-		peer_failed(&state->cs, &id_in,
-			    "funding_signed ids don't match: expected %s got %s",
-			    type_to_string(msg, struct channel_id,
-					   &state->channel_id),
-			    type_to_string(msg, struct channel_id, &id_in));
-
-	/* BOLT #2:
-	 *
-	 * The recipient:
-	 *   - if `signature` is incorrect:
-	 *     - MUST fail the channel.
-	 */
-	/* So we create *our* initial commitment transaction, and check the
-	 * signature they sent against that. */
-	tx = initial_channel_tx(state, &wscript, state->channel,
-				&state->first_per_commitment_point[LOCAL],
-				LOCAL, &err_reason);
-	if (!tx) {
-		negotiation_failed(state, true,
-				   "Could not meet our fees and reserve: %s", err_reason);
-		goto fail_2;
-	}
-
-	if (!check_tx_sig(tx, 0, NULL, wscript, &their_funding_pubkey, &sig)) {
-		peer_failed(&state->cs,
-			    &state->channel_id,
-			    "Bad signature %s on tx %s using key %s",
-			    type_to_string(tmpctx, struct bitcoin_signature,
-					   &sig),
-			    type_to_string(tmpctx, struct bitcoin_tx, tx),
-			    type_to_string(tmpctx, struct pubkey,
-					   &their_funding_pubkey));
-	}
-
-	peer_billboard(false, "Funding channel: opening negotiation succeeded");
 
 	if (taken(utxos))
 		tal_free(utxos);
@@ -812,21 +1099,20 @@ static u8 *funder_channel(struct state *state,
 					   &state->remoteconf,
 					   tx,
 					   &sig,
-					   &state->cs,
-					   &theirs.revocation,
-					   &theirs.payment,
-					   &theirs.htlc,
-					   &theirs.delayed_payment,
+					   state->pps,
+					   &state->their_points.revocation,
+					   &state->their_points.payment,
+					   &state->their_points.htlc,
+					   &state->their_points.delayed_payment,
 					   &state->first_per_commitment_point[REMOTE],
-					   minimum_depth,
-					   &their_funding_pubkey,
+					   state->minimum_depth,
+					   &state->their_funding_pubkey,
 					   &state->funding_txid,
+					   state->funding_txout,
 					   state->feerate_per_kw,
-					   state->localconf.channel_reserve);
+					   state->localconf.channel_reserve,
+					   state->remote_upfront_shutdown_script);
 
-fail_2:
-	tal_free(wscript);
-	tal_free(funding);
 fail:
 	if (taken(utxos))
 		tal_free(utxos);
@@ -847,6 +1133,10 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	u8 channel_flags;
 	char* err_reason;
 
+	/* Default is no shutdown_scriptpubkey: free any leftover one. */
+	state->remote_upfront_shutdown_script
+		= tal_free(state->remote_upfront_shutdown_script);
+
 	/* BOLT #2:
 	 *
 	 * The receiving node MUST fail the channel if:
@@ -855,37 +1145,52 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 *    `payment_basepoint`, or `delayed_payment_basepoint` are not valid
 	 *     DER-encoded compressed secp256k1 pubkeys.
 	 */
-	if (!fromwire_open_channel(open_channel_msg, &chain_hash,
-				   &state->channel_id,
-				   &state->funding,
-				   &state->push_msat,
-				   &state->remoteconf.dust_limit,
-				   &state->remoteconf.max_htlc_value_in_flight,
-				   &state->remoteconf.channel_reserve,
-				   &state->remoteconf.htlc_minimum,
-				   &state->feerate_per_kw,
-				   &state->remoteconf.to_self_delay,
-				   &state->remoteconf.max_accepted_htlcs,
-				   &their_funding_pubkey,
-				   &theirs.revocation,
-				   &theirs.payment,
-				   &theirs.delayed_payment,
-				   &theirs.htlc,
-				   &state->first_per_commitment_point[REMOTE],
-				   &channel_flags))
-		peer_failed(&state->cs, NULL,
+	if (local_feature_negotiated(state->localfeatures,
+				     LOCAL_UPFRONT_SHUTDOWN_SCRIPT)) {
+		if (!fromwire_open_channel_option_upfront_shutdown_script(state,
+			    open_channel_msg, &chain_hash,
+			    &state->channel_id,
+			    &state->funding,
+			    &state->push_msat,
+			    &state->remoteconf.dust_limit,
+			    &state->remoteconf.max_htlc_value_in_flight,
+			    &state->remoteconf.channel_reserve,
+			    &state->remoteconf.htlc_minimum,
+			    &state->feerate_per_kw,
+			    &state->remoteconf.to_self_delay,
+			    &state->remoteconf.max_accepted_htlcs,
+			    &their_funding_pubkey,
+			    &theirs.revocation,
+			    &theirs.payment,
+			    &theirs.delayed_payment,
+			    &theirs.htlc,
+			    &state->first_per_commitment_point[REMOTE],
+			    &channel_flags,
+			    &state->remote_upfront_shutdown_script))
+		    peer_failed(state->pps,
+				&state->channel_id,
+				"Parsing open_channel with option_upfront_shutdown_script %s", tal_hex(tmpctx, open_channel_msg));
+	} else if (!fromwire_open_channel(open_channel_msg, &chain_hash,
+				      &state->channel_id,
+				      &state->funding,
+				      &state->push_msat,
+				      &state->remoteconf.dust_limit,
+				      &state->remoteconf.max_htlc_value_in_flight,
+				      &state->remoteconf.channel_reserve,
+				      &state->remoteconf.htlc_minimum,
+				      &state->feerate_per_kw,
+				      &state->remoteconf.to_self_delay,
+				      &state->remoteconf.max_accepted_htlcs,
+				      &their_funding_pubkey,
+				      &theirs.revocation,
+				      &theirs.payment,
+				      &theirs.delayed_payment,
+				      &theirs.htlc,
+				      &state->first_per_commitment_point[REMOTE],
+				      &channel_flags))
+		peer_failed(state->pps, NULL,
 			    "Bad open_channel %s",
 			    tal_hex(open_channel_msg, open_channel_msg));
-
-	/* We can't handle talking about more than one channel at once. */
-	if (!state->can_accept_channel) {
-		u8 *errmsg;
-		errmsg = towire_errorfmt(NULL, &state->channel_id,
-					 "Already have active channel");
-
-		sync_crypto_write(&state->cs, PEER_FD, take(errmsg));
-		return NULL;
-	}
 
 	/* BOLT #2:
 	 *
@@ -922,9 +1227,9 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 *   - `push_msat` is greater than `funding_satoshis` * 1000.
 	 */
 	if (amount_msat_greater_sat(state->push_msat, state->funding)) {
-		peer_failed(&state->cs,
+		peer_failed(state->pps,
 			    &state->channel_id,
-			    "Our push_msat %s"
+			    "Their push_msat %s"
 			    " would be too large for funding_satoshis %s",
 			    type_to_string(tmpctx, struct amount_msat,
 					   &state->push_msat),
@@ -993,8 +1298,36 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	if (!check_config_bounds(state, &state->remoteconf, false))
 		return NULL;
 
+	/* Check with lightningd that we can accept this?  In particular,
+	 * if we have an existing channel, we don't support it. */
+	msg = towire_opening_got_offer(NULL,
+				       state->funding,
+				       state->push_msat,
+				       state->remoteconf.dust_limit,
+				       state->remoteconf.max_htlc_value_in_flight,
+				       state->remoteconf.channel_reserve,
+				       state->remoteconf.htlc_minimum,
+				       state->feerate_per_kw,
+				       state->remoteconf.to_self_delay,
+				       state->remoteconf.max_accepted_htlcs,
+				       channel_flags,
+				       state->remote_upfront_shutdown_script);
+	wire_sync_write(REQ_FD, take(msg));
+	msg = wire_sync_read(tmpctx, REQ_FD);
+
+	if (!fromwire_opening_got_offer_reply(tmpctx, msg, &err_reason))
+		master_badmsg(WIRE_OPENING_GOT_OFFER_REPLY, msg);
+
+	/* If they give us a reason to reject, do so. */
+	if (err_reason) {
+		u8 *errmsg = towire_errorfmt(NULL, &state->channel_id,
+					     "%s", err_reason);
+		sync_crypto_write(state->pps, take(errmsg));
+		return NULL;
+	}
+
 	/* OK, we accept! */
-	msg = towire_accept_channel(NULL, &state->channel_id,
+	msg = towire_accept_channel_option_upfront_shutdown_script(NULL, &state->channel_id,
 				    state->localconf.dust_limit,
 				    state->localconf.max_htlc_value_in_flight,
 				    state->localconf.channel_reserve,
@@ -1007,9 +1340,10 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				    &state->our_points.payment,
 				    &state->our_points.delayed_payment,
 				    &state->our_points.htlc,
-				    &state->first_per_commitment_point[LOCAL]);
+				    &state->first_per_commitment_point[LOCAL],
+				    dev_upfront_shutdown_script(tmpctx));
 
-	sync_crypto_write(&state->cs, PEER_FD, take(msg));
+	sync_crypto_write(state->pps, take(msg));
 
 	peer_billboard(false,
 		       "Incoming channel: accepted, now waiting for them to create funding tx");
@@ -1026,7 +1360,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				      &state->funding_txid,
 				      &state->funding_txout,
 				      &theirsig.s))
-		peer_failed(&state->cs,
+		peer_failed(state->pps,
 			    &state->channel_id,
 			    "Parsing funding_created");
 
@@ -1036,7 +1370,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 * `temporary_channel_id` in the `open_channel` message.
 	 */
 	if (!channel_id_eq(&id_in, &state->channel_id))
-		peer_failed(&state->cs, &id_in,
+		peer_failed(state->pps, &id_in,
 			    "funding_created ids don't match: sent %s got %s",
 			    type_to_string(msg, struct channel_id,
 					   &state->channel_id),
@@ -1060,7 +1394,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	/* We don't expect this to fail, but it does do some additional
 	 * internal sanity checks. */
 	if (!state->channel)
-		peer_failed(&state->cs,
+		peer_failed(state->pps,
 			    &state->channel_id,
 			    "We could not create channel with given config");
 
@@ -1095,7 +1429,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		 * a courtesy to other implementaters whose brains may be so
 		 * twisted by coding in Go, Scala and Rust that they can no
 		 * longer read C code. */
-		peer_failed(&state->cs,
+		peer_failed(state->pps,
 			    &state->channel_id,
 			    "Bad signature %s on tx %s using key %s",
 			    type_to_string(tmpctx, struct bitcoin_signature,
@@ -1160,7 +1494,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     &state->remoteconf,
 				     local_commit,
 				     &theirsig,
-				     &state->cs,
+				     state->pps,
 				     &theirs.revocation,
 				     &theirs.payment,
 				     &theirs.htlc,
@@ -1174,7 +1508,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     channel_flags,
 				     state->feerate_per_kw,
 				     msg,
-				     state->localconf.channel_reserve);
+				     state->localconf.channel_reserve,
+				     state->remote_upfront_shutdown_script);
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -1182,7 +1517,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
  * surprise. */
 static u8 *handle_peer_in(struct state *state)
 {
-	u8 *msg = sync_crypto_read(tmpctx, &state->cs, PEER_FD);
+	u8 *msg = sync_crypto_read(tmpctx, state->pps);
 	enum wire_type t = fromwire_peektype(msg);
 	struct channel_id channel_id;
 
@@ -1220,13 +1555,13 @@ static u8 *handle_peer_in(struct state *state)
 	case WIRE_UPDATE_FEE:
 	case WIRE_ANNOUNCEMENT_SIGNATURES:
 		/* Standard cases */
-		if (handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD, &state->cs,
+		if (handle_peer_gossip_or_error(state->pps,
 						&state->channel_id, msg))
 			return NULL;
 		break;
 	}
 
-	sync_crypto_write(&state->cs, PEER_FD,
+	sync_crypto_write(state->pps,
 			  take(towire_errorfmt(NULL,
 					       extract_channel_id(msg, &channel_id) ? &channel_id : NULL,
 					       "Unexpected message %s: %s",
@@ -1240,17 +1575,17 @@ static u8 *handle_peer_in(struct state *state)
 	peer_failed_connection_lost();
 }
 
-/*~ If we see the GOSSIP_FD readable, we read a whole message.  Sure, we might
+/*~ If we see the gossip_fd readable, we read a whole message.  Sure, we might
  * block, but we trust gossipd. */
 static void handle_gossip_in(struct state *state)
 {
-	u8 *msg = wire_sync_read(NULL, GOSSIP_FD);
+	u8 *msg = wire_sync_read(NULL, state->pps->gossip_fd);
 
 	if (!msg)
 		status_failed(STATUS_FAIL_GOSSIP_IO,
 			      "Reading gossip: %s", strerror(errno));
 
-	handle_gossip_msg(PEER_FD, &state->cs, take(msg));
+	handle_gossip_msg(state->pps, take(msg));
 }
 
 /*~ Is this message of type `error` with the special zero-id
@@ -1305,6 +1640,8 @@ static u8 *handle_master_in(struct state *state)
 	struct amount_sat change;
 	u32 change_keyindex;
 	u8 channel_flags;
+	struct bitcoin_txid funding_txid;
+	u16 funding_txout;
 	struct utxo **utxos;
 	struct ext_key bip32_base;
 
@@ -1325,13 +1662,34 @@ static u8 *handle_master_in(struct state *state)
 				     change_keyindex, channel_flags,
 				     take(utxos), &bip32_base);
 		return msg;
+	case WIRE_OPENING_FUNDER_START:
+		if (!fromwire_opening_funder_start(msg, &state->funding,
+						   &state->push_msat,
+						   &state->feerate_per_kw,
+						   &channel_flags))
+			master_badmsg(WIRE_OPENING_FUNDER_START, msg);
+		msg = funder_channel_start(state, channel_flags);
 
-	case WIRE_OPENING_CAN_ACCEPT_CHANNEL:
-		if (!fromwire_opening_can_accept_channel(msg))
-			master_badmsg(WIRE_OPENING_CAN_ACCEPT_CHANNEL, msg);
-		state->can_accept_channel = true;
+		/* We want to keep openingd alive, since we're not done yet */
+		wire_sync_write(REQ_FD, take(msg));
 		return NULL;
+	case WIRE_OPENING_FUNDER_COMPLETE:
+		if (!fromwire_opening_funder_complete(msg,
+						      &funding_txid,
+						      &funding_txout))
+			master_badmsg(WIRE_OPENING_FUNDER_COMPLETE, msg);
+		state->funding_txid = funding_txid;
+		state->funding_txout = funding_txout;
+		return funder_channel_complete(state);
+	case WIRE_OPENING_FUNDER_CANCEL:
+		/* We're aborting this, simple */
+		if (!fromwire_opening_funder_cancel(msg))
+			master_badmsg(WIRE_OPENING_FUNDER_CANCEL, msg);
 
+		msg = towire_errorfmt(NULL, &state->channel_id, "Channel open canceled by us");
+		sync_crypto_write(state->pps, take(msg));
+		negotiation_aborted(state, true, "Channel open canceled by RPC");
+		return NULL;
 	case WIRE_OPENING_DEV_MEMLEAK:
 #if DEVELOPER
 		handle_dev_memleak(state, msg);
@@ -1340,13 +1698,24 @@ static u8 *handle_master_in(struct state *state)
 	case WIRE_OPENING_DEV_MEMLEAK_REPLY:
 	case WIRE_OPENING_INIT:
 	case WIRE_OPENING_FUNDER_REPLY:
+	case WIRE_OPENING_FUNDER_START_REPLY:
 	case WIRE_OPENING_FUNDEE:
 	case WIRE_OPENING_FUNDER_FAILED:
+	case WIRE_OPENING_GOT_OFFER:
+	case WIRE_OPENING_GOT_OFFER_REPLY:
 		break;
 	}
 
 	status_failed(STATUS_FAIL_MASTER_IO,
 		      "Unknown msg %s", tal_hex(tmpctx, msg));
+}
+
+static void try_read_gossip_store(struct state *state)
+{
+	u8 *msg = gossip_store_next(tmpctx, state->pps);
+
+	if (msg)
+		sync_crypto_write(state->pps, take(msg));
 }
 
 int main(int argc, char *argv[])
@@ -1367,25 +1736,29 @@ int main(int argc, char *argv[])
 
 	/*~ The very first thing we read from lightningd is our init msg */
 	msg = wire_sync_read(tmpctx, REQ_FD);
-	if (!fromwire_opening_init(tmpctx, msg,
+	if (!fromwire_opening_init(state, msg,
 				   &chain_hash,
 				   &state->localconf,
 				   &state->max_to_self_delay,
 				   &state->min_effective_htlc_capacity,
-				   &state->cs,
+				   &state->pps,
 				   &state->our_points,
 				   &state->our_funding_pubkey,
 				   &state->minimum_depth,
 				   &state->min_feerate, &state->max_feerate,
-				   &state->can_accept_channel,
+				   &state->localfeatures,
 				   &inner))
 		master_badmsg(WIRE_OPENING_INIT, msg);
+
+	/* 3 == peer, 4 == gossipd, 5 = gossip_store, 6 = hsmd */
+	per_peer_state_set_fds(state->pps, 3, 4, 5);
 
 	/*~ If lightningd wanted us to send a msg, do so before we waste time
 	 * doing work.  If it's a global error, we'll close immediately. */
 	if (inner != NULL) {
-		sync_crypto_write(&state->cs, PEER_FD, inner);
+		sync_crypto_write(state->pps, inner);
 		fail_if_all_error(inner);
+		tal_free(inner);
 	}
 
 	/*~ Even though I only care about bitcoin, there's still testnet and
@@ -1396,6 +1769,9 @@ int main(int argc, char *argv[])
 	 * handle_peer_gossip_or_error compares this. */
 	memset(&state->channel_id, 0, sizeof(state->channel_id));
 	state->channel = NULL;
+
+	/*~ We set this to NULL, meaning no requirements on shutdown */
+	state->remote_upfront_shutdown_script = NULL;
 
 	/*~ We need an initial per-commitment point whether we're funding or
 	 * they are, and lightningd has reserved a unique dbid for us already,
@@ -1419,16 +1795,22 @@ int main(int argc, char *argv[])
 	/*~ We manually run a little poll() loop here.  With only three fds */
 	pollfd[0].fd = REQ_FD;
 	pollfd[0].events = POLLIN;
-	pollfd[1].fd = GOSSIP_FD;
+	pollfd[1].fd = state->pps->gossip_fd;
 	pollfd[1].events = POLLIN;
-	pollfd[2].fd = PEER_FD;
+	pollfd[2].fd = state->pps->peer_fd;
 	pollfd[2].events = POLLIN;
 
 	/* We exit when we get a conclusion to write to lightningd: either
 	 * opening_funder_reply or opening_fundee. */
 	msg = NULL;
 	while (!msg) {
-		poll(pollfd, ARRAY_SIZE(pollfd), -1);
+		int t;
+		struct timerel trel;
+		if (time_to_next_gossip(state->pps, &trel))
+			t = time_to_msec(trel);
+		else
+			t = -1;
+		poll(pollfd, ARRAY_SIZE(pollfd), t);
 		/* Subtle: handle_master_in can do its own poll loop, so
 		 * don't try to service more than one fd per loop. */
 		/* First priority: messages from lightningd. */
@@ -1440,6 +1822,8 @@ int main(int argc, char *argv[])
 		/* Last priority: chit-chat from gossipd. */
 		else if (pollfd[1].revents & POLLIN)
 			handle_gossip_in(state);
+		else
+			try_read_gossip_store(state);
 
 		/* Since we're the top-level event loop, we clean up */
 		clean_tmpctx();
@@ -1449,9 +1833,8 @@ int main(int argc, char *argv[])
 	 * means that if the peer or gossipd wrote us any messages we didn't
 	 * read yet, it will simply be read by the next daemon. */
 	wire_sync_write(REQ_FD, msg);
-	fdpass_send(REQ_FD, PEER_FD);
-	fdpass_send(REQ_FD, GOSSIP_FD);
-	status_trace("Sent %s with fd",
+	per_peer_state_fdpass_send(REQ_FD, state->pps);
+	status_trace("Sent %s with fds",
 		     opening_wire_type_name(fromwire_peektype(msg)));
 
 	/* This frees the entire tal tree. */

@@ -1,4 +1,5 @@
 COMMON_SRC_NOGEN :=				\
+	common/addr.c				\
 	common/amount.c				\
 	common/base32.c				\
 	common/bech32.c				\
@@ -18,15 +19,16 @@ COMMON_SRC_NOGEN :=				\
 	common/dev_disconnect.c			\
 	common/features.c			\
 	common/funding_tx.c			\
+	common/gossip_store.c			\
 	common/hash_u5.c			\
 	common/htlc_state.c			\
+	common/htlc_trim.c			\
 	common/htlc_tx.c			\
 	common/htlc_wire.c			\
 	common/initial_channel.c		\
 	common/initial_commit_tx.c		\
 	common/io_lock.c			\
 	common/json.c				\
-	common/json_escaped.c			\
 	common/json_helpers.c			\
 	common/json_tok.c			\
 	common/key_derive.c			\
@@ -35,6 +37,7 @@ COMMON_SRC_NOGEN :=				\
 	common/msg_queue.c			\
 	common/node_id.c			\
 	common/param.c				\
+	common/per_peer_state.c			\
 	common/peer_billboard.c			\
 	common/peer_failed.c			\
 	common/permute_tx.c			\
@@ -51,6 +54,7 @@ COMMON_SRC_NOGEN :=				\
 	common/utils.c				\
 	common/utxo.c				\
 	common/version.c			\
+	common/wallet.c				\
 	common/wallet_tx.c			\
 	common/wireaddr.c			\
 	common/wire_error.c			\
@@ -76,16 +80,16 @@ common/gen_htlc_state_names.h: common/htlc_state.h ccan/ccan/cdump/tools/cdump-e
 	ccan/ccan/cdump/tools/cdump-enumstr common/htlc_state.h > $@
 
 common/gen_status_wire.h: $(WIRE_GEN) common/status_wire.csv
-	$(WIRE_GEN) --header $@ status < common/status_wire.csv > $@
+	$(WIRE_GEN) --page header $@ status < common/status_wire.csv > $@
 
 common/gen_status_wire.c: $(WIRE_GEN) common/status_wire.csv
-	$(WIRE_GEN) ${@:.c=.h} status < common/status_wire.csv > $@
+	$(WIRE_GEN) --page impl ${@:.c=.h} status < common/status_wire.csv > $@
 
 common/gen_peer_status_wire.h: $(WIRE_GEN) common/peer_status_wire.csv
-	$(WIRE_GEN) --header $@ peer_status < common/peer_status_wire.csv > $@
+	$(WIRE_GEN) --page header $@ peer_status < common/peer_status_wire.csv > $@
 
 common/gen_peer_status_wire.c: $(WIRE_GEN) common/peer_status_wire.csv
-	$(WIRE_GEN) ${@:.c=.h} peer_status < common/peer_status_wire.csv > $@
+	$(WIRE_GEN) --page impl ${@:.c=.h} peer_status < common/peer_status_wire.csv > $@
 
 check-makefile: check-common-makefile
 

@@ -4,6 +4,7 @@
 #include <bitcoin/pubkey.h>
 #include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/htable/htable_type.h>
+#include <ccan/intmap/intmap.h>
 #include <ccan/time/time.h>
 #include <common/amount.h>
 #include <common/node_id.h>
@@ -12,6 +13,8 @@
 #include <gossipd/gossip_store.h>
 #include <wire/gen_onion_wire.h>
 #include <wire/wire.h>
+
+struct routing_state;
 
 struct half_chan {
 	/* millisatoshi. */
@@ -54,11 +57,14 @@ struct chan {
 	struct amount_sat sat;
 };
 
-/* A local channel can exist which isn't announced; normal channels are only
- * created once we have both an announcement *and* an update. */
+/* Use this instead of tal_free(chan)! */
+void free_chan(struct routing_state *rstate, struct chan *chan);
+
+/* A local channel can exist which isn't announced: we abuse timestamp
+ * to indicate this. */
 static inline bool is_chan_public(const struct chan *chan)
 {
-	return chan->bcast.index != 0;
+	return chan->bcast.timestamp != 0;
 }
 
 static inline bool is_halfchan_defined(const struct half_chan *hc)
@@ -215,8 +221,8 @@ struct routing_state {
 	/* channel_announcement which are pending short_channel_id lookup */
 	struct pending_cannouncement_map pending_cannouncements;
 
-	/* Broadcast map, and access to gossip store */
-	struct broadcast_state *broadcasts;
+	/* Gossip store */
+	struct gossip_store *gs;
 
 	/* Our own ID so we can identify local channels */
 	struct node_id local_id;
@@ -244,10 +250,6 @@ struct routing_state {
 #if DEVELOPER
 	/* Override local time for gossip messages */
 	struct timeabs *gossip_time;
-
-	/* Instead of ignoring unknown channels, pretend they're valid
-	 * with this many satoshis (if non-NULL) */
-	const struct amount_sat *dev_unknown_channel_satoshis;
 #endif
 };
 
@@ -271,8 +273,7 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct node_id *local_id,
 					u32 prune_timeout,
 					struct list_head *peers,
-					const u32 *dev_gossip_time,
-					const struct amount_sat *dev_unknown_channel_satoshis);
+					const u32 *dev_gossip_time);
 
 /**
  * Add a new bidirectional channel from id1 to id2 with the given
@@ -300,9 +301,10 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 
 /**
  * handle_pending_cannouncement -- handle channel_announce once we've
- * completed short_channel_id lookup.
+ * completed short_channel_id lookup.  Returns true if handling created
+ * a new channel.
  */
-void handle_pending_cannouncement(struct routing_state *rstate,
+bool handle_pending_cannouncement(struct routing_state *rstate,
 				  const struct short_channel_id *scid,
 				  const struct amount_sat sat,
 				  const u8 *txscript);
@@ -311,9 +313,12 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 struct chan *first_chan(const struct node *node, struct chan_map_iter *i);
 struct chan *next_chan(const struct node *node, struct chan_map_iter *i);
 
-/* Returns NULL if all OK, otherwise an error for the peer which sent. */
+/* Returns NULL if all OK, otherwise an error for the peer which sent.
+ * If the error is that the channel is unknown, fills in *unknown_scid
+ * (if not NULL). */
 u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
-			  const char *source);
+			  const char *source,
+			  struct short_channel_id *unknown_scid);
 
 /* Returns NULL if all OK, otherwise an error for the peer which sent. */
 u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node);
@@ -388,7 +393,8 @@ bool routing_add_node_announcement(struct routing_state *rstate,
  * is the case for private channels or channels that have not yet reached
  * `announce_depth`.
  */
-bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg);
+bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg,
+			      u64 index);
 
 #if DEVELOPER
 void memleak_remove_routing_tables(struct htable *memtable,
@@ -427,4 +433,12 @@ static inline void local_enable_chan(struct routing_state *rstate,
 /* Helper to convert on-wire addresses format to wireaddrs array */
 struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser);
 
+/* Remove channel from store: announcement and any updates. */
+void remove_channel_from_store(struct routing_state *rstate,
+			       struct chan *chan);
+
+/* Returns an error string if there are unfinalized entries after load */
+const char *unfinalized_entries(const tal_t *ctx, struct routing_state *rstate);
+
+void remove_all_gossip(struct routing_state *rstate);
 #endif /* LIGHTNING_GOSSIPD_ROUTING_H */

@@ -16,6 +16,7 @@
 #include <common/timeout.h>
 #include <dirent.h>
 #include <errno.h>
+#include <lightningd/io_loop_with_timers.h>
 #include <lightningd/json.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/notification.h>
@@ -77,15 +78,25 @@ struct plugins {
 	struct log *log;
 	struct log_book *log_book;
 
-	struct timers timers;
 	struct lightningd *ld;
+};
+
+/* The value of a plugin option, which can have different types.
+ * The presence of the integer and boolean values will depend of
+ * the option type, but the string value will always be filled.
+ */
+struct plugin_opt_value {
+	char *as_str;
+	int *as_int;
+	bool *as_bool;
 };
 
 struct plugin_opt {
 	struct list_node list;
 	const char *name;
+	const char *type;
 	const char *description;
-	char *value;
+	struct plugin_opt_value *value;
 };
 
 struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
@@ -96,9 +107,13 @@ struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
 	list_head_init(&p->plugins);
 	p->log_book = log_book;
 	p->log = new_log(p, log_book, "plugin-manager");
-	timers_init(&p->timers, time_mono());
 	p->ld = ld;
 	return p;
+}
+
+static void destroy_plugin(struct plugin *p)
+{
+	list_del(&p->list);
 }
 
 void plugin_register(struct plugins *plugins, const char* path TAKES)
@@ -115,6 +130,7 @@ void plugin_register(struct plugins *plugins, const char* path TAKES)
 			 path_basename(tmpctx, p->cmd));
 	p->methods = tal_arr(p, const char *, 0);
 	list_head_init(&p->plugin_opts);
+	tal_add_destructor(p, destroy_plugin);
 }
 
 static bool paths_match(const char *cmd, const char *name)
@@ -185,6 +201,7 @@ static void plugin_log_handle(struct plugin *plugin, const jsmntok_t *paramstok)
 {
 	const jsmntok_t *msgtok, *leveltok;
 	enum log_level level;
+	bool call_notifier;
 	msgtok = json_get_member(plugin->buffer, paramstok, "message");
 	leveltok = json_get_member(plugin->buffer, paramstok, "level");
 
@@ -211,7 +228,8 @@ static void plugin_log_handle(struct plugin *plugin, const jsmntok_t *paramstok)
 		return;
 	}
 
-	log_(plugin->log, level, "%.*s", msgtok->end - msgtok->start,
+	call_notifier = (level == LOG_BROKEN || level == LOG_UNUSUAL)? true : false;
+	log_(plugin->log, level, call_notifier, "%.*s", msgtok->end - msgtok->start,
 	     plugin->buffer + msgtok->start);
 }
 
@@ -374,6 +392,10 @@ static struct io_plan *plugin_read_json(struct io_conn *conn UNUSED,
 					struct plugin *plugin)
 {
 	bool success;
+
+	log_io(plugin->log, LOG_IO_IN, "",
+	       plugin->buffer + plugin->used, plugin->len_read);
+
 	plugin->used += plugin->len_read;
 	if (plugin->used == tal_count(plugin->buffer))
 		tal_resize(&plugin->buffer, plugin->used * 2);
@@ -463,8 +485,13 @@ static struct io_plan *plugin_stdout_conn_init(struct io_conn *conn,
 
 char *plugin_opt_set(const char *arg, struct plugin_opt *popt)
 {
-	tal_free(popt->value);
-	popt->value = tal_strdup(popt, arg);
+	tal_free(popt->value->as_str);
+	popt->value->as_str = tal_strdup(popt, arg);
+	if (streq(popt->type, "int"))
+		*popt->value->as_int = atoi(arg);
+	else if (streq(popt->type, "bool"))
+		*popt->value->as_bool = streq(arg, "true") || streq(arg, "True")
+			|| streq(arg, "1");
 	return NULL;
 }
 
@@ -486,31 +513,48 @@ static bool plugin_opt_add(struct plugin *plugin, const char *buffer,
 		return false;
 	}
 
-	/* FIXME(cdecker) Support numeric and boolean options as well */
-	if (!json_tok_streq(buffer, typetok, "string")) {
-		plugin_kill(plugin,
-			    "Only \"string\" options currently supported");
-		return false;
-	}
-
 	popt = tal(plugin, struct plugin_opt);
+	popt->value = talz(popt, struct plugin_opt_value);
 
 	popt->name = tal_fmt(plugin, "--%.*s", nametok->end - nametok->start,
 			     buffer + nametok->start);
-	popt->value = NULL;
-	if (defaulttok) {
-		popt->value = json_strdup(popt, buffer, defaulttok);
-		popt->description = tal_fmt(
-		    popt, "%.*s (default: %s)", desctok->end - desctok->start,
-		    buffer + desctok->start, popt->value);
+	if (json_tok_streq(buffer, typetok, "string")) {
+		popt->type = "string";
+		if (defaulttok) {
+			popt->value->as_str = json_strdup(popt, buffer, defaulttok);
+			popt->description = tal_fmt(
+					popt, "%.*s (default: %s)", desctok->end - desctok->start,
+					buffer + desctok->start, popt->value->as_str);
+		}
+	} else if (json_tok_streq(buffer, typetok, "int")) {
+		popt->type = "int";
+		popt->value->as_int = talz(popt->value, int);
+		if (defaulttok) {
+			json_to_int(buffer, defaulttok, popt->value->as_int);
+			popt->value->as_str = tal_fmt(popt->value, "%d", *popt->value->as_int);
+			popt->description = tal_fmt(
+					popt, "%.*s (default: %i)", desctok->end - desctok->start,
+					buffer + desctok->start, *popt->value->as_int);
+		}
+	} else if (json_tok_streq(buffer, typetok, "bool")) {
+		popt->type = "bool";
+		popt->value->as_bool = talz(popt->value, bool);
+		if (defaulttok) {
+			json_to_bool(buffer, defaulttok, popt->value->as_bool);
+			popt->value->as_str = tal_fmt(popt->value, *popt->value->as_bool ? "true" : "false");
+			popt->description = tal_fmt(
+					popt, "%.*s (default: %s)", desctok->end - desctok->start,
+					buffer + desctok->start, *popt->value->as_bool ? "true" : "false");
+		}
 	} else {
-		popt->description = json_strdup(popt, buffer, desctok);
+		plugin_kill(plugin, "Only \"string\", \"int\", and \"bool\" options are supported");
+		return false;
 	}
-
+	if (!defaulttok)
+		popt->description = json_strdup(popt, buffer, desctok);
 	list_add_tail(&plugin->plugin_opts, &popt->list);
-
 	opt_register_arg(popt->name, plugin_opt_set, NULL, popt,
-			 popt->description);
+				popt->description);
 	return true;
 }
 
@@ -552,20 +596,20 @@ static void json_stream_forward_change_id(struct json_stream *stream,
 	 * new_id into a string, or even worse, quote a string id
 	 * twice. */
 	size_t offset = idtok->type==JSMN_STRING?1:0;
-	json_stream_append_part(stream, buffer + toks->start,
-				idtok->start - toks->start - offset);
+	json_stream_append(stream, buffer + toks->start,
+			   idtok->start - toks->start - offset);
 
-	json_stream_append(stream, new_id);
-	json_stream_append_part(stream, buffer + idtok->end + offset,
-				toks->end - idtok->end - offset);
+	json_stream_append(stream, new_id, strlen(new_id));
+	json_stream_append(stream, buffer + idtok->end + offset,
+			   toks->end - idtok->end - offset);
 
 	/* We promise it will end in '\n\n' */
 	/* It's an object (with an id!): definitely can't be less that "{}" */
 	assert(toks->end - toks->start >= 2);
 	if (buffer[toks->end-1] != '\n')
-		json_stream_append(stream, "\n\n");
+		json_stream_append(stream, "\n\n", 2);
 	else if (buffer[toks->end-2] != '\n')
-		json_stream_append(stream, "\n");
+		json_stream_append(stream, "\n", 1);
 }
 
 static void plugin_rpcmethod_cb(const char *buffer,
@@ -631,11 +675,12 @@ static bool plugin_rpcmethod_add(struct plugin *plugin,
 				 const char *buffer,
 				 const jsmntok_t *meth)
 {
-	const jsmntok_t *nametok, *desctok, *longdesctok, *usagetok;
+	const jsmntok_t *nametok, *categorytok, *desctok, *longdesctok, *usagetok;
 	struct json_command *cmd;
 	const char *usage;
 
 	nametok = json_get_member(buffer, meth, "name");
+	categorytok = json_get_member(buffer, meth, "category");
 	desctok = json_get_member(buffer, meth, "description");
 	longdesctok = json_get_member(buffer, meth, "long_description");
 	usagetok = json_get_member(buffer, meth, "usage");
@@ -671,6 +716,10 @@ static bool plugin_rpcmethod_add(struct plugin *plugin,
 
 	cmd = notleak(tal(plugin, struct json_command));
 	cmd->name = json_strdup(cmd, buffer, nametok);
+	if (categorytok)
+        cmd->category = json_strdup(cmd, buffer, categorytok);
+	else
+		cmd->category = "plugin";
 	cmd->description = json_strdup(cmd, buffer, desctok);
 	if (longdesctok)
 		cmd->verbose = json_strdup(cmd, buffer, longdesctok);
@@ -900,15 +949,30 @@ void clear_plugins(struct plugins *plugins)
 		tal_free(p);
 }
 
+void plugins_add_default_dir(struct plugins *plugins, const char *default_dir)
+{
+	DIR *d = opendir(default_dir);
+	if (d) {
+		struct dirent *di;
+		while ((di = readdir(d)) != NULL) {
+			if (streq(di->d_name, ".") || streq(di->d_name, ".."))
+				continue;
+			add_plugin_dir(plugins, path_join(tmpctx, default_dir, di->d_name), true);
+		}
+		closedir(d);
+	}
+}
+
 void plugins_init(struct plugins *plugins, const char *dev_plugin_debug)
 {
 	struct plugin *p;
 	char **cmd;
 	int stdin, stdout;
-	struct timer *expired;
 	struct jsonrpc_request *req;
 	plugins->pending_manifests = 0;
 	uintmap_init(&plugins->pending_requests);
+
+	plugins_add_default_dir(plugins, path_join(tmpctx, plugins->ld->config_dir, "plugins"));
 
 	setenv("LIGHTNINGD_PLUGIN", "1", 1);
 	/* Spawn the plugin processes before entering the io_loop */
@@ -943,20 +1007,15 @@ void plugins_init(struct plugins *plugins, const char *dev_plugin_debug)
 			p->timeout_timer = NULL;
 		else {
 			p->timeout_timer
-				= new_reltimer(&plugins->timers, p,
+				= new_reltimer(plugins->ld->timers, p,
 					       time_from_sec(PLUGIN_MANIFEST_TIMEOUT),
 					       plugin_manifest_timeout, p);
 		}
 		tal_free(cmd);
 	}
 
-	while (plugins->pending_manifests > 0) {
-		void *v = io_loop(&plugins->timers, &expired);
-		if (v == plugins)
-			break;
-		if (expired)
-			timer_expired(plugins, expired);
-	}
+	if (plugins->pending_manifests > 0)
+		io_loop_with_timers(plugins->ld);
 }
 
 static void plugin_config_cb(const char *buffer,
@@ -984,9 +1043,9 @@ static void plugin_config(struct plugin *plugin)
 	list_for_each(&plugin->plugin_opts, opt, list) {
 		/* Trim the `--` that we added before */
 		name = opt->name + 2;
-		if (!opt->value)
-			opt->value = "";
-		json_add_string(req->stream, name, opt->value);
+		if (opt->value->as_str) {
+			json_add_string(req->stream, name, opt->value->as_str);
+		}
 	}
 	json_object_end(req->stream); /* end of .params.options */
 
@@ -1034,9 +1093,14 @@ void plugins_notify(struct plugins *plugins,
 		    const struct jsonrpc_notification *n TAKES)
 {
 	struct plugin *p;
-	list_for_each(&plugins->plugins, p, list) {
-		if (plugin_subscriptions_contains(p, n->method))
-			plugin_send(p, json_stream_dup(p, n->stream));
+
+	/* If we're shutting down, ld->plugins will be NULL */
+	if (plugins) {
+		list_for_each(&plugins->plugins, p, list) {
+			if (plugin_subscriptions_contains(p, n->method))
+				plugin_send(p, json_stream_dup(p, n->stream,
+							       p->log));
+		}
 	}
 	if (taken(n))
 		tal_free(n);
@@ -1070,4 +1134,9 @@ void *plugin_exclusive_loop(struct plugin *plugin)
 		      plugin->cmd);
 
 	return ret;
+}
+
+struct log *plugin_get_log(struct plugin *plugin)
+{
+	return plugin->log;
 }

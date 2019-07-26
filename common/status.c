@@ -20,6 +20,10 @@ static struct daemon_conn *status_conn;
 volatile bool logging_io = false;
 static bool was_logging_io = false;
 
+/* If we're more than this many msgs deep, don't add debug messages. */
+#define TRACE_QUEUE_LIMIT 20
+static size_t traces_suppressed;
+
 static void got_sigusr1(int signal UNUSED)
 {
 	logging_io = !logging_io;
@@ -118,6 +122,22 @@ void status_vfmt(enum log_level level, const char *fmt, va_list ap)
 {
 	char *str;
 
+	/* We only suppress async debug msgs.  IO messages are even spammier
+	 * but they only occur when explicitly asked for */
+	if (level == LOG_DBG && status_conn) {
+		size_t qlen = daemon_conn_queue_length(status_conn);
+
+		/* Once suppressing, we keep suppressing until we're empty */
+		if (traces_suppressed && qlen == 0) {
+			size_t n = traces_suppressed;
+			traces_suppressed = 0;
+			/* Careful: recursion! */
+			status_debug("...[%zu debug messages suppressed]...", n);
+		} else if (traces_suppressed || qlen > TRACE_QUEUE_LIMIT) {
+			traces_suppressed++;
+			return;
+		}
+	}
 	str = tal_vfmt(NULL, fmt, ap);
 	status_send(take(towire_status_log(NULL, level, str)));
 	tal_free(str);
@@ -142,18 +162,17 @@ static NORETURN void flush_and_exit(int reason)
 	exit(0x80 | (reason & 0xFF));
 }
 
-void status_send_fatal(const u8 *msg TAKES, int fd1, int fd2)
+void status_send_fd(int fd)
+{
+	assert(!status_conn);
+	fdpass_send(status_fd, fd);
+}
+
+void status_send_fatal(const u8 *msg TAKES)
 {
 	int reason = fromwire_peektype(msg);
 	breakpoint();
 	status_send(msg);
-
-	/* We don't support async fd passing here. */
-	if (fd1 != -1) {
-		assert(!status_conn);
-		fdpass_send(status_fd, fd1);
-		fdpass_send(status_fd, fd2);
-	}
 
 	flush_and_exit(reason);
 }
@@ -172,8 +191,7 @@ void status_failed(enum status_failreason reason, const char *fmt, ...)
 	if (reason == STATUS_FAIL_INTERNAL_ERROR)
 		send_backtrace(str);
 
-	status_send_fatal(take(towire_status_fail(NULL, reason, str)),
-			  -1, -1);
+	status_send_fatal(take(towire_status_fail(NULL, reason, str)));
 }
 
 void master_badmsg(u32 type_expected, const u8 *msg)

@@ -76,6 +76,7 @@ struct channel {
 
 	/* Last tx they gave us. */
 	struct bitcoin_tx *last_tx;
+	enum wallet_tx_type last_tx_type;
 	struct bitcoin_signature last_sig;
 	secp256k1_ecdsa_signature *last_htlc_sigs;
 
@@ -113,6 +114,9 @@ struct channel {
 
 	/* Feerate per channel */
 	u32 feerate_base, feerate_ppm;
+
+	/* If they used option_upfront_shutdown_script. */
+	const u8 *remote_upfront_shutdown_script;
 };
 
 struct channel *new_channel(struct peer *peer, u64 dbid,
@@ -159,19 +163,24 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const struct pubkey *local_funding_pubkey,
 			    const struct pubkey *future_per_commitment_point,
 			    u32 feerate_base,
-			    u32 feerate_ppm);
+			    u32 feerate_ppm,
+			    /* NULL or stolen */
+			    const u8 *remote_upfront_shutdown_script);
 
 void delete_channel(struct channel *channel);
 
 const char *channel_state_name(const struct channel *channel);
 const char *channel_state_str(enum channel_state state);
 
-void channel_set_owner(struct channel *channel, struct subd *owner,
-		       bool reconnect);
+void channel_set_owner(struct channel *channel, struct subd *owner);
 
 /* Channel has failed, but can try again. */
-PRINTF_FMT(2,3) void channel_fail_transient(struct channel *channel,
-					    const char *fmt,...);
+PRINTF_FMT(2,3) void channel_fail_reconnect(struct channel *channel,
+					      const char *fmt, ...);
+/* Channel has failed, but can try again after a minute. */
+PRINTF_FMT(2,3) void channel_fail_reconnect_later(struct channel *channel,
+						  const char *fmt,...);
+
 /* Channel has failed, give up on it. */
 void channel_fail_permanent(struct channel *channel, const char *fmt, ...);
 /* Permanent error, but due to internal problems, not peer. */
@@ -196,7 +205,8 @@ struct channel *channel_by_dbid(struct lightningd *ld, const u64 dbid);
 
 void channel_set_last_tx(struct channel *channel,
 			 struct bitcoin_tx *tx,
-			 const struct bitcoin_signature *sig);
+			 const struct bitcoin_signature *sig,
+			 enum wallet_tx_type type);
 
 static inline bool channel_can_add_htlc(const struct channel *channel)
 {

@@ -1,9 +1,11 @@
 from fixtures import *  # noqa: F401,F403
+from flaky import flaky  # noqa: F401
 from lightning import RpcError, Millisatoshi
-from utils import DEVELOPER, wait_for, only_one, sync_blockheight, SLOW_MACHINE
+from utils import DEVELOPER, wait_for, only_one, sync_blockheight, SLOW_MACHINE, TIMEOUT
 
 
 import copy
+import concurrent.futures
 import pytest
 import random
 import re
@@ -94,13 +96,11 @@ def test_pay_limits(node_factory):
     # It should have retried (once without routehint, too)
     status = l1.rpc.call('paystatus', {'bolt11': inv['bolt11']})['pay'][0]['attempts']
 
-    # Hits weird corner case: it excludes channel, then uses routehint
-    # which reintroduces it, so then it excludes other channel.
-    assert len(status) == 4
+    # Excludes channel, then ignores routehint which includes that, then
+    # it excludes other channel.
+    assert len(status) == 2
     assert status[0]['strategy'] == "Initial attempt"
     assert status[1]['strategy'].startswith("Excluded expensive channel ")
-    assert status[2]['strategy'] == "Trying route hint"
-    assert status[3]['strategy'].startswith("Excluded expensive channel ")
 
     # Delay too high.
     with pytest.raises(RpcError, match=r'Route wanted delay of .* blocks') as err:
@@ -109,11 +109,9 @@ def test_pay_limits(node_factory):
     assert err.value.error['code'] == PAY_ROUTE_TOO_EXPENSIVE
     # Should also have retried.
     status = l1.rpc.call('paystatus', {'bolt11': inv['bolt11']})['pay'][1]['attempts']
-    assert len(status) == 4
+    assert len(status) == 2
     assert status[0]['strategy'] == "Initial attempt"
     assert status[1]['strategy'].startswith("Excluded delaying channel ")
-    assert status[2]['strategy'] == "Trying route hint"
-    assert status[3]['strategy'].startswith("Excluded delaying channel ")
 
     # This works, because fee is less than exemptfee.
     l1.rpc.call('pay', {'bolt11': inv['bolt11'], 'msatoshi': 100000, 'maxfeepercent': 0.0001, 'exemptfee': 2000})
@@ -1121,6 +1119,225 @@ def test_forward_stats(node_factory, bitcoind):
     assert 'received_time' in stats['forwards'][2] and 'resolved_time' not in stats['forwards'][2]
 
 
+@unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
+def test_forward_local_failed_stats(node_factory, bitcoind, executor):
+    """Check that we track forwarded payments correctly.
+
+    We wire up the network to have l1 and l6 as payment initiator, l2 as
+    forwarded (the one we check) and l3-l5 as payment recipients.
+
+    There 5 cases for FORWARD_LOCAL_FAILED status:
+    1. When Msater resolves the reply about the next peer infor(sent
+       by Gossipd), and need handle unknown next peer failure in
+       channel_resolve_reply(). For this case, we ask l1 pay to l3
+       through l2 but close the channel between l2 and l3 after
+       getroute(), the payment will fail in l2 because of
+       WIRE_UNKNOWN_NEXT_PEER;
+    2. When Master handle the forward process with the htlc_in and
+       the id of next hop, it tries to drive a new htlc_out but fails
+       in forward_htlc(). For this case, we ask l1 pay to 14 through
+       with no fee, so the payment will fail in l2 becase of
+       WIRE_FEE_INSUFFICIENT;
+    3. When we send htlc_out, Master asks Channeld to add a new htlc
+       into the outgoing channel but Channeld fails. Master need
+       handle and store this failure in rcvd_htlc_reply(). For this
+       case, we ask l1 pay to l5 with 10**8 sat though the channel
+       (l2-->l5) with the max capacity of 10**4 msat , the payment
+       will fail in l2 because of CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
+    4. When Channeld receives a new revoke message, if the state of
+       corresponding htlc is RCVD_ADD_ACK_REVOCATION, Master will tries
+       to resolve onionpacket and handle the failure before resolving
+       the next hop in peer_got_revoke(). For this case, we ask l6 pay
+       to l4 though l1 and l2, but we replace the second node_id in route
+       with the wrong one, so the payment will fail in l2 because of
+       WIRE_INVALID_ONION_KEY;
+    5. When Onchaind finds the htlc time out or missing htlc, Master
+       need handle these failure as FORWARD_LOCAL_FAILED in if it's forward
+       payment case. For this case, we ask l1 pay to l4 though l2 with the
+       amount less than the invoice(the payment must fail in l4), and we
+       also ask l5 disconnected before sending update_fail_htlc, so the
+       htlc will be holding until l2 meets timeout and handle it as local_fail.
+    """
+
+    amount = 10**8
+
+    disconnects = ['-WIRE_UPDATE_FAIL_HTLC', 'permfail']
+
+    l1 = node_factory.get_node()
+    l2 = node_factory.get_node()
+    l3 = node_factory.get_node()
+    l4 = node_factory.get_node(disconnect=disconnects)
+    l5 = node_factory.get_node()
+    l6 = node_factory.get_node()
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
+    l2.rpc.connect(l4.info['id'], 'localhost', l4.port)
+    l2.rpc.connect(l5.info['id'], 'localhost', l5.port)
+    l6.rpc.connect(l1.info['id'], 'localhost', l1.port)
+    c12 = l1.fund_channel(l2, 10**6)
+    c23 = l2.fund_channel(l3, 10**6)
+    c24 = l2.fund_channel(l4, 10**6)
+    c25 = l2.fund_channel(l5, 10**4)
+    l6.fund_channel(l1, 10**6)
+
+    # Make sure routes finalized.
+    bitcoind.generate_block(5)
+    l1.wait_channel_active(c23)
+    l1.wait_channel_active(c24)
+    l1.wait_channel_active(c25)
+
+    wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 10)
+
+    """1. When Msater resolves the reply about the next peer infor(sent
+       by Gossipd), and need handle unknown next peer failure in
+       channel_resolve_reply();
+
+       For this case, we ask l1 pay to l3 through l2 but close the channel
+       between l2 and l3 after getroute(), the payment will fail in l2
+       because of WIRE_UNKNOWN_NEXT_PEER;
+    """
+
+    payment_hash = l3.rpc.invoice(amount, "first", "desc")['payment_hash']
+    route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
+
+    l2.rpc.close(c23, True, 0)
+
+    with pytest.raises(RpcError):
+        l1.rpc.sendpay(route, payment_hash)
+        l1.rpc.waitsendpay(payment_hash)
+
+    """2. When Master handle the forward process with the htlc_in and
+       the id of next hop, it tries to drive a new htlc_out but fails
+       in forward_htlc();
+
+       For this case, we ask l1 pay to 14 through with no fee, so the
+       payment will fail in l2 becase of WIRE_FEE_INSUFFICIENT;
+    """
+
+    payment_hash = l4.rpc.invoice(amount, "third", "desc")['payment_hash']
+    fee = amount * 10 // 1000000 + 1
+
+    route = [{'msatoshi': amount,
+              'id': l2.info['id'],
+              'delay': 12,
+              'channel': c12},
+             {'msatoshi': amount,
+              'id': l4.info['id'],
+              'delay': 6,
+              'channel': c24}]
+
+    with pytest.raises(RpcError):
+        l1.rpc.sendpay(route, payment_hash)
+        l1.rpc.waitsendpay(payment_hash)
+
+    """3. When we send htlc_out, Master asks Channeld to add a new htlc
+       into the outgoing channel but Channeld fails. Master need
+       handle and store this failure in rcvd_htlc_reply();
+
+       For this case, we ask l1 pay to l5 with 10**8 sat though the channel
+       (l2-->l5) with the max capacity of 10**4 msat , the payment will
+       fail in l2 because of CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
+    """
+
+    payment_hash = l5.rpc.invoice(amount, "second", "desc")['payment_hash']
+    fee = amount * 10 // 1000000 + 1
+
+    route = [{'msatoshi': amount + fee,
+              'id': l2.info['id'],
+              'delay': 12,
+              'channel': c12},
+             {'msatoshi': amount,
+              'id': l5.info['id'],
+              'delay': 6,
+              'channel': c25}]
+
+    with pytest.raises(RpcError):
+        l1.rpc.sendpay(route, payment_hash)
+        l1.rpc.waitsendpay(payment_hash)
+
+    """4. When Channeld receives a new revoke message, if the state of
+       corresponding htlc is RCVD_ADD_ACK_REVOCATION, Master will tries
+       to resolve onionpacket and handle the failure before resolving
+       the next hop in peer_got_revoke();
+
+       For this case, we ask l6 pay to l4 though l1 and l2, but we replace
+       the second node_id in route with the wrong one, so the payment will
+       fail in l2 because of WIRE_INVALID_ONION_KEY;
+    """
+
+    payment_hash = l4.rpc.invoice(amount, 'fourth', 'desc')['payment_hash']
+    route = l6.rpc.getroute(l4.info['id'], amount, 1)['route']
+
+    mangled_nodeid = '0265b6ab5ec860cd257865d61ef0bbf5b3339c36cbda8b26b74e7f1dca490b6510'
+
+    # Replace id with a different pubkey, so onion encoded badly at l2 hop.
+    route[1]['id'] = mangled_nodeid
+
+    with pytest.raises(RpcError):
+        l6.rpc.sendpay(route, payment_hash)
+        l6.rpc.waitsendpay(payment_hash)
+
+    """5. When Onchaind finds the htlc time out or missing htlc, Master
+       need handle these failure as FORWARD_LOCAL_FAILED in if it's forward
+       payment case.
+
+       For this case, we ask l1 pay to l4 though l2 with the amount less than
+       the invoice(the payment must fail in l4), and we also ask l5 disconnected
+       before sending update_fail_htlc, so the htlc will be holding until l2
+       meets timeout and handle it as local_fail.
+    """
+    payment_hash = l4.rpc.invoice(amount, 'onchain_timeout', 'desc')['payment_hash']
+    fee = amount * 10 // 1000000 + 1
+
+    # We underpay, so it fails.
+    route = [{'msatoshi': amount + fee - 1,
+              'id': l2.info['id'],
+              'delay': 12,
+              'channel': c12},
+             {'msatoshi': amount - 1,
+              'id': l4.info['id'],
+              'delay': 5,
+              'channel': c24}]
+
+    executor.submit(l1.rpc.sendpay, route, payment_hash)
+
+    l4.daemon.wait_for_log('permfail')
+    l4.wait_for_channel_onchain(l2.info['id'])
+    l2.bitcoin.generate_block(1)
+    l2.daemon.wait_for_log(' to ONCHAIN')
+    l4.daemon.wait_for_log(' to ONCHAIN')
+
+    # Wait for timeout.
+    l2.daemon.wait_for_log('Propose handling THEIR_UNILATERAL/OUR_HTLC by OUR_HTLC_TIMEOUT_TO_US .* after 6 blocks')
+    bitcoind.generate_block(6)
+
+    l2.wait_for_onchaind_broadcast('OUR_HTLC_TIMEOUT_TO_US',
+                                   'THEIR_UNILATERAL/OUR_HTLC')
+
+    bitcoind.generate_block(1)
+    l2.daemon.wait_for_log('Resolved THEIR_UNILATERAL/OUR_HTLC by our proposal OUR_HTLC_TIMEOUT_TO_US')
+    l4.daemon.wait_for_log('Ignoring output.*: OUR_UNILATERAL/THEIR_HTLC')
+
+    bitcoind.generate_block(100)
+    sync_blockheight(bitcoind, [l2])
+
+    # give time to let l2 store the local_failed stats
+    time.sleep(5)
+
+    # Select all forwardings, and check the status
+    stats = l2.rpc.listforwards()
+
+    assert [f['status'] for f in stats['forwards']] == ['local_failed', 'local_failed', 'local_failed', 'local_failed', 'local_failed']
+    assert l2.rpc.getinfo()['msatoshi_fees_collected'] == 0
+
+    assert 'received_time' in stats['forwards'][0] and 'resolved_time' not in stats['forwards'][0]
+    assert 'received_time' in stats['forwards'][1] and 'resolved_time' not in stats['forwards'][1]
+    assert 'received_time' in stats['forwards'][2] and 'resolved_time' not in stats['forwards'][2]
+    assert 'received_time' in stats['forwards'][3] and 'resolved_time' not in stats['forwards'][3]
+    assert 'received_time' in stats['forwards'][3] and 'resolved_time' not in stats['forwards'][4]
+
+
 @unittest.skipIf(not DEVELOPER or SLOW_MACHINE, "needs DEVELOPER=1 for dev_ignore_htlcs, and temporarily disabled on Travis")
 def test_htlcs_cltv_only_difference(node_factory, bitcoind):
     # l1 -> l2 -> l3 -> l4
@@ -1158,6 +1375,10 @@ def test_htlcs_cltv_only_difference(node_factory, bitcoind):
     assert only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected']
     assert only_one(l2.rpc.listpeers(l3.info['id'])['peers'])['connected']
     assert only_one(l3.rpc.listpeers(l4.info['id'])['peers'])['connected']
+
+    # TODO Remove our reliance on HTLCs failing on startup and the need for
+    #      this plugin
+    l4.daemon.opts['plugin'] = 'tests/plugins/fail_htlcs.py'
 
     # Restarting tail node will stop it ignoring HTLCs (it will actually
     # fail them immediately).
@@ -1240,14 +1461,37 @@ def test_pay_retry(node_factory, bitcoind):
     exhaust_channel(l2, l5, scid25)
     exhaust_channel(l3, l5, scid35)
 
+    def listpays_nofail(b11):
+        while True:
+            pays = l1.rpc.listpays(b11)['pays']
+            if len(pays) != 0:
+                if only_one(pays)['status'] == 'complete':
+                    return
+                assert only_one(pays)['status'] != 'failed'
+
+    inv = l5.rpc.invoice(10**8, 'test_retry', 'test_retry')
+
+    # Make sure listpays doesn't transiently show failure while pay
+    # is retrying.
+    executor = concurrent.futures.ThreadPoolExecutor()
+    fut = executor.submit(listpays_nofail, inv['bolt11'])
+
     # Pay l1->l5 should succeed via straight line (eventually)
-    l1.rpc.pay(l5.rpc.invoice(10**8, 'test_retry', 'test_retry')['bolt11'])
+    l1.rpc.pay(inv['bolt11'])
+
+    # This should be OK.
+    fut.result()
 
     # This should make it fail.
     exhaust_channel(l4, l5, scid45, 10**8)
 
-    with pytest.raises(RpcError):
-        l1.rpc.pay(l5.rpc.invoice(10**8, 'test_retry2', 'test_retry2')['bolt11'])
+    # It won't try l1->l5, since it knows that's under capacity.
+    # It will try l1->l2->l5, which fails.
+    # It will try l1->l2->l3->l5, which fails.
+    # It will try l1->l2->l3->l4->l5, which fails.
+    inv = l5.rpc.invoice(10**8, 'test_retry2', 'test_retry2')['bolt11']
+    with pytest.raises(RpcError, match=r'3 attempts'):
+        l1.rpc.pay(inv)
 
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 otherwise gossip takes 5 minutes!")
@@ -1256,6 +1500,11 @@ def test_pay_routeboost(node_factory, bitcoind):
     # l1->l2->l3--private-->l4
     l1, l2 = node_factory.line_graph(2, announce_channels=True, wait_for_announce=True)
     l3, l4, l5 = node_factory.line_graph(3, announce_channels=False, wait_for_announce=False)
+
+    # This should a "could not find a route" because that's true.
+    with pytest.raises(RpcError, match=r'Could not find a route'):
+        l1.rpc.pay(l5.rpc.invoice(10**8, 'test_retry', 'test_retry')['bolt11'])
+
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
     scidl2l3 = l2.fund_channel(l3, 10**6)
 
@@ -1371,6 +1620,7 @@ def test_pay_routeboost(node_factory, bitcoind):
         assert [h['channel'] for h in attempts[2]['routehint']] == [r['short_channel_id'] for r in routel3l5]
 
 
+@flaky
 @unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
 def test_pay_direct(node_factory, bitcoind):
     """Check that we prefer the direct route.
@@ -1796,3 +2046,144 @@ def test_setchannelfee_all(node_factory, bitcoind):
     assert result['channels'][0]['short_channel_id'] == scid2
     assert result['channels'][1]['peer_id'] == l3.info['id']
     assert result['channels'][1]['short_channel_id'] == scid3
+
+
+def test_channel_spendable(node_factory, bitcoind):
+    """Test that spendable_msat is accurate"""
+    sats = 10**6
+    l1, l2 = node_factory.line_graph(2, fundamount=sats, wait_for_announce=True,
+                                     opts={'plugin': 'tests/plugins/hold_invoice.py', 'holdtime': str(TIMEOUT / 2)})
+
+    payment_hash = l2.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+
+    # We should be able to spend this much, and not one msat more!
+    amount = l1.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat']
+    route = l1.rpc.getroute(l2.info['id'], amount + 1, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+
+    # This should fail locally with "capacity exceeded"
+    with pytest.raises(RpcError, match=r"Capacity exceeded.*'erring_index': 0"):
+        l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # Exact amount should succeed.
+    route = l1.rpc.getroute(l2.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+
+    # Amount should drop to 0 once HTLC is sent; we have time, thanks to
+    # hold_invoice.py plugin.
+    wait_for(lambda: len(l1.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 1)
+    assert l1.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat'] == Millisatoshi(0)
+    l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # Make sure l2 thinks it's all over.
+    wait_for(lambda: len(l2.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+    # Now, reverse should work similarly.
+    payment_hash = l1.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+    amount = l2.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat']
+
+    # Turns out we this won't route, as it's over max - reserve:
+    route = l2.rpc.getroute(l1.info['id'], amount + 1, riskfactor=1, fuzzpercent=0)['route']
+    l2.rpc.sendpay(route, payment_hash)
+
+    # This should fail locally with "capacity exceeded"
+    with pytest.raises(RpcError, match=r"Capacity exceeded.*'erring_index': 0"):
+        l2.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # Exact amount should succeed.
+    route = l2.rpc.getroute(l1.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l2.rpc.sendpay(route, payment_hash)
+
+    # Amount should drop to 0 once HTLC is sent; we have time, thanks to
+    # hold_invoice.py plugin.
+    wait_for(lambda: len(l2.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 1)
+    assert l2.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat'] == Millisatoshi(0)
+    l2.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+
+def test_channel_spendable_large(node_factory, bitcoind):
+    """Test that spendable_msat is accurate for large channels"""
+    # This is almost the max allowable spend.
+    sats = 4294967
+    l1, l2 = node_factory.line_graph(2, fundamount=sats, wait_for_announce=True,
+                                     opts={'plugin': 'tests/plugins/hold_invoice.py', 'holdtime': str(TIMEOUT / 2)})
+
+    payment_hash = l2.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+
+    # We should be able to spend this much, and not one msat more!
+    amount = l1.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat']
+
+    # route or waitsendpay fill fail.
+    with pytest.raises(RpcError):
+        route = l1.rpc.getroute(l2.info['id'], amount + 1, riskfactor=1, fuzzpercent=0)['route']
+        l1.rpc.sendpay(route, payment_hash)
+        l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    print(l2.rpc.listchannels())
+    # Exact amount should succeed.
+    route = l1.rpc.getroute(l2.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+    l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+
+def test_channel_spendable_capped(node_factory, bitcoind):
+    """Test that spendable_msat is capped at 2^32-1"""
+    sats = 16777215
+    l1, l2 = node_factory.line_graph(2, fundamount=sats, wait_for_announce=False)
+    assert l1.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat'] == Millisatoshi(0xFFFFFFFF)
+
+
+def test_channel_drainage(node_factory, bitcoind):
+    """Test channel drainage.
+
+    Test to drains a channels as much as possible,
+    especially in regards to commitment fee:
+
+    [l1] <=> [l2]
+    """
+    sats = 10**6
+    l1, l2 = node_factory.line_graph(2, fundamount=sats, wait_for_announce=True)
+
+    # wait for everyone to see every channel as active
+    for n in [l1, l2]:
+        wait_for(lambda: [c['active'] for c in n.rpc.listchannels()['channels']] == [True] * 2 * 1)
+
+    # This first HTLC drains the channel.
+    amount = Millisatoshi("976559200msat")
+    payment_hash = l2.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+    route = l1.rpc.getroute(l2.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+    l1.rpc.waitsendpay(payment_hash, 10)
+
+    # wait until totally settled
+    wait_for(lambda: len(l1.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+    wait_for(lambda: len(l2.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+
+    # But we can get more!  By using a trimmed htlc output; this doesn't cause
+    # an increase in tx fee, so it's allowed.
+    amount = Millisatoshi("2580800msat")
+    payment_hash = l2.rpc.invoice('any', 'inv2', 'for testing')['payment_hash']
+    route = l1.rpc.getroute(l2.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+    l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # wait until totally settled
+    wait_for(lambda: len(l1.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+    wait_for(lambda: len(l2.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+
+    # Now, l1 is paying fees, but it can't afford a larger tx, so any
+    # attempt to add an HTLC which is not trimmed will fail.
+    payment_hash = l1.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+
+    # feerate_per_kw = 15000, so htlc_timeout_fee = 663 * 15000 / 1000 = 9945.
+    # dust_limit is 546.  So it's trimmed if < 9945 + 546.
+    amount = Millisatoshi("10491sat")
+    route = l2.rpc.getroute(l1.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l2.rpc.sendpay(route, payment_hash)
+    with pytest.raises(RpcError, match=r"Capacity exceeded.*'erring_index': 0"):
+        l2.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # But if it's trimmed, we're ok.
+    amount -= 1
+    route = l2.rpc.getroute(l1.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l2.rpc.sendpay(route, payment_hash)
+    l2.rpc.waitsendpay(payment_hash, TIMEOUT)

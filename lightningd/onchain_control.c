@@ -79,16 +79,30 @@ static void onchain_tx_depth(struct channel *channel,
 static enum watch_result onchain_tx_watched(struct lightningd *ld,
 					    struct channel *channel,
 					    const struct bitcoin_txid *txid,
+					    const struct bitcoin_tx *tx,
 					    unsigned int depth)
 {
 	u32 blockheight = get_block_height(ld->topology);
+
+	if (tx != NULL) {
+		struct bitcoin_txid txid2;
+
+		bitcoin_txid(tx, &txid2);
+		if (!bitcoin_txid_eq(txid, &txid2)) {
+			channel_internal_error(channel, "Txid for %s is not %s",
+					       type_to_string(tmpctx,
+							      struct bitcoin_tx,
+							      tx),
+					       type_to_string(tmpctx,
+							      struct bitcoin_txid,
+							      txid));
+			return DELETE_WATCH;
+		}
+	}
+
 	if (depth == 0) {
 		log_unusual(channel->log, "Chain reorganization!");
-		channel_set_owner(channel, NULL, false);
-
-		/* FIXME!
-		topology_rescan(peer->ld->topology, peer->funding_txid);
-		*/
+		channel_set_owner(channel, NULL);
 
 		/* We will most likely be freed, so this is a noop */
 		return KEEP_WATCHING;
@@ -165,11 +179,18 @@ static void watch_tx_and_outputs(struct channel *channel,
 static void handle_onchain_broadcast_tx(struct channel *channel, const u8 *msg)
 {
 	struct bitcoin_tx *tx;
+	struct wallet *w = channel->peer->ld->wallet;
+	struct bitcoin_txid txid;
+	enum wallet_tx_type type;
 
-	if (!fromwire_onchain_broadcast_tx(msg, msg, &tx)) {
+	if (!fromwire_onchain_broadcast_tx(msg, msg, &tx, &type)) {
 		channel_internal_error(channel, "Invalid onchain_broadcast_tx");
 		return;
 	}
+
+	bitcoin_txid(tx, &txid);
+	wallet_transaction_add(w, tx, 0, 0);
+	wallet_transaction_annotate(w, &txid, type, channel->dbid);
 
 	/* We don't really care if it fails, we'll respond via watch. */
 	broadcast_tx(channel->peer->ld->topology, channel, tx, NULL);
@@ -284,6 +305,18 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 	wallet_add_utxo(channel->peer->ld->wallet, u, p2wpkh);
 }
 
+static void onchain_transaction_annotate(struct channel *channel, const u8 *msg)
+{
+	struct bitcoin_txid txid;
+	enum wallet_tx_type type;
+	if (!fromwire_onchain_transaction_annotate(msg, &txid, &type))
+		fatal("onchaind gave invalid onchain_transaction_annotate "
+		      "message: %s",
+		      tal_hex(msg, msg));
+	wallet_transaction_annotate(channel->peer->ld->wallet, &txid, type,
+				    channel->dbid);
+}
+
 static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds UNUSED)
 {
 	enum onchain_wire_type t = fromwire_peektype(msg);
@@ -319,6 +352,10 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 
 	case WIRE_ONCHAIN_ADD_UTXO:
 		onchain_add_utxo(sd->channel, msg);
+		break;
+
+	case WIRE_ONCHAIN_TRANSACTION_ANNOTATE:
+		onchain_transaction_annotate(sd->channel, msg);
 		break;
 
 	/* We send these, not receive them */
@@ -376,16 +413,16 @@ static bool tell_if_missing(const struct channel *channel,
 
 /* Only error onchaind can get is if it dies. */
 static void onchain_error(struct channel *channel,
-			  int peer_fd UNUSED, int gossip_fd UNUSED,
-			  const struct crypto_state *cs UNUSED,
+			  struct per_peer_state *pps UNUSED,
 			  const struct channel_id *channel_id UNUSED,
 			  const char *desc,
+			  bool soft_error UNUSED,
 			  const u8 *err_for_them UNUSED)
 {
 	/* FIXME: re-launch? */
 	log_broken(channel->log, "%s", desc);
 	channel_set_billboard(channel, true, desc);
-	channel_set_owner(channel, NULL, false);
+	channel_set_owner(channel, NULL);
 }
 
 /* With a reorg, this can get called multiple times; each time we'll kill
@@ -395,7 +432,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 					 u32 blockheight)
 {
 	u8 *msg;
-	struct bitcoin_txid our_last_txid;
+	struct bitcoin_txid our_last_txid, txid;
 	struct htlc_stub *stubs;
 	struct lightningd *ld = channel->peer->ld;
 	struct pubkey final_key;
@@ -421,8 +458,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 						    onchain_error,
 						    channel_set_billboard,
 						    take(&hsmfd),
-						    NULL),
-			  false);
+						    NULL));
 
 	if (!channel->owner) {
 		log_broken(channel->log, "Could not subdaemon onchain: %s",
@@ -443,6 +479,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 		return KEEP_WATCHING;
 	}
 	/* This could be a mutual close, but it doesn't matter. */
+	bitcoin_txid(tx, &txid);
 	bitcoin_txid(channel->last_tx, &our_last_txid);
 
 	/* We try to use normal feerate for onchaind spends. */

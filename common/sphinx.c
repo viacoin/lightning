@@ -434,6 +434,8 @@ struct route_step *process_onionpacket(
 	deserialize_hop_data(&step->hop_data, paddedheader);
 
         memcpy(&step->next->mac, step->hop_data.hmac, SECURITY_PARAMETER);
+	step->raw_payload = tal_dup_arr(step, u8, paddedheader + 1,
+					HOP_DATA_SIZE - 1 - HMAC_SIZE, 0);
 
 	memcpy(&step->next->routinginfo, paddedheader + HOP_DATA_SIZE, ROUTING_INFO_SIZE);
 
@@ -462,11 +464,11 @@ u8 *create_onionreply(const tal_t *ctx, const struct secret *shared_secret,
 	 * the following fields:
 	 *
 	 * 1. data:
-	 *    * [`32`:`hmac`]
-	 *    * [`2`:`failure_len`]
-	 *    * [`failure_len`:`failuremsg`]
-	 *    * [`2`:`pad_len`]
-	 *    * [`pad_len`:`pad`]
+	 *    * [`32*byte`:`hmac`]
+	 *    * [`u16`:`failure_len`]
+	 *    * [`failure_len*byte`:`failuremsg`]
+	 *    * [`u16`:`pad_len`]
+	 *    * [`pad_len*byte`:`pad`]
 	 */
 	towire_u16(&payload, msglen);
 	towire(&payload, failure_msg, msglen);

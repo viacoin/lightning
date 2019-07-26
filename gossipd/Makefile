@@ -12,13 +12,13 @@ LIGHTNINGD_GOSSIP_CONTROL_SRC := gossipd/gen_gossip_wire.c
 LIGHTNINGD_GOSSIP_CONTROL_OBJS := $(LIGHTNINGD_GOSSIP_CONTROL_SRC:.c=.o)
 
 # gossipd needs these:
-LIGHTNINGD_GOSSIP_HEADERS := gossipd/gen_gossip_wire.h \
+LIGHTNINGD_GOSSIP_HEADERS_WSRC := gossipd/gen_gossip_wire.h \
 	gossipd/gen_gossip_peerd_wire.h \
 	gossipd/gen_gossip_store.h			\
 	gossipd/gossip_store.h				\
-	gossipd/routing.h				\
-	gossipd/broadcast.h
-LIGHTNINGD_GOSSIP_SRC := $(LIGHTNINGD_GOSSIP_HEADERS:.h=.c) gossipd/gossipd.c
+	gossipd/routing.h
+LIGHTNINGD_GOSSIP_HEADERS := $(LIGHTNINGD_GOSSIP_HEADERS_WSRC) gossipd/broadcast.h
+LIGHTNINGD_GOSSIP_SRC := $(LIGHTNINGD_GOSSIP_HEADERS_WSRC:.h=.c) gossipd/gossipd.c
 LIGHTNINGD_GOSSIP_OBJS := $(LIGHTNINGD_GOSSIP_SRC:.c=.o)
 
 # Make sure these depend on everything.
@@ -54,6 +54,7 @@ GOSSIPD_COMMON_OBJS :=				\
 	common/memleak.o			\
 	common/msg_queue.o			\
 	common/node_id.o			\
+	common/per_peer_state.o			\
 	common/ping.o				\
 	common/pseudorand.o			\
 	common/status.o				\
@@ -80,22 +81,22 @@ gossipd-all: lightningd/lightning_gossipd $(LIGHTNINGD_GOSSIP_CLIENT_OBJS)
 lightningd/lightning_gossipd: $(LIGHTNINGD_GOSSIP_OBJS) $(GOSSIPD_COMMON_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(LIGHTNINGD_HSM_CLIENT_OBJS)
 
 gossipd/gen_gossip_wire.h: $(WIRE_GEN) gossipd/gossip_wire.csv
-	$(WIRE_GEN) --header $@ gossip_wire_type < gossipd/gossip_wire.csv > $@
+	$(WIRE_GEN) --page header $@ gossip_wire_type < gossipd/gossip_wire.csv > $@
 
 gossipd/gen_gossip_wire.c: $(WIRE_GEN) gossipd/gossip_wire.csv
-	$(WIRE_GEN) ${@:.c=.h} gossip_wire_type < gossipd/gossip_wire.csv > $@
+	$(WIRE_GEN) --page impl ${@:.c=.h} gossip_wire_type < gossipd/gossip_wire.csv > $@
 
 gossipd/gen_gossip_peerd_wire.h: $(WIRE_GEN) gossipd/gossip_peerd_wire.csv
-	$(WIRE_GEN) --header $@ gossip_peerd_wire_type < gossipd/gossip_peerd_wire.csv > $@
+	$(WIRE_GEN) --page header $@ gossip_peerd_wire_type < gossipd/gossip_peerd_wire.csv > $@
 
 gossipd/gen_gossip_peerd_wire.c: $(WIRE_GEN) gossipd/gossip_peerd_wire.csv
-	$(WIRE_GEN) ${@:.c=.h} gossip_peerd_wire_type < gossipd/gossip_peerd_wire.csv > $@
+	$(WIRE_GEN) --page impl ${@:.c=.h} gossip_peerd_wire_type < gossipd/gossip_peerd_wire.csv > $@
 
 gossipd/gen_gossip_store.h: $(WIRE_GEN) gossipd/gossip_store.csv
-	$(WIRE_GEN) --header $@ gossip_store_type < gossipd/gossip_store.csv > $@
+	$(WIRE_GEN) --page header $@ gossip_store_type < gossipd/gossip_store.csv > $@
 
 gossipd/gen_gossip_store.c: $(WIRE_GEN) gossipd/gossip_store.csv
-	$(WIRE_GEN) ${@:.c=.h} gossip_store_type < gossipd/gossip_store.csv > $@
+	$(WIRE_GEN) --page impl ${@:.c=.h} gossip_store_type < gossipd/gossip_store.csv > $@
 
 
 check-source: $(LIGHTNINGD_GOSSIP_ALLSRC_NOGEN:%=check-src-include-order/%) $(LIGHTNINGD_GOSSIP_ALLHEADERS_NOGEN:%=check-hdr-include-order/%)

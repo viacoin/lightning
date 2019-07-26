@@ -36,8 +36,11 @@ struct json_stream *new_json_stream(const tal_t *ctx, struct command *writer,
  *
  * @ctx: tal context for allocation.
  * @original: the stream to duplicate.
+ * @log: log for new stream.
  */
-struct json_stream *json_stream_dup(const tal_t *ctx, struct json_stream *original);
+struct json_stream *json_stream_dup(const tal_t *ctx,
+				    struct json_stream *original,
+				    struct log *log);
 
 /**
  * json_stream_close - finished writing to a JSON stream.
@@ -45,6 +48,9 @@ struct json_stream *json_stream_dup(const tal_t *ctx, struct json_stream *origin
  * @writer: object responsible for writing to this stream.
  */
 void json_stream_close(struct json_stream *js, struct command *writer);
+
+/* For low-level JSON stream access: */
+void json_stream_log_suppress(struct json_stream *js, const char *cmd_name);
 
 /**
  * json_stream_still_writing - is someone currently writing to this stream?
@@ -59,44 +65,47 @@ bool json_stream_still_writing(const struct json_stream *js);
 void json_array_start(struct json_stream *js, const char *fieldname);
 /* '"fieldname" : { ' or '{ ' if fieldname is NULL */
 void json_object_start(struct json_stream *ks, const char *fieldname);
-/* ' ], ' */
+/* '],' */
 void json_array_end(struct json_stream *js);
-/* ' }, ' */
+/* '},' */
 void json_object_end(struct json_stream *js);
+/* ' },' */
+void json_object_compat_end(struct json_stream *js);
 
 /**
  * json_stream_append - literally insert this string into the json_stream.
  * @js: the json_stream.
  * @str: the string.
- */
-void json_stream_append(struct json_stream *js, const char *str);
-
-/**
- * json_stream_append_part - literally insert part of string into json_stream.
- * @js: the json_stream.
- * @str: the string.
  * @len: the length to append (<= strlen(str)).
  */
-void json_stream_append_part(struct json_stream *js, const char *str,
-			     size_t len);
-
-/**
- * json_stream_append_fmt - insert formatted string into the json_stream.
- * @js: the json_stream.
- * @fmt...: the printf-style format
- */
-PRINTF_FMT(2,3)
-void json_stream_append_fmt(struct json_stream *js, const char *fmt, ...);
+void json_stream_append(struct json_stream *js, const char *str, size_t len);
 
 /**
  * json_add_member - add a generic member.
  * @js: the json_stream.
- * @fieldname: optional fieldname.
+ * @fieldname: fieldname (if in object), otherwise must be NULL.
+ * @quote: true if should be escaped and wrapped in "".
  * @fmt...: the printf-style format
+ *
+ * The resulting string from @fmt is escaped if quote is true:
+ * see json_member_direct to avoid quoting.
  */
-PRINTF_FMT(3,4)
-void json_add_member(struct json_stream *js, const char *fieldname,
+PRINTF_FMT(4,5)
+void json_add_member(struct json_stream *js,
+		     const char *fieldname,
+		     bool quote,
 		     const char *fmt, ...);
+
+/**
+ * json_member_direct - start a generic member.
+ * @js: the json_stream.
+ * @fieldname: fieldname (if in object), otherwise must be NULL.
+ * @extra: the space to reserve.
+ *
+ * Returns NULL if oom, otherwise returns a ptr to @extra bytes.
+ */
+char *json_member_direct(struct json_stream *js,
+			 const char *fieldname, size_t extra);
 
 /**
  * json_stream_output - start writing out a json_stream to this conn.
@@ -120,5 +129,7 @@ struct io_plan *json_stream_output_(struct json_stream *js,
 							  struct json_stream *js,
 							  void *arg),
 				    void *arg);
+
+void json_stream_flush(struct json_stream *js);
 
 #endif /* LIGHTNING_LIGHTNINGD_JSON_STREAM_H */

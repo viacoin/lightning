@@ -72,6 +72,13 @@ static struct {
  * so set it static.*/
 static struct  bip32_key_version  bip32_key_version;
 
+#if DEVELOPER
+/* If they specify --dev-force-privkey it ends up in here. */
+static struct privkey *dev_force_privkey;
+/* If they specify --dev-force-bip32-seed it ends up in here. */
+static struct secret *dev_force_bip32_seed;
+#endif
+
 /*~ We keep track of clients, but there's not much to keep. */
 struct client {
 	/* The ccan/io async io connection for this client: it closes, we die. */
@@ -151,6 +158,9 @@ static PRINTF_FMT(4,5)
 		status_broken("%s", str);
 		master_badmsg(fromwire_peektype(msg_in), msg_in);
 	}
+
+	/*~ Nobody should give us bad requests; it's a sign something is broken */
+	status_broken("%s: %s", type_to_string(tmpctx, struct node_id, &c->id), str);
 
 	/*~ Note the use of NULL as the ctx arg to towire_hsmstatus_: only
 	 * use NULL as the allocation when we're about to immediately free it
@@ -311,6 +321,17 @@ static void node_key(struct privkey *node_privkey, struct pubkey *node_id)
 		salt++;
 	} while (!secp256k1_ec_pubkey_create(secp256k1_ctx, &node_id->pubkey,
 					     node_privkey->secret.data));
+
+#if DEVELOPER
+	/* In DEVELOPER mode, we can override with --dev-force-privkey */
+	if (dev_force_privkey) {
+		*node_privkey = *dev_force_privkey;
+		if (!secp256k1_ec_pubkey_create(secp256k1_ctx, &node_id->pubkey,
+						node_privkey->secret.data))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Failed to derive pubkey for dev_force_privkey");
+	}
+#endif
 }
 
 /*~ This secret is the basis for all per-channel secrets: the per-channel seeds
@@ -383,6 +404,18 @@ static void populate_secretstuff(void)
 	} while (bip32_key_from_seed(bip32_seed, sizeof(bip32_seed),
 				     bip32_key_version.bip32_privkey_version,
 				     0, &master_extkey) != WALLY_OK);
+
+#if DEVELOPER
+	/* In DEVELOPER mode, we can override with --dev-force-bip32-seed */
+	if (dev_force_bip32_seed) {
+		if (bip32_key_from_seed(dev_force_bip32_seed->data,
+					sizeof(dev_force_bip32_seed->data),
+					bip32_key_version.bip32_privkey_version,
+					0, &master_extkey) != WALLY_OK)
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Can't derive bip32 master key");
+	}
+#endif /* DEVELOPER */
 
 	/* BIP 32:
 	 *
@@ -537,6 +570,10 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 {
 	struct node_id node_id;
 	struct pubkey key;
+	struct privkey *privkey;
+	struct secret *seed;
+	struct secrets *secrets;
+	struct sha256 *shaseed;
 
 	/* This must be lightningd. */
 	assert(is_lightningd(c));
@@ -545,9 +582,16 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 	 * definitions in hsm_client_wire.csv.  The format of those files is
 	 * an extension of the simple comma-separated format output by the
 	 * BOLT tools/extract-formats.py tool. */
-	if (!fromwire_hsm_init(msg_in, &bip32_key_version))
+	if (!fromwire_hsm_init(NULL, msg_in, &bip32_key_version,
+			       &privkey, &seed, &secrets, &shaseed))
 		return bad_req(conn, c, msg_in);
 
+#if DEVELOPER
+	dev_force_privkey = privkey;
+	dev_force_bip32_seed = seed;
+	dev_force_channel_secrets = secrets;
+	dev_force_channel_secrets_shaseed = shaseed;
+#endif
 	maybe_create_new_hsm();
 	load_hsm();
 
@@ -770,6 +814,12 @@ static struct io_plan *handle_sign_commitment_tx(struct io_conn *conn,
 					     &funding))
 		return bad_req(conn, c, msg_in);
 
+	/* Basic sanity checks. */
+	if (tx->wtx->num_inputs != 1)
+		return bad_req_fmt(conn, c, msg_in, "tx must have 1 input");
+	if (tx->wtx->num_outputs == 0)
+		return bad_req_fmt(conn, c, msg_in, "tx must have > 0 outputs");
+
 	get_channel_seed(&peer_id, dbid, &channel_seed);
 	derive_basepoints(&channel_seed,
 			  &local_funding_pubkey, NULL, &secrets, NULL);
@@ -822,6 +872,12 @@ static struct io_plan *handle_sign_remote_commitment_tx(struct io_conn *conn,
 						    &remote_funding_pubkey,
 						    &funding))
 		bad_req(conn, c, msg_in);
+
+	/* Basic sanity checks. */
+	if (tx->wtx->num_inputs != 1)
+		return bad_req_fmt(conn, c, msg_in, "tx must have 1 input");
+	if (tx->wtx->num_outputs == 0)
+		return bad_req_fmt(conn, c, msg_in, "tx must have > 0 outputs");
 
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
 	derive_basepoints(&channel_seed,
@@ -1439,7 +1495,6 @@ static struct io_plan *handle_sign_withdrawal_tx(struct io_conn *conn,
 	u32 change_keyindex;
 	struct utxo **utxos;
 	struct bitcoin_tx *tx;
-	struct ext_key ext;
 	struct pubkey changekey;
 	u8 *scriptpubkey;
 
@@ -1448,15 +1503,13 @@ static struct io_plan *handle_sign_withdrawal_tx(struct io_conn *conn,
 					  &scriptpubkey, &utxos))
 		return bad_req(conn, c, msg_in);
 
-	if (bip32_key_from_parent(&secretstuff.bip32, change_keyindex,
-				  BIP32_FLAG_KEY_PUBLIC, &ext) != WALLY_OK)
+	if (!bip32_pubkey(&secretstuff.bip32, &changekey, change_keyindex))
 		return bad_req_fmt(conn, c, msg_in,
 				   "Failed to get key %u", change_keyindex);
 
-	pubkey_from_der(ext.pub_key, sizeof(ext.pub_key), &changekey);
 	tx = withdraw_tx(tmpctx, cast_const2(const struct utxo **, utxos),
 			 scriptpubkey, satoshi_out,
-			 &changekey, change_out, NULL);
+			 &changekey, change_out, NULL, NULL);
 
 	sign_all_inputs(tx, utxos);
 
@@ -1588,6 +1641,9 @@ static struct io_plan *handle_memleak(struct io_conn *conn,
 			    dbid_zero_clients, sizeof(dbid_zero_clients));
 	memleak_remove_uintmap(memtable, &clients);
 	memleak_scan_region(memtable, status_conn, tal_bytelen(status_conn));
+
+	memleak_scan_region(memtable, dev_force_privkey, 0);
+	memleak_scan_region(memtable, dev_force_bip32_seed, 0);
 
 	found_leak = dump_memleak(memtable);
 	reply = towire_hsm_dev_memleak_reply(NULL, found_leak);

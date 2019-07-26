@@ -2,6 +2,7 @@
 int unused_main(int argc, char *argv[]);
 #include "../../common/base32.c"
 #include "../../common/wireaddr.c"
+#include "../io_loop_with_timers.c"
 #include "../lightningd.c"
 #include "../subd.c"
 #include <common/amount.h>
@@ -62,6 +63,9 @@ void   fatal(const char *fmt UNNEEDED, ...)
 /* Generated stub for free_htlcs */
 void free_htlcs(struct lightningd *ld UNNEEDED, const struct channel *channel UNNEEDED)
 { fprintf(stderr, "free_htlcs called!\n"); abort(); }
+/* Generated stub for free_unreleased_txs */
+void free_unreleased_txs(struct wallet *w UNNEEDED)
+{ fprintf(stderr, "free_unreleased_txs called!\n"); abort(); }
 /* Generated stub for fromwire_status_fail */
 bool fromwire_status_fail(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, enum status_failreason *failreason UNNEEDED, wirestring **desc UNNEEDED)
 { fprintf(stderr, "fromwire_status_fail called!\n"); abort(); }
@@ -69,7 +73,7 @@ bool fromwire_status_fail(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, enu
 bool fromwire_status_peer_billboard(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, bool *perm UNNEEDED, wirestring **happenings UNNEEDED)
 { fprintf(stderr, "fromwire_status_peer_billboard called!\n"); abort(); }
 /* Generated stub for fromwire_status_peer_error */
-bool fromwire_status_peer_error(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct channel_id *channel UNNEEDED, wirestring **desc UNNEEDED, struct crypto_state *crypto_state UNNEEDED, u8 **error_for_them UNNEEDED)
+bool fromwire_status_peer_error(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct channel_id *channel UNNEEDED, wirestring **desc UNNEEDED, bool *soft_error UNNEEDED, struct per_peer_state **pps UNNEEDED, u8 **error_for_them UNNEEDED)
 { fprintf(stderr, "fromwire_status_peer_error called!\n"); abort(); }
 /* Generated stub for get_log_book */
 struct log_book *get_log_book(const struct log *log UNNEEDED)
@@ -102,7 +106,7 @@ void jsonrpc_setup(struct lightningd *ld UNNEEDED)
 void load_channels_from_wallet(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "load_channels_from_wallet called!\n"); abort(); }
 /* Generated stub for log_ */
-void log_(struct log *log UNNEEDED, enum log_level level UNNEEDED, const char *fmt UNNEEDED, ...)
+void log_(struct log *log UNNEEDED, enum log_level level UNNEEDED, bool call_notifier UNNEEDED, const char *fmt UNNEEDED, ...)
 
 { fprintf(stderr, "log_ called!\n"); abort(); }
 /* Generated stub for log_backtrace_exit */
@@ -121,7 +125,7 @@ bool log_status_msg(struct log *log UNNEEDED, const u8 *msg UNNEEDED)
 struct log *new_log(const tal_t *ctx UNNEEDED, struct log_book *record UNNEEDED, const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "new_log called!\n"); abort(); }
 /* Generated stub for new_log_book */
-struct log_book *new_log_book(size_t max_mem UNNEEDED,
+struct log_book *new_log_book(struct lightningd *ld UNNEEDED, size_t max_mem UNNEEDED,
 			      enum log_level printlevel UNNEEDED)
 { fprintf(stderr, "new_log_book called!\n"); abort(); }
 /* Generated stub for new_topology */
@@ -130,6 +134,9 @@ struct chain_topology *new_topology(struct lightningd *ld UNNEEDED, struct log *
 /* Generated stub for onchaind_replay_channels */
 void onchaind_replay_channels(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "onchaind_replay_channels called!\n"); abort(); }
+/* Generated stub for per_peer_state_set_fds_arr */
+void per_peer_state_set_fds_arr(struct per_peer_state *pps UNNEEDED, const int *fds UNNEEDED)
+{ fprintf(stderr, "per_peer_state_set_fds_arr called!\n"); abort(); }
 /* Generated stub for plugins_config */
 void plugins_config(struct plugins *plugins UNNEEDED)
 { fprintf(stderr, "plugins_config called!\n"); abort(); }
@@ -166,11 +173,9 @@ const char *version(void)
 /* Generated stub for wallet_blocks_heights */
 void wallet_blocks_heights(struct wallet *w UNNEEDED, u32 def UNNEEDED, u32 *min UNNEEDED, u32 *max UNNEEDED)
 { fprintf(stderr, "wallet_blocks_heights called!\n"); abort(); }
-/* Generated stub for wallet_invoice_autoclean */
-void wallet_invoice_autoclean(struct wallet * wallet UNNEEDED,
-			      u64 cycle_seconds UNNEEDED,
-			      u64 expired_by UNNEEDED)
-{ fprintf(stderr, "wallet_invoice_autoclean called!\n"); abort(); }
+/* Generated stub for wallet_clean_utxos */
+void wallet_clean_utxos(struct wallet *w UNNEEDED, struct bitcoind *bitcoind UNNEEDED)
+{ fprintf(stderr, "wallet_clean_utxos called!\n"); abort(); }
 /* Generated stub for wallet_network_check */
 bool wallet_network_check(struct wallet *w UNNEEDED,
 			  const struct chainparams *chainparams UNNEEDED)

@@ -24,6 +24,9 @@ bool derive_keyset(const struct pubkey *per_commitment_point UNNEEDED,
 		   const struct basepoints *other UNNEEDED,
 		   struct keyset *keyset UNNEEDED)
 { fprintf(stderr, "derive_keyset called!\n"); abort(); }
+/* Generated stub for fromwire_fail */
+const void *fromwire_fail(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
+{ fprintf(stderr, "fromwire_fail called!\n"); abort(); }
 /* Generated stub for fromwire_hsm_get_per_commitment_point_reply */
 bool fromwire_hsm_get_per_commitment_point_reply(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct pubkey *per_commitment_point UNNEEDED, struct secret **old_commitment_secret UNNEEDED)
 { fprintf(stderr, "fromwire_hsm_get_per_commitment_point_reply called!\n"); abort(); }
@@ -130,7 +133,7 @@ u8 *towire_onchain_add_utxo(const tal_t *ctx UNNEEDED, const struct bitcoin_txid
 u8 *towire_onchain_all_irrevocably_resolved(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "towire_onchain_all_irrevocably_resolved called!\n"); abort(); }
 /* Generated stub for towire_onchain_broadcast_tx */
-u8 *towire_onchain_broadcast_tx(const tal_t *ctx UNNEEDED, const struct bitcoin_tx *tx UNNEEDED)
+u8 *towire_onchain_broadcast_tx(const tal_t *ctx UNNEEDED, const struct bitcoin_tx *tx UNNEEDED, enum wallet_tx_type type UNNEEDED)
 { fprintf(stderr, "towire_onchain_broadcast_tx called!\n"); abort(); }
 /* Generated stub for towire_onchain_dev_memleak_reply */
 u8 *towire_onchain_dev_memleak_reply(const tal_t *ctx UNNEEDED, bool leak UNNEEDED)
@@ -147,6 +150,9 @@ u8 *towire_onchain_init_reply(const tal_t *ctx UNNEEDED)
 /* Generated stub for towire_onchain_missing_htlc_output */
 u8 *towire_onchain_missing_htlc_output(const tal_t *ctx UNNEEDED, const struct htlc_stub *htlc UNNEEDED)
 { fprintf(stderr, "towire_onchain_missing_htlc_output called!\n"); abort(); }
+/* Generated stub for towire_onchain_transaction_annotate */
+u8 *towire_onchain_transaction_annotate(const tal_t *ctx UNNEEDED, const struct bitcoin_txid *txid UNNEEDED, enum wallet_tx_type type UNNEEDED)
+{ fprintf(stderr, "towire_onchain_transaction_annotate called!\n"); abort(); }
 /* Generated stub for towire_onchain_unwatch_tx */
 u8 *towire_onchain_unwatch_tx(const tal_t *ctx UNNEEDED, const struct bitcoin_txid *txid UNNEEDED)
 { fprintf(stderr, "towire_onchain_unwatch_tx called!\n"); abort(); }

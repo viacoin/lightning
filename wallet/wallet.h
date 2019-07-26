@@ -11,12 +11,14 @@
 #include <ccan/tal/tal.h>
 #include <common/channel_config.h>
 #include <common/utxo.h>
+#include <common/wallet.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/invoice.h>
 #include <lightningd/log.h>
 #include <onchaind/onchain_wire.h>
 #include <wally_bip32.h>
+#include <wire/gen_onion_wire.h>
 
 enum onion_type;
 struct amount_msat;
@@ -44,6 +46,24 @@ struct wallet {
 	/* Filter matching all outpoints that might be a funding transaction on
 	 * the blockchain. This is currently all P2WSH outputs */
 	struct outpointfilter *utxoset_outpoints;
+
+	/* Unreleased txs, waiting for txdiscard/txsend */
+	struct list_head unreleased_txs;
+};
+
+/* A transaction we've txprepared, but  haven't signed and released yet */
+struct unreleased_tx {
+	/* In wallet->unreleased_txs */
+	struct list_node list;
+	/* All the utxos. */
+	struct wallet_tx *wtx;
+	/* Scriptpubkey this pays to. */
+	const u8 *destination;
+	/* The tx itself (unsigned initially) */
+	struct bitcoin_tx *tx;
+	struct bitcoin_txid txid;
+	/* Index of change output, or -1 if none. */
+	int change_outnum;
 };
 
 /* Possible states for tracked outputs in the database. Not sure yet
@@ -128,7 +148,8 @@ static inline enum wallet_output_type wallet_output_type_in_db(enum wallet_outpu
 enum forward_status {
 	FORWARD_OFFERED = 0,
 	FORWARD_SETTLED = 1,
-	FORWARD_FAILED = 2
+	FORWARD_FAILED = 2,
+	FORWARD_LOCAL_FAILED = 3
 };
 
 static inline enum forward_status wallet_forward_status_in_db(enum forward_status s)
@@ -143,6 +164,9 @@ static inline enum forward_status wallet_forward_status_in_db(enum forward_statu
 	case FORWARD_FAILED:
 		BUILD_ASSERT(FORWARD_FAILED == 2);
 		return s;
+	case FORWARD_LOCAL_FAILED:
+		BUILD_ASSERT(FORWARD_LOCAL_FAILED == 3);
+		return s;
 	}
 	fatal("%s: %u is invalid", __func__, s);
 }
@@ -156,6 +180,8 @@ static inline const char* forward_status_name(enum forward_status status)
 		return "settled";
 	case FORWARD_FAILED:
 		return "failed";
+	case FORWARD_LOCAL_FAILED:
+		return "local_failed";
 	}
 	abort();
 }
@@ -165,6 +191,7 @@ struct forwarding {
 	struct amount_msat msat_in, msat_out, fee;
 	struct sha256_double *payment_hash;
 	enum forward_status status;
+	enum onion_type failcode;
 	struct timeabs received_time;
 	/* May not be present if the HTLC was not resolved yet. */
 	struct timeabs *resolved_time;
@@ -262,6 +289,15 @@ struct channeltx {
 	u32 depth;
 };
 
+struct wallet_transaction {
+	struct bitcoin_txid id;
+	u32 blockheight;
+	u32 txindex;
+	u8 *rawtx;
+	enum wallet_tx_type type;
+	u64 channel_id;
+};
+
 /**
  * wallet_new - Constructor for a new sqlite3 based wallet
  *
@@ -334,6 +370,15 @@ const struct utxo **wallet_select_all(const tal_t *ctx, struct wallet *w,
 				      u32 maxheight,
 				      struct amount_sat *sat,
 				      struct amount_sat *fee_estimate);
+
+/**
+ * wallet_select_specific - Select utxos given an array of txids and an array of outputs index
+ *
+ * Returns an array of `utxo` structs.
+ */
+const struct utxo **wallet_select_specific(const tal_t *ctx, struct wallet *w,
+					struct bitcoin_txid **txids,
+					u32 **outnums);
 
 /**
  * wallet_confirm_utxos - Once we've spent a set of utxos, mark them confirmed.
@@ -409,9 +454,9 @@ void wallet_channel_save(struct wallet *w, struct channel *chan);
 void wallet_channel_insert(struct wallet *w, struct channel *chan);
 
 /**
- * wallet_channel_delete -- After resolving a channel, forget about it
+ * After fully resolving a channel, only keep a lightweight stub
  */
-void wallet_channel_delete(struct wallet *w, u64 wallet_id);
+void wallet_channel_close(struct wallet *w, u64 wallet_id);
 
 /**
  * wallet_peer_delete -- After no more channels in peer, forget about it
@@ -427,13 +472,12 @@ bool wallet_channel_config_load(struct wallet *w, const u64 id,
 /**
  * wlalet_channels_load_active -- Load persisted active channels into the peers
  *
- * @ctx: context to allocate peers from
  * @w: wallet to load from
  *
  * Be sure to call this only once on startup since it'll append peers
  * loaded from the database to the list without checking.
  */
-bool wallet_channels_load_active(const tal_t *ctx, struct wallet *w);
+bool wallet_channels_load_active(struct wallet *w);
 
 /**
  * wallet_channel_stats_incr_* - Increase channel statistics.
@@ -548,6 +592,21 @@ bool wallet_htlcs_load_for_channel(struct wallet *wallet,
 				   struct htlc_in_map *htlcs_in,
 				   struct htlc_out_map *htlcs_out);
 
+/**
+ * wallet_announcement_save - Save remote announcement information with channel.
+ *
+ * @wallet: wallet to load from
+ * @id: channel database id
+ * @remote_ann_node_sig: location to load remote_ann_node_sig to
+ * @remote_ann_bitcoin_sig: location to load remote_ann_bitcoin_sig to
+ *
+ * This function is only used to save REMOTE announcement information into DB
+ * when the channel has set the announce_channel bit and don't send the shutdown
+ * message(BOLT#7).
+ */
+void wallet_announcement_save(struct wallet *wallet, u64 id,
+			      secp256k1_ecdsa_signature *remote_ann_node_sig,
+			      secp256k1_ecdsa_signature *remote_ann_bitcoin_sig);
 
 /* /!\ This is a DB ENUM, please do not change the numbering of any
  * already defined elements (adding is ok) /!\ */
@@ -582,7 +641,7 @@ struct invoice_details {
 	/* Hash of preimage r */
 	struct sha256 rhash;
 	/* Label assigned by user */
-	const struct json_escaped *label;
+	const struct json_escape *label;
 	/* NULL if they specified "any" */
 	struct amount_msat *msat;
 	/* Absolute UNIX epoch time this will expire */
@@ -634,7 +693,7 @@ struct invoice {
 bool wallet_invoice_create(struct wallet *wallet,
 			   struct invoice *pinvoice,
 			   const struct amount_msat *msat TAKES,
-			   const struct json_escaped *label TAKES,
+			   const struct json_escape *label TAKES,
 			   u64 expiry,
 			   const char *b11enc,
 			   const char *description,
@@ -653,7 +712,7 @@ bool wallet_invoice_create(struct wallet *wallet,
  */
 bool wallet_invoice_find_by_label(struct wallet *wallet,
 				  struct invoice *pinvoice,
-				  const struct json_escaped *label);
+				  const struct json_escape *label);
 
 /**
  * wallet_invoice_find_by_rhash - Search for an invoice by payment_hash
@@ -989,6 +1048,18 @@ void wallet_transaction_add(struct wallet *w, const struct bitcoin_tx *tx,
 			    const u32 blockheight, const u32 txindex);
 
 /**
+ * Annotate a transaction in the DB with its type and channel referemce.
+ *
+ * We add transactions when filtering the block, but often know its type only
+ * when we trigger the txwatches, at which point we've already discarded the
+ * full transaction. This function can be used to annotate the transactions
+ * after the fact with a channel number for grouping and a type for filtering.
+ */
+void wallet_transaction_annotate(struct wallet *w,
+				 const struct bitcoin_txid *txid,
+				 enum wallet_tx_type type, u64 channel_id);
+
+/**
  * Get the confirmation height of a transaction we are watching by its
  * txid. Returns 0 if the transaction was not part of any block.
  */
@@ -1032,7 +1103,8 @@ struct channeltx *wallet_channeltxs_get(struct wallet *w, const tal_t *ctx,
  */
 void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
 				  const struct htlc_out *out,
-				  enum forward_status state);
+				  enum forward_status state,
+				  enum onion_type failcode);
 
 /**
  * Retrieve summary of successful forwarded payments' fees
@@ -1044,4 +1116,47 @@ struct amount_msat wallet_total_forward_fees(struct wallet *w);
  */
 const struct forwarding *wallet_forwarded_payments_get(struct wallet *w,
 						       const tal_t *ctx);
+
+/**
+ * Load remote_ann_node_sig and remote_ann_bitcoin_sig
+ *
+ * @ctx: allocation context for the return value
+ * @w: wallet containing the channel
+ * @id: channel database id
+ * @remote_ann_node_sig: location to load remote_ann_node_sig to
+ * @remote_ann_bitcoin_sig: location to load remote_ann_bitcoin_sig to
+ */
+bool wallet_remote_ann_sigs_load(const tal_t *ctx, struct wallet *w, u64 id,
+				 secp256k1_ecdsa_signature **remote_ann_node_sig,
+				 secp256k1_ecdsa_signature **remote_ann_bitcoin_sig);
+
+/**
+ * wallet_clean_utxos: clean up any reserved UTXOs on restart.
+ * @w: wallet
+ *
+ * If we crash, it's unclear if we have actually used the inputs.  eg. if
+ * we crash around transaction broadcast.
+ *
+ * We ask bitcoind to clarify in this case.
+ */
+void wallet_clean_utxos(struct wallet *w, struct bitcoind *bitcoind);
+
+/* Operations for unreleased transactions */
+struct unreleased_tx *find_unreleased_tx(struct wallet *w,
+					 const struct bitcoin_txid *txid);
+void remove_unreleased_tx(struct unreleased_tx *utx);
+void add_unreleased_tx(struct wallet *w, struct unreleased_tx *utx);
+
+/* These will touch the db, so need to be explicitly freed. */
+void free_unreleased_txs(struct wallet *w);
+
+/**
+ * Get a list of transactions that we track in the wallet.
+ *
+ * @param ctx: allocation context for the returned list
+ * @param wallet: Wallet to load from.
+ * @return A tal_arr of wallet transactions
+ */
+struct wallet_transaction *wallet_transactions_get(struct wallet *w, const tal_t *ctx);
+
 #endif /* LIGHTNING_WALLET_WALLET_H */

@@ -73,9 +73,7 @@ void ping_reply(struct subd *subd, const u8 *msg)
 	else {
 		struct json_stream *response = json_stream_success(pc->cmd);
 
-		json_object_start(response, NULL);
 		json_add_num(response, "totlen", totlen);
-		json_object_end(response);
 		was_pending(command_success(pc->cmd, response));
 	}
 }
@@ -106,9 +104,9 @@ static struct command_result *json_ping(struct command *cmd,
 	 *...
 	 * 1. type: 18 (`ping`)
 	 * 2. data:
-	 *    * [`2`:`num_pong_bytes`]
-	 *    * [`2`:`byteslen`]
-	 *    * [`byteslen`:`ignored`]
+	 *    * [`u16`:`num_pong_bytes`]
+	 *    * [`u16`:`byteslen`]
+	 *    * [`byteslen*byte`:`ignored`]
 	 */
 	if (*len > 65535 - 2 - 2 - 2) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
@@ -132,6 +130,7 @@ static struct command_result *json_ping(struct command *cmd,
 
 static const struct json_command ping_command = {
 	"ping",
+	"network",
 	json_ping,
 	"Send peer {id} a ping of length {len} (default 128) asking for {pongbytes} (default 128)"
 };

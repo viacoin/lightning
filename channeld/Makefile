@@ -47,7 +47,9 @@ CHANNELD_COMMON_OBJS :=				\
 	common/features.o			\
 	common/gen_status_wire.o		\
 	common/gen_peer_status_wire.o		\
+	common/gossip_store.o			\
 	common/htlc_state.o			\
+	common/htlc_trim.o			\
 	common/htlc_tx.o			\
 	common/htlc_wire.o			\
 	common/initial_channel.o		\
@@ -59,6 +61,7 @@ CHANNELD_COMMON_OBJS :=				\
 	common/node_id.o			\
 	common/peer_billboard.o			\
 	common/peer_failed.o			\
+	common/per_peer_state.o			\
 	common/permute_tx.o			\
 	common/ping.o				\
 	common/pseudorand.o			\
@@ -100,10 +103,10 @@ channeld/gen_full_channel_error_names.h: channeld/full_channel_error.h ccan/ccan
 $(LIGHTNINGD_CHANNEL_OBJS): $(LIGHTNINGD_HEADERS) $(LIGHTNINGD_GOSSIP_CONTROL_HEADERS)
 
 channeld/gen_channel_wire.h: $(WIRE_GEN) channeld/channel_wire.csv
-	$(WIRE_GEN) --header $@ channel_wire_type < channeld/channel_wire.csv > $@
+	$(WIRE_GEN) --page header $@ channel_wire_type < channeld/channel_wire.csv > $@
 
 channeld/gen_channel_wire.c: $(WIRE_GEN) channeld/channel_wire.csv
-	$(WIRE_GEN) ${@:.c=.h} channel_wire_type < channeld/channel_wire.csv > $@
+	$(WIRE_GEN) --page impl ${@:.c=.h} channel_wire_type < channeld/channel_wire.csv > $@
 
 LIGHTNINGD_CHANNEL_OBJS := $(LIGHTNINGD_CHANNEL_SRC:.c=.o)
 

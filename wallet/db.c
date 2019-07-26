@@ -1,8 +1,8 @@
 #include "db.h"
 
 #include <ccan/array_size/array_size.h>
+#include <ccan/json_escape/json_escape.h>
 #include <ccan/tal/str/str.h>
-#include <common/json_escaped.h>
 #include <common/node_id.h>
 #include <common/version.h>
 #include <inttypes.h>
@@ -379,6 +379,19 @@ static struct migration dbmigrations[] = {
 	{ "ALTER TABLE channel_htlcs ADD received_time INTEGER", NULL },
 	{ "ALTER TABLE forwarded_payments ADD received_time INTEGER", NULL },
 	{ "ALTER TABLE forwarded_payments ADD resolved_time INTEGER", NULL },
+	{ "ALTER TABLE channels ADD remote_upfront_shutdown_script BLOB;", NULL },
+	/* PR #2524: Add failcode into forward_payment */
+	{ "ALTER TABLE forwarded_payments ADD failcode INTEGER;", NULL },
+	/* remote signatures for channel announcement */
+	{ "ALTER TABLE channels ADD remote_ann_node_sig BLOB;", NULL },
+	{ "ALTER TABLE channels ADD remote_ann_bitcoin_sig BLOB;", NULL },
+	/* Additional information for transaction tracking and listing */
+	{ "ALTER TABLE transactions ADD type INTEGER;", NULL },
+	/* Not a foreign key on purpose since we still delete channels from
+	 * the DB which would remove this. It is mainly used to group payments
+	 * in the list view anyway, e.g., show all close and htlc transactions
+	 * as a single bundle. */
+	{ "ALTER TABLE transactions ADD channel_id INTEGER;", NULL},
 };
 
 /* Leak tracking. */
@@ -1108,16 +1121,16 @@ bool sqlite3_bind_sha256_double(sqlite3_stmt *stmt, int col, const struct sha256
 	return err == SQLITE_OK;
 }
 
-struct json_escaped *sqlite3_column_json_escaped(const tal_t *ctx,
-						 sqlite3_stmt *stmt, int col)
+struct json_escape *sqlite3_column_json_escape(const tal_t *ctx,
+					       sqlite3_stmt *stmt, int col)
 {
-	return json_escaped_string_(ctx,
-				    sqlite3_column_blob(stmt, col),
-				    sqlite3_column_bytes(stmt, col));
+	return json_escape_string_(ctx,
+				   sqlite3_column_blob(stmt, col),
+				   sqlite3_column_bytes(stmt, col));
 }
 
-bool sqlite3_bind_json_escaped(sqlite3_stmt *stmt, int col,
-			       const struct json_escaped *esc)
+bool sqlite3_bind_json_escape(sqlite3_stmt *stmt, int col,
+			      const struct json_escape *esc)
 {
 	int err = sqlite3_bind_text(stmt, col, esc->s, strlen(esc->s), SQLITE_TRANSIENT);
 	return err == SQLITE_OK;
@@ -1162,7 +1175,7 @@ void migrate_pr2342_feerate_per_channel(struct lightningd *ld, struct db *db)
 
 void sqlite3_bind_timeabs(sqlite3_stmt *stmt, int col, struct timeabs t)
 {
-	u64 timestamp =  t.ts.tv_nsec + (t.ts.tv_sec * NSEC_IN_SEC);
+	u64 timestamp =  t.ts.tv_nsec + (((u64) t.ts.tv_sec) * ((u64) NSEC_IN_SEC));
 	sqlite3_bind_int64(stmt, col, timestamp);
 }
 

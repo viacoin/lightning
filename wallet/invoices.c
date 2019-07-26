@@ -45,10 +45,6 @@ struct invoices {
 	u64 min_expiry_time;
 	/* Expiration timer */
 	struct oneshot *expiration_timer;
-	/* Autoclean timer */
-	struct oneshot *autoclean_timer;
-	u64 autoclean_cycle_seconds;
-	u64 autoclean_expired_by;
 };
 
 static void trigger_invoice_waiter(struct invoice_waiter *w,
@@ -100,7 +96,7 @@ static struct invoice_details *wallet_stmt2invoice_details(const tal_t *ctx,
 
 	sqlite3_column_sha256(stmt, 2, &dtl->rhash);
 
-	dtl->label = sqlite3_column_json_escaped(dtl, stmt, 3);
+	dtl->label = sqlite3_column_json_escape(dtl, stmt, 3);
 
 	if (sqlite3_column_type(stmt, 4) != SQLITE_NULL) {
 		dtl->msat = tal(dtl, struct amount_msat);
@@ -160,7 +156,6 @@ struct invoices *invoices_new(const tal_t *ctx,
 	list_head_init(&invs->waiters);
 
 	invs->expiration_timer = NULL;
-	invs->autoclean_timer = NULL;
 
 	update_db_expirations(invs, time_now().ts.tv_sec);
 	install_expiration_timer(invs);
@@ -260,7 +255,7 @@ static void install_expiration_timer(struct invoices *invoices)
 bool invoices_create(struct invoices *invoices,
 		     struct invoice *pinvoice,
 		     const struct amount_msat *msat TAKES,
-		     const struct json_escaped *label TAKES,
+		     const struct json_escape *label TAKES,
 		     u64 expiry,
 		     const char *b11enc,
 		     const char *description,
@@ -305,7 +300,7 @@ bool invoices_create(struct invoices *invoices,
 		sqlite3_bind_amount_msat(stmt, 4, *msat);
 	else
 		sqlite3_bind_null(stmt, 4);
-	sqlite3_bind_json_escaped(stmt, 5, label);
+	sqlite3_bind_json_escape(stmt, 5, label);
 	sqlite3_bind_int64(stmt, 6, expiry_time);
 	sqlite3_bind_text(stmt, 7, b11enc, strlen(b11enc), SQLITE_TRANSIENT);
 	sqlite3_bind_text(stmt, 8, description, strlen(description), SQLITE_TRANSIENT);
@@ -332,7 +327,7 @@ bool invoices_create(struct invoices *invoices,
 
 bool invoices_find_by_label(struct invoices *invoices,
 			    struct invoice *pinvoice,
-			    const struct json_escaped *label)
+			    const struct json_escape *label)
 {
 	sqlite3_stmt *stmt;
 
@@ -340,7 +335,7 @@ bool invoices_find_by_label(struct invoices *invoices,
 				 "id"
 				 "  FROM invoices"
 				 " WHERE label = ?;");
-	sqlite3_bind_json_escaped(stmt, 1, label);
+	sqlite3_bind_json_escape(stmt, 1, label);
 	if (!db_select_step(invoices->db, stmt))
 		return false;
 
@@ -421,42 +416,6 @@ void invoices_delete_expired(struct invoices *invoices,
 	db_exec_prepared(invoices->db, stmt);
 }
 
-static void refresh_autoclean(struct invoices *invoices);
-static void trigger_autoclean(struct invoices *invoices)
-{
-	u64 now = time_now().ts.tv_sec;
-
-	invoices_delete_expired(invoices,
-				now - invoices->autoclean_expired_by);
-
-	refresh_autoclean(invoices);
-}
-static void refresh_autoclean(struct invoices *invoices)
-{
-	struct timerel rel = time_from_sec(invoices->autoclean_cycle_seconds);
-	invoices->autoclean_timer = tal_free(invoices->autoclean_timer);
-	invoices->autoclean_timer = new_reltimer(invoices->timers,
-						 invoices,
-						 rel,
-						 &trigger_autoclean,
-						 invoices);
-}
-
-void invoices_autoclean_set(struct invoices *invoices,
-			    u64 cycle_seconds,
-			    u64 expired_by)
-{
-	/* If not perform autoclean, just clear */
-	if (cycle_seconds == 0) {
-		invoices->autoclean_timer = tal_free(invoices->autoclean_timer);
-		return;
-	}
-
-	invoices->autoclean_cycle_seconds = cycle_seconds;
-	invoices->autoclean_expired_by = expired_by;
-	refresh_autoclean(invoices);
-}
-
 bool invoices_iterate(struct invoices *invoices,
 		      struct invoice_iterator *it)
 {
@@ -496,6 +455,21 @@ static s64 get_next_pay_index(struct db *db)
 	return next_pay_index;
 }
 
+static enum invoice_status invoice_get_status(struct invoices *invoices, struct invoice invoice)
+{
+	sqlite3_stmt *stmt;
+	enum invoice_status state;
+	bool res;
+
+	stmt = db_select_prepare(invoices->db,
+				 "state FROM invoices WHERE id = ?;");
+	sqlite3_bind_int64(stmt, 1, invoice.id);
+	res = db_select_step(invoices->db, stmt);
+	assert(res);
+	state = sqlite3_column_int(stmt, 0);
+	db_stmt_done(stmt);
+	return state;
+}
 
 void invoices_resolve(struct invoices *invoices,
 		      struct invoice invoice,
@@ -504,6 +478,9 @@ void invoices_resolve(struct invoices *invoices,
 	sqlite3_stmt *stmt;
 	s64 pay_index;
 	u64 paid_timestamp;
+	enum invoice_status state = invoice_get_status(invoices, invoice);
+
+	assert(state == UNPAID);
 
 	/* Assign a pay-index. */
 	pay_index = get_next_pay_index(invoices->db);
@@ -589,25 +566,14 @@ void invoices_waitany(const tal_t *ctx,
 
 
 void invoices_waitone(const tal_t *ctx,
-		      struct invoices *invoices UNUSED,
+		      struct invoices *invoices,
 		      struct invoice invoice,
 		      void (*cb)(const struct invoice *, void*),
 		      void *cbarg)
 {
-	sqlite3_stmt *stmt;
-	bool res;
 	enum invoice_status state;
 
-	stmt = db_select_prepare(invoices->db,
-				 "state"
-				 "  FROM invoices"
-				 " WHERE id = ?;");
-	sqlite3_bind_int64(stmt, 1, invoice.id);
-
-	res = db_select_step(invoices->db, stmt);
-	assert(res);
-	state = sqlite3_column_int(stmt, 0);
-	db_stmt_done(stmt);
+	state = invoice_get_status(invoices, invoice);
 
 	if (state == PAID || state == EXPIRED) {
 		cb(&invoice, cbarg);

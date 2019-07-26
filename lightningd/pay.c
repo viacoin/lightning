@@ -78,10 +78,10 @@ json_add_payment_fields(struct json_stream *response,
 	json_add_u64(response, "id", t->id);
 	json_add_hex(response, "payment_hash", &t->payment_hash, sizeof(t->payment_hash));
 	json_add_node_id(response, "destination", &t->destination);
-	json_add_amount_msat(response, t->msatoshi,
-			     "msatoshi", "amount_msat");
-	json_add_amount_msat(response, t->msatoshi_sent,
-			     "msatoshi_sent", "amount_sent_msat");
+	json_add_amount_msat_compat(response, t->msatoshi,
+				    "msatoshi", "amount_msat");
+	json_add_amount_msat_compat(response, t->msatoshi_sent,
+				    "msatoshi_sent", "amount_sent_msat");
 	json_add_u64(response, "created_at", t->timestamp);
 
 	switch (t->status) {
@@ -116,9 +116,7 @@ static struct command_result *sendpay_success(struct command *cmd,
 	assert(payment->status == PAYMENT_COMPLETE);
 
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_add_payment_fields(response, payment);
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 
@@ -132,7 +130,6 @@ json_add_routefail_info(struct json_stream *js,
 {
 	const char *failcodename = onion_type_name(failcode);
 
-	json_object_start(js, NULL);
 	json_add_num(js, "erring_index", erring_index);
 	json_add_num(js, "failcode", failcode);
 	/* FIXME: Better way to detect this? */
@@ -141,7 +138,6 @@ json_add_routefail_info(struct json_stream *js,
 	json_add_node_id(js, "erring_node", erring_node);
 	json_add_short_channel_id(js, "erring_channel", erring_channel);
 	json_add_num(js, "erring_direction", channel_dir);
-	json_object_end(js);
 }
 
 /* onionreply used if pay_errcode == PAY_UNPARSEABLE_ONION */
@@ -157,7 +153,6 @@ sendpay_fail(struct command *cmd,
 	if (pay_errcode == PAY_UNPARSEABLE_ONION) {
 		data = json_stream_fail(cmd, PAY_UNPARSEABLE_ONION,
 					"Malformed error reply");
- 		json_object_start(data, NULL);
 		json_add_hex_talarr(data, "onionreply", onionreply);
 		json_object_end(data);
 		return command_failed(cmd, data);
@@ -174,6 +169,7 @@ sendpay_fail(struct command *cmd,
 				&fail->erring_node,
 				&fail->erring_channel,
 				fail->channel_dir);
+	json_object_end(data);
 	return command_failed(cmd, data);
 }
 
@@ -183,11 +179,9 @@ json_sendpay_in_progress(struct command *cmd,
 			 const struct wallet_payment *payment)
 {
 	struct json_stream *response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_add_string(response, "message",
 			"Monitor status with listpayments or waitsendpay");
 	json_add_payment_fields(response, payment);
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 
@@ -678,6 +672,7 @@ send_payment(struct lightningd *ld,
 		json_add_routefail_info(data, 0, WIRE_UNKNOWN_NEXT_PEER,
 					&ld->id, &route[0].channel_id,
 					node_id_idx(&ld->id, &route[0].nodeid));
+		json_object_end(data);
 		return command_failed(cmd, data);
 	}
 
@@ -894,6 +889,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 
 static const struct json_command sendpay_command = {
 	"sendpay",
+	"payment",
 	json_sendpay,
 	"Send along {route} in return for preimage of {payment_hash}"
 };
@@ -925,13 +921,14 @@ static struct command_result *json_waitsendpay(struct command *cmd,
 		return res;
 
 	if (timeout)
-		new_reltimer(&cmd->ld->timers, cmd, time_from_sec(*timeout),
+		new_reltimer(cmd->ld->timers, cmd, time_from_sec(*timeout),
 			     &waitsendpay_timeout, cmd);
 	return command_still_pending(cmd);
 }
 
 static const struct json_command waitsendpay_command = {
 	"waitsendpay",
+	"payment",
 	json_waitsendpay,
 	"Wait for payment attempt on {payment_hash} to succeed or fail, "
 	"but only up to {timeout} seconds."
@@ -975,7 +972,6 @@ static struct command_result *json_listsendpays(struct command *cmd,
 	payments = wallet_payment_list(cmd, cmd->ld->wallet, rhash);
 
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 
 	json_array_start(response, "payments");
 	for (size_t i = 0; i < tal_count(payments); i++) {
@@ -985,12 +981,12 @@ static struct command_result *json_listsendpays(struct command *cmd,
 	}
 	json_array_end(response);
 
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 
 static const struct json_command listpayments_command = {
 	"listpayments",
+	"payment",
 	json_listsendpays,
 	"Show outgoing payments",
 	true /* deprecated, use new name */
@@ -999,6 +995,7 @@ AUTODATA(json_command, &listpayments_command);
 
 static const struct json_command listsendpays_command = {
 	"listsendpays",
+	"payment",
 	json_listsendpays,
 	"Show sendpay, old and current, optionally limiting to {bolt11} or {payment_hash}."
 };

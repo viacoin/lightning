@@ -11,6 +11,7 @@
 #include <common/gen_peer_status_wire.h>
 #include <common/gen_status_wire.h>
 #include <common/memleak.h>
+#include <common/per_peer_state.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <lightningd/lightningd.h>
@@ -362,23 +363,25 @@ static bool log_status_fail(struct subd *sd, const u8 *msg)
 	return true;
 }
 
-static bool handle_peer_error(struct subd *sd, const u8 *msg, int fds[2])
+static bool handle_peer_error(struct subd *sd, const u8 *msg, int fds[3])
 {
 	void *channel = sd->channel;
 	struct channel_id channel_id;
 	char *desc;
-	struct crypto_state cs;
+	struct per_peer_state *pps;
 	u8 *err_for_them;
+	bool soft_error;
 
 	if (!fromwire_status_peer_error(msg, msg,
-					&channel_id, &desc,
-					&cs, &err_for_them))
+					&channel_id, &desc, &soft_error,
+					&pps, &err_for_them))
 		return false;
 
-	/* Don't free sd; we're may be about to free channel. */
+	per_peer_state_set_fds_arr(pps, fds);
+
+	/* Don't free sd; we may be about to free channel. */
 	sd->channel = NULL;
-	sd->errcb(channel, fds[0], fds[1], &cs,
-		  &channel_id, desc, err_for_them);
+	sd->errcb(channel, pps, &channel_id, desc, soft_error, err_for_them);
 	return true;
 }
 
@@ -452,11 +455,11 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 	if (sd->channel) {
 		switch ((enum peer_status)type) {
 		case WIRE_STATUS_PEER_ERROR:
-			/* We expect 2 fds after this */
+			/* We expect 3 fds after this */
 			if (!sd->fds_in) {
 				/* Don't free msg_in: we go around again. */
 				tal_steal(sd, sd->msg_in);
-				plan = sd_collect_fds(conn, sd, 2);
+				plan = sd_collect_fds(conn, sd, 3);
 				goto out;
 			}
 			if (!handle_peer_error(sd, sd->msg_in, sd->fds_in))
@@ -464,8 +467,6 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 			goto close;
 		}
 	}
-
-	log_debug(sd->log, "UPDATE %s", sd->msgname(type));
 
 	/* Might free sd (if returns negative); save/restore sd->conn */
 	sd->conn = NULL;
@@ -558,10 +559,10 @@ static void destroy_subd(struct subd *sd)
 		if (!outer_transaction)
 			db_begin_transaction(db);
 		if (sd->errcb)
-			sd->errcb(channel, -1, -1, NULL, NULL,
+			sd->errcb(channel, NULL, NULL,
 				  tal_fmt(sd, "Owning subdaemon %s died (%i)",
 					  sd->name, status),
-				  NULL);
+				  false, NULL);
 		if (!outer_transaction)
 			db_commit_transaction(db);
 	}
@@ -608,10 +609,10 @@ static struct subd *new_subd(struct lightningd *ld,
 			     unsigned int (*msgcb)(struct subd *,
 						   const u8 *, const int *fds),
 			     void (*errcb)(void *channel,
-					   int peer_fd, int gossip_fd,
-					   const struct crypto_state *cs,
+					   struct per_peer_state *pps,
 					   const struct channel_id *channel_id,
 					   const char *desc,
+					   bool soft_error,
 					   const u8 *err_for_them),
 			     void (*billboardcb)(void *channel,
 						 bool perm,
@@ -699,10 +700,10 @@ struct subd *new_channel_subd_(struct lightningd *ld,
 			       unsigned int (*msgcb)(struct subd *, const u8 *,
 						     const int *fds),
 			       void (*errcb)(void *channel,
-					     int peer_fd, int gossip_fd,
-					     const struct crypto_state *cs,
+					     struct per_peer_state *pps,
 					     const struct channel_id *channel_id,
 					     const char *desc,
+					     bool soft_error,
 					     const u8 *err_for_them),
 			       void (*billboardcb)(void *channel, bool perm,
 						   const char *happenings),
@@ -748,7 +749,7 @@ void subd_req_(const tal_t *ctx,
 	add_req(ctx, sd, type, num_fds_in, replycb, replycb_data);
 }
 
-void subd_shutdown(struct subd *sd, unsigned int seconds)
+struct subd *subd_shutdown(struct subd *sd, unsigned int seconds)
 {
 	log_debug(sd->log, "Shutting down");
 
@@ -761,7 +762,7 @@ void subd_shutdown(struct subd *sd, unsigned int seconds)
 	/* Wait for a while. */
 	while (seconds) {
 		if (waitpid(sd->pid, NULL, WNOHANG) > 0) {
-			return;
+			return (struct subd*) tal_free(sd);
 		}
 		sleep(1);
 		seconds--;
@@ -770,7 +771,7 @@ void subd_shutdown(struct subd *sd, unsigned int seconds)
 	/* Didn't die?  This will kill it harder */
 	sd->must_not_exit = false;
 	destroy_subd(sd);
-	tal_free(sd);
+	return (struct subd*) tal_free(sd);
 }
 
 void subd_release_channel(struct subd *owner, void *channel)

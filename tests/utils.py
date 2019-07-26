@@ -149,9 +149,6 @@ class TailableProc(object):
         self.proc.wait()
         self.thread.join()
 
-        if self.proc.returncode:
-            raise ValueError("Process '{}' did not cleanly shutdown: return code {}".format(self.proc.pid, rc))
-
         return self.proc.returncode
 
     def kill(self):
@@ -290,6 +287,8 @@ class BitcoinD(TailableProc):
             '-server',
             '-logtimestamps',
             '-nolisten',
+            '-txindex',
+            '-addresstype=bech32'
         ]
         # For up to and including 0.16.1, this needs to be in main section.
         BITCOIND_CONFIG['rpcport'] = rpcport
@@ -316,11 +315,67 @@ class BitcoinD(TailableProc):
     def get_proxy(self):
         proxy = BitcoinRpcProxy(self)
         self.proxies.append(proxy)
+        proxy.start()
         return proxy
 
-    def generate_block(self, numblocks=1):
+    # wait_for_mempool can be used to wait for the mempool before generating blocks:
+    # True := wait for at least 1 transation
+    # int > 0 := wait for at least N transactions
+    # 'tx_id' := wait for one transaction id given as a string
+    # ['tx_id1', 'tx_id2'] := wait until all of the specified transaction IDs
+    def generate_block(self, numblocks=1, wait_for_mempool=0):
+        if wait_for_mempool:
+            if isinstance(wait_for_mempool, str):
+                wait_for_mempool = [wait_for_mempool]
+            if isinstance(wait_for_mempool, list):
+                wait_for(lambda: all(txid in self.rpc.getrawmempool() for txid in wait_for_mempool))
+            else:
+                wait_for(lambda: len(self.rpc.getrawmempool()) >= wait_for_mempool)
         # As of 0.16, generate() is removed; use generatetoaddress.
         return self.rpc.generatetoaddress(numblocks, self.rpc.getnewaddress())
+
+    def simple_reorg(self, height, shift=0):
+        """
+        Reorganize chain by creating a fork at height=[height] and re-mine all mempool
+        transactions into [height + shift], where shift >= 0. Returns hashes of generated
+        blocks.
+
+        Note that tx's that become invalid at [height] (because coin maturity, locktime
+        etc.) are removed from mempool. The length of the new chain will be original + 1
+        OR original + [shift], whichever is larger.
+
+        For example: to push tx's backward from height h1 to h2 < h1, use [height]=h2.
+
+        Or to change the txindex of tx's at height h1:
+        1. A block at height h2 < h1 should contain a non-coinbase tx that can be pulled
+           forward to h1.
+        2. Set [height]=h2 and [shift]= h1-h2
+        """
+        hashes = []
+        fee_delta = 1000000
+        orig_len = self.rpc.getblockcount()
+        old_hash = self.rpc.getblockhash(height)
+        final_len = height + shift if height + shift > orig_len else 1 + orig_len
+        # TODO: raise error for insane args?
+
+        self.rpc.invalidateblock(old_hash)
+        self.wait_for_log(r'InvalidChainFound: invalid block=.*  height={}'.format(height))
+        memp = self.rpc.getrawmempool()
+
+        if shift == 0:
+            hashes += self.generate_block(1 + final_len - height)
+        else:
+            for txid in memp:
+                # lower priority (to effective feerate=0) so they are not mined
+                self.rpc.prioritisetransaction(txid, None, -fee_delta)
+            hashes += self.generate_block(shift)
+
+            for txid in memp:
+                # restore priority so they are mined
+                self.rpc.prioritisetransaction(txid, None, fee_delta)
+            hashes += self.generate_block(1 + final_len - (height + shift))
+        self.wait_for_log(r'UpdateTip: new best=.* height={}'.format(final_len))
+        return hashes
 
 
 class LightningD(TailableProc):
@@ -383,8 +438,6 @@ class LightningD(TailableProc):
         return self.cmd_prefix + [self.executable] + opts
 
     def start(self):
-        self.rpcproxy.start()
-
         self.opts['bitcoin-rpcport'] = self.rpcproxy.rpcport
         TailableProc.start(self)
         self.wait_for_log("Server started with public key")
@@ -401,13 +454,14 @@ class LightningD(TailableProc):
 
 
 class LightningNode(object):
-    def __init__(self, daemon, rpc, btc, executor, may_fail=False, may_reconnect=False):
+    def __init__(self, daemon, rpc, btc, executor, may_fail=False, may_reconnect=False, allow_broken_log=False):
         self.rpc = rpc
         self.daemon = daemon
         self.bitcoin = btc
         self.executor = executor
         self.may_fail = may_fail
         self.may_reconnect = may_reconnect
+        self.allow_broken_log = allow_broken_log
 
     def connect(self, remote_node):
             self.rpc.connect(remote_node.info['id'], '127.0.0.1', remote_node.daemon.port)
@@ -441,7 +495,7 @@ class LightningNode(object):
         addr = self.rpc.newaddr(addrtype)[addrtype]
         txid = self.bitcoin.rpc.sendtoaddress(addr, sats / 10**8)
         self.bitcoin.generate_block(1)
-        self.daemon.wait_for_log('Owning output .* txid {}'.format(txid))
+        self.daemon.wait_for_log('Owning output .* txid {} CONFIRMED'.format(txid))
         return addr, txid
 
     def getactivechannels(self):
@@ -720,6 +774,7 @@ class NodeFactory(object):
         node_opt_keys = [
             'disconnect',
             'may_fail',
+            'allow_broken_log',
             'may_reconnect',
             'random_hsm',
             'log_all_io',
@@ -732,6 +787,14 @@ class NodeFactory(object):
     def get_next_port(self):
         with self.lock:
             return reserve()
+
+    def get_node_id(self):
+        """Generate a unique numeric ID for a lightning node
+        """
+        with self.lock:
+            node_id = self.next_id
+            self.next_id += 1
+            return node_id
 
     def get_nodes(self, num_nodes, opts=None):
         """Start a number of nodes in parallel, each with its own options
@@ -748,17 +811,20 @@ class NodeFactory(object):
         jobs = []
         for i in range(num_nodes):
             node_opts, cli_opts = self.split_options(opts[i])
-            jobs.append(self.executor.submit(self.get_node, options=cli_opts, **node_opts))
+            jobs.append(self.executor.submit(
+                self.get_node, options=cli_opts,
+                node_id=self.get_node_id(), **node_opts
+            ))
 
         return [j.result() for j in jobs]
 
     def get_node(self, disconnect=None, options=None, may_fail=False,
                  may_reconnect=False, random_hsm=False,
                  feerates=(15000, 7500, 3750), start=True, log_all_io=False,
-                 dbfile=None):
-        with self.lock:
-            node_id = self.next_id
-            self.next_id += 1
+                 dbfile=None, node_id=None, allow_broken_log=False):
+        if not node_id:
+            node_id = self.get_node_id()
+
         port = self.get_next_port()
 
         lightning_dir = os.path.join(
@@ -798,7 +864,7 @@ class NodeFactory(object):
         rpc = LightningRpc(socket_path, self.executor)
 
         node = LightningNode(daemon, rpc, self.bitcoind, self.executor, may_fail=may_fail,
-                             may_reconnect=may_reconnect)
+                             may_reconnect=may_reconnect, allow_broken_log=allow_broken_log)
 
         # Regtest estimatefee are unusable, so override.
         node.set_feerates(feerates, False)

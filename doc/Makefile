@@ -15,9 +15,13 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-delinvoice.7 \
 	doc/lightning-disconnect.7 \
 	doc/lightning-fundchannel.7 \
+	doc/lightning-fundchannel_start.7 \
+	doc/lightning-fundchannel_complete.7 \
+	doc/lightning-fundchannel_cancel.7 \
 	doc/lightning-getroute.7 \
 	doc/lightning-invoice.7 \
 	doc/lightning-listchannels.7 \
+	doc/lightning-listforwards.7 \
 	doc/lightning-listfunds.7 \
 	doc/lightning-listinvoices.7 \
 	doc/lightning-listpays.7 \
@@ -27,6 +31,9 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-pay.7 \
 	doc/lightning-sendpay.7 \
 	doc/lightning-setchannelfee.7 \
+	doc/lightning-txprepare.7 \
+	doc/lightning-txdiscard.7 \
+	doc/lightning-txsend.7 \
 	doc/lightning-waitinvoice.7 \
 	doc/lightning-waitanyinvoice.7 \
 	doc/lightning-waitsendpay.7 \
@@ -71,7 +78,7 @@ check: check-manpages
 
 check-manpages: cli/lightning-cli lightningd/lightningd
 	@tools/check-manpage.sh cli/lightning-cli doc/lightning-cli.1.txt
-	@tools/check-manpage.sh lightningd/lightningd doc/lightningd-config.5.txt
+	@tools/check-manpage.sh "lightningd/lightningd --lightning-dir=/tmp/" doc/lightningd-config.5.txt
 
 doc-maintainer-clean:
 	$(RM) doc/deployable-lightning.pdf

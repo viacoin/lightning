@@ -12,7 +12,6 @@ CLI_TEST_COMMON_OBJS :=				\
 	common/daemon_conn.o			\
 	common/htlc_state.o			\
 	common/json.o				\
-	common/json_escaped.o			\
 	common/pseudorand.o			\
 	common/memleak.o			\
 	common/msg_queue.o			\
@@ -22,8 +21,8 @@ CLI_TEST_COMMON_OBJS :=				\
 
 update-mocks: $(CLI_TEST_SRC:%=update-mocks/%)
 
-$(CLI_TEST_PROGRAMS): $(CCAN_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(LIBBASE58_OBJS) $(CLI_TEST_COMMON_OBJS)
+$(CLI_TEST_PROGRAMS): $(CCAN_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(CLI_TEST_COMMON_OBJS)
 
 $(CLI_TEST_OBJS): $(LIGHTNING_CLI_HEADERS) $(LIGHTNING_CLI_SRC)
 
-check: $(CLI_TEST_PROGRAMS:%=unittest/%)
+check-units: $(CLI_TEST_PROGRAMS:%=unittest/%)

@@ -1,10 +1,13 @@
 from collections import OrderedDict
 from fixtures import *  # noqa: F401,F403
+from flaky import flaky  # noqa: F401
 from lightning import RpcError, Millisatoshi
-from utils import only_one
+from utils import only_one, wait_for, TIMEOUT
 
+import json
 import os
 import pytest
+import re
 import sqlite3
 import subprocess
 import time
@@ -106,7 +109,29 @@ def test_plugin_disable(node_factory):
         n.rpc.hello(name='Sun')
 
 
-def test_plugin_notifications(node_factory):
+def test_plugin_hook(node_factory, executor):
+    """The helloworld plugin registers a htlc_accepted hook.
+
+    The hook will sleep for a few seconds and log a
+    message. `lightningd` should wait for the response and only then
+    complete the payment.
+
+    """
+    l1, l2 = node_factory.line_graph(2, opts={'plugin': 'contrib/plugins/helloworld.py'})
+    start_time = time.time()
+    f = executor.submit(l1.pay, l2, 100000)
+    l2.daemon.wait_for_log(r'on_htlc_accepted called')
+
+    # The hook will sleep for 20 seconds before answering, so `f`
+    # should take at least that long.
+    f.result()
+    end_time = time.time()
+    assert(end_time >= start_time + 20)
+
+
+def test_plugin_connect_notifications(node_factory):
+    """ test 'connect' and 'disconnect' notifications
+    """
     l1, l2 = node_factory.get_nodes(2, opts={'plugin': 'contrib/plugins/helloworld.py'})
 
     l1.connect(l2)
@@ -169,8 +194,11 @@ def test_plugin_connected_hook(node_factory):
                            .format(l1.info['id']))
     l3.daemon.wait_for_log(r"You are in reject list")
 
-    peer = l1.rpc.listpeers(l3.info['id'])['peers']
-    assert(peer == [] or not peer[0]['connected'])
+    def check_disconnect():
+        peers = l1.rpc.listpeers(l3.info['id'])['peers']
+        return peers == [] or not peers[0]['connected']
+
+    wait_for(check_disconnect)
 
 
 def test_async_rpcmethod(node_factory, executor):
@@ -265,3 +293,204 @@ def test_invoice_payment_hook(node_factory):
     l2.daemon.wait_for_log('label=label2')
     l2.daemon.wait_for_log('msat=')
     l2.daemon.wait_for_log('preimage=' + '0' * 64)
+
+
+def test_invoice_payment_hook_hold(node_factory):
+    """ l1 uses the hold_invoice plugin to delay invoice payment.
+    """
+    opts = [{}, {'plugin': 'tests/plugins/hold_invoice.py', 'holdtime': TIMEOUT / 2}]
+    l1, l2 = node_factory.line_graph(2, opts=opts)
+
+    inv1 = l2.rpc.invoice(123000, 'label', 'description', preimage='1' * 64)
+    l1.rpc.pay(inv1['bolt11'])
+
+
+def test_openchannel_hook(node_factory, bitcoind):
+    """ l2 uses the reject_odd_funding_amounts plugin to reject some openings.
+    """
+    opts = [{}, {'plugin': 'tests/plugins/reject_odd_funding_amounts.py'}]
+    l1, l2 = node_factory.line_graph(2, fundchannel=False, opts=opts)
+
+    # Get some funds.
+    addr = l1.rpc.newaddr()['bech32']
+    txid = bitcoind.rpc.sendtoaddress(addr, 10)
+    numfunds = len(l1.rpc.listfunds()['outputs'])
+    bitcoind.generate_block(1, txid)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > numfunds)
+
+    # Even amount: works.
+    l1.rpc.fundchannel(l2.info['id'], 100000)
+
+    # Make sure plugin got all the vars we expect
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py 11 VARS')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py channel_flags=1')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py channel_reserve_satoshis=1000000msat')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py dust_limit_satoshis=546000msat')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py feerate_per_kw=7500')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py funding_satoshis=100000000msat')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py htlc_minimum_msat=0msat')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py id={}'.format(l1.info['id']))
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py max_accepted_htlcs=483')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py max_htlc_value_in_flight_msat=18446744073709551615msat')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py push_msat=0msat')
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py to_self_delay=5')
+
+    # Close it.
+    txid = l1.rpc.close(l2.info['id'])['txid']
+    bitcoind.generate_block(1, txid)
+    wait_for(lambda: [c['state'] for c in only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['channels']] == ['ONCHAIN'])
+
+    # Odd amount: fails
+    l1.connect(l2)
+    with pytest.raises(RpcError, match=r"I don't like odd amounts"):
+        l1.rpc.fundchannel(l2.info['id'], 100001)
+
+
+def test_htlc_accepted_hook_fail(node_factory):
+    """Send payments from l1 to l2, but l2 just declines everything.
+
+    l2 is configured with a plugin that'll hook into htlc_accepted and
+    always return failures. The same should also work for forwarded
+    htlcs in the second half.
+
+    """
+    l1, l2, l3 = node_factory.line_graph(3, opts=[
+        {},
+        {'plugin': 'tests/plugins/fail_htlcs.py'},
+        {}
+    ], wait_for_announce=True)
+
+    # This must fail
+    inv = l2.rpc.invoice(1000, "lbl", "desc")['bolt11']
+    with pytest.raises(RpcError) as excinfo:
+        l1.rpc.pay(inv)
+    assert excinfo.value.error['data']['failcode'] == 16399
+    assert excinfo.value.error['data']['erring_index'] == 1
+
+    # And the invoice must still be unpaid
+    inv = l2.rpc.listinvoices("lbl")['invoices']
+    assert len(inv) == 1 and inv[0]['status'] == 'unpaid'
+
+    # Now try with forwarded HTLCs: l2 should still fail them
+    # This must fail
+    inv = l3.rpc.invoice(1000, "lbl", "desc")['bolt11']
+    with pytest.raises(RpcError) as excinfo:
+        l1.rpc.pay(inv)
+
+    # And the invoice must still be unpaid
+    inv = l3.rpc.listinvoices("lbl")['invoices']
+    assert len(inv) == 1 and inv[0]['status'] == 'unpaid'
+
+
+def test_htlc_accepted_hook_resolve(node_factory):
+    """l3 creates an invoice, l2 knows the preimage and will shortcircuit.
+    """
+    l1, l2, l3 = node_factory.line_graph(3, opts=[
+        {},
+        {'plugin': 'tests/plugins/shortcircuit.py'},
+        {}
+    ], wait_for_announce=True)
+
+    inv = l3.rpc.invoice(msatoshi=1000, label="lbl", description="desc", preimage="00" * 32)['bolt11']
+    l1.rpc.pay(inv)
+
+    # And the invoice must still be unpaid
+    inv = l3.rpc.listinvoices("lbl")['invoices']
+    assert len(inv) == 1 and inv[0]['status'] == 'unpaid'
+
+
+def test_htlc_accepted_hook_direct_restart(node_factory, executor):
+    """l2 restarts while it is pondering what to do with an HTLC.
+    """
+    l1, l2 = node_factory.line_graph(2, opts=[
+        {'may_reconnect': True},
+        {'may_reconnect': True, 'plugin': 'tests/plugins/hold_htlcs.py'}
+    ])
+
+    i1 = l2.rpc.invoice(msatoshi=1000, label="direct", description="desc")['bolt11']
+    f1 = executor.submit(l1.rpc.pay, i1)
+
+    l2.daemon.wait_for_log(r'Holding onto an incoming htlc for 10 seconds')
+    l2.restart()
+
+    f1.result()
+
+
+def test_htlc_accepted_hook_forward_restart(node_factory, executor):
+    """l2 restarts while it is pondering what to do with an HTLC.
+    """
+    l1, l2, l3 = node_factory.line_graph(3, opts=[
+        {'may_reconnect': True},
+        {'may_reconnect': True, 'plugin': 'tests/plugins/hold_htlcs.py'},
+        {'may_reconnect': True},
+    ], wait_for_announce=True)
+
+    i1 = l3.rpc.invoice(msatoshi=1000, label="direct", description="desc")['bolt11']
+    f1 = executor.submit(l1.rpc.pay, i1)
+
+    l2.daemon.wait_for_log(r'Holding onto an incoming htlc for 10 seconds')
+
+    l2.restart()
+
+    # Grab the file where the plugin wrote the onion and read it in for some
+    # additional checks
+    logline = l2.daemon.wait_for_log(r'Onion written to')
+    fname = re.search(r'Onion written to (.*\.json)', logline).group(1)
+    onion = json.load(open(fname))
+    assert re.match(r'^00006700000.000100000000000003e8000000..000000000000000000000000$', onion['payload'])
+    assert len(onion['payload']) == 64
+    assert len(onion['shared_secret']) == 64
+    assert onion['per_hop_v0']['realm'] == "00"
+    assert onion['per_hop_v0']['forward_amount'] == '1000msat'
+    assert len(onion['next_onion']) == 2 * (1300 + 32 + 33 + 1)
+
+    f1.result()
+
+
+def test_warning_notification(node_factory):
+    """ test 'warning' notifications
+    """
+    l1 = node_factory.get_node(options={'plugin': 'tests/plugins/pretend_badlog.py'}, allow_broken_log=True)
+
+    # 1. test 'warn' level
+    event = "Test warning notification(for unusual event)"
+    l1.rpc.call('pretendbad', {'event': event, 'level': 'warn'})
+
+    # ensure an unusual log_entry was produced by 'pretendunusual' method
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py Test warning notification\\(for unusual event\\)')
+
+    # now wait for notification
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py Received warning')
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py level: warn')
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py time: *')
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py source: plugin-pretend_badlog.py')
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py log: Test warning notification\\(for unusual event\\)')
+
+    # 2. test 'error' level, steps like above
+    event = "Test warning notification(for broken event)"
+    l1.rpc.call('pretendbad', {'event': event, 'level': 'error'})
+    l1.daemon.wait_for_log(r'\*\*BROKEN\*\* plugin-pretend_badlog.py Test warning notification\(for broken event\)')
+
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py Received warning')
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py level: error')
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py time: *')
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py source: plugin-pretend_badlog.py')
+    l1.daemon.wait_for_log('plugin-pretend_badlog.py log: Test warning notification\\(for broken event\\)')
+
+
+def test_invoice_payment_notification(node_factory):
+    """
+    Test the 'invoice_payment' notification
+    """
+    opts = [{}, {"plugin": "contrib/plugins/helloworld.py"}]
+    l1, l2 = node_factory.line_graph(2, opts=opts)
+
+    msats = 12345
+    preimage = '1' * 64
+    label = "a_descriptive_label"
+    inv1 = l2.rpc.invoice(msats, label, 'description', preimage=preimage)
+    l1.rpc.pay(inv1['bolt11'])
+
+    l2.daemon.wait_for_log(r"Received invoice_payment event for label {},"
+                           " preimage {}, and amount of {}msat"
+                           .format(label, preimage, msats))

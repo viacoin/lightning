@@ -31,6 +31,12 @@ struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
 			    struct lightningd *ld);
 
 /**
+ * Search for `default_dir`, and if it exists add every directory it
+ * contains as a plugin dir.
+ */
+void plugins_add_default_dir(struct plugins *plugins, const char *default_dir);
+
+/**
  * Initialize the registered plugins.
  *
  * Initialization includes spinning up the plugins, reading their
@@ -112,5 +118,11 @@ void plugin_request_send(struct plugin *plugin,
  * the plugin_opt
  */
 char *plugin_opt_set(const char *arg, struct plugin_opt *popt);
+
+
+/**
+ * Needed for I/O logging for plugin messages.
+*/
+struct log *plugin_get_log(struct plugin *plugin);
 
 #endif /* LIGHTNING_LIGHTNINGD_PLUGIN_H */

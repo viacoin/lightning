@@ -9,10 +9,13 @@
 #define BIP32_VER_MAIN_PRIVATE 0x0488ADE4
 #define BIP32_VER_TEST_PUBLIC  0x043587CF
 #define BIP32_VER_TEST_PRIVATE 0x04358394
+#define BIP32_VER_SIGT_PUBLIC  0x043587CF
+#define BIP32_VER_SIGT_PRIVATE 0x04358394
 
 const struct chainparams networks[] = {
     {.network_name = "bitcoin",
      .bip173_name = "bc",
+     .bip70_name = "main",
      .genesis_blockhash = {{{.u.u8 = {0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72, 0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7, 0x4f, 0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c, 0x68, 0xd6, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00}}}},
      .rpc_port = 8332,
      .cli = "bitcoin-cli",
@@ -28,10 +31,13 @@ const struct chainparams networks[] = {
      .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
      /* "Lightning Charge Powers Developers & Blockstream Store" */
      .when_lightning_became_cool = 504500,
+     .p2pkh_version = 0,
+     .p2sh_version = 5,
      .testnet = false,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC, .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE}},
     {.network_name = "regtest",
      .bip173_name = "bcrt",
+     .bip70_name = "regtest",
      .genesis_blockhash = {{{.u.u8 = {0x06, 0x22, 0x6e, 0x46, 0x11, 0x1a, 0x0b, 0x59, 0xca, 0xaf, 0x12, 0x60, 0x43, 0xeb, 0x5b, 0xbf, 0x28, 0xc3, 0x4f, 0x3a, 0x5e, 0x33, 0x2a, 0x1f, 0xc7, 0xb2, 0xb7, 0x3c, 0xf1, 0x88, 0x91, 0x0f}}}},
      .rpc_port = 18332,
      .cli = "bitcoin-cli",
@@ -40,10 +46,28 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
      .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
      .when_lightning_became_cool = 1,
+     .p2pkh_version = 111,
+     .p2sh_version = 196,
      .testnet = true,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE}},
+    {.network_name = "signet",
+     .bip173_name = "sb",
+     .bip70_name = "signet",
+     .genesis_blockhash = {{{.u.u8 = {0x2d, 0x09, 0x8b, 0x08, 0x55, 0x1b, 0xf3, 0xda, 0xb1, 0xa2, 0x72, 0xa8, 0x71, 0x4a, 0x12, 0x9d, 0x06, 0x5c, 0xfb, 0x32, 0xfa, 0x7e, 0x18, 0xdf, 0x00, 0x99, 0x09, 0x5f, 0xbc, 0xd8, 0x53, 0x62}}}},
+     .rpc_port = 38332,
+     .cli = "bitcoin-cli",
+     .cli_args = "-signet",
+     .dust_limit = { 546 },
+     .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
+     .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
+     .when_lightning_became_cool = 1,
+     .p2pkh_version = 125,
+     .p2sh_version = 87,
+     .testnet = true,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_SIGT_PUBLIC, .bip32_privkey_version = BIP32_VER_SIGT_PRIVATE}},
     {.network_name = "testnet",
      .bip173_name = "tb",
+     .bip70_name = "test",
      .genesis_blockhash = {{{.u.u8 = {0x43, 0x49, 0x7f, 0xd7, 0xf8, 0x26, 0x95, 0x71, 0x08, 0xf4, 0xa3, 0x0f, 0xd9, 0xce, 0xc3, 0xae, 0xba, 0x79, 0x97, 0x20, 0x84, 0xe9, 0x0e, 0xad, 0x01, 0xea, 0x33, 0x09, 0x00, 0x00, 0x00, 0x00}}}},
      .rpc_port = 18332,
      .cli = "bitcoin-cli",
@@ -51,10 +75,13 @@ const struct chainparams networks[] = {
      .dust_limit = { 546 },
      .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
      .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
-     .testnet = true},
-     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC, .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE}},
+     .p2pkh_version = 127,
+     .p2sh_version = 196,
+     .testnet = true,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE}},
     {.network_name = "viacoin",
      .bip173_name = "via",
+     .bip70_name = "main",
      .genesis_blockhash = {{{.u.u8 = {0xa1, 0x0b, 0x40, 0x9a, 0x53, 0xa1, 0x1d, 0x97, 0x79, 0x0d, 0x97, 0x70, 0x5a, 0xe3, 0xab, 0xea, 0x15, 0x15, 0x33, 0xc0, 0x8e, 0x12, 0x30, 0x98, 0x04, 0x76, 0x99, 0x1f, 0x00, 0x54, 0x9b, 0x4e }}}},
      .rpc_port = 5222,
      .cli = "viacoin-cli",
@@ -63,10 +90,13 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT_INIT(60 * ((1 << 24) - 1)),
      .max_payment = AMOUNT_MSAT_INIT(60 * 0xFFFFFFFFULL),
      .when_lightning_became_cool = 1320000,
-     .testnet = false},
+     .p2pkh_version = 71,
+     .p2sh_version = 33,
+     .testnet = false,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC, .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE}},
-     {.network_name = "viacoin-testnet",
+    {.network_name = "viacoin-testnet",
      .bip173_name = "tvia",
+     .bip70_name = "test",
      .genesis_blockhash = {{{.u.u8 = { 0xa0, 0x29, 0x3e, 0x4e, 0xeb, 0x3d, 0xa6, 0xe6, 0xf5, 0x6f, 0x81, 0xed, 0x59, 0x5f, 0x57, 0x88, 0x0d, 0x1a, 0x21, 0x56, 0x9e, 0x13, 0xee, 0xfd, 0xd9, 0x51, 0x28, 0x4b, 0x5a, 0x62, 0x66, 0x49 }}}},
      .rpc_port = 25222,
      .cli = "viacoin-cli",
@@ -75,6 +105,8 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT_INIT(60 * ((1 << 24) - 1)),
      .max_payment = AMOUNT_MSAT_INIT(60 * 0xFFFFFFFFULL),
      .when_lightning_became_cool = 1,
+     .p2pkh_version = 111,
+     .p2sh_version = 58,
      .testnet = true,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE}}
 };
@@ -107,4 +139,12 @@ const struct chainparams *chainparams_by_bip173(const char *bip173_name)
 		}
 	}
 	return NULL;
+}
+
+const char *chainparams_get_network_names(const tal_t *ctx)
+{
+    char *networks_string = tal_strdup(ctx, networks[0].network_name);
+    for (size_t i = 1; i < ARRAY_SIZE(networks); ++i)
+        tal_append_fmt(&networks_string, ", %s", networks[i].network_name);
+    return networks_string;
 }

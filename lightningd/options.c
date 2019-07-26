@@ -1,17 +1,19 @@
 #include <bitcoin/chainparams.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
+#include <ccan/json_escape/json_escape.h>
 #include <ccan/mem/mem.h>
 #include <ccan/opt/opt.h>
 #include <ccan/opt/private.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/short_types/short_types.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/configdir.h>
+#include <common/derive_basepoints.h>
 #include <common/json_command.h>
-#include <common/json_escaped.h>
 #include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
 #include <common/param.h>
@@ -218,6 +220,11 @@ static char *opt_set_testnet(struct lightningd *ld)
 	return opt_set_network("testnet", ld);
 }
 
+static char *opt_set_signet(struct lightningd *ld)
+{
+	return opt_set_network("signet", ld);
+}
+
 static char *opt_set_mainnet(struct lightningd *ld)
 {
 	return opt_set_network("bitcoin", ld);
@@ -252,7 +259,7 @@ static char *opt_set_alias(const char *arg, struct lightningd *ld)
 	ld->alias = tal_free(ld->alias);
 	/* BOLT #7:
 	 *
-	 *    * [`32`:`alias`]
+	 *    * [`32*byte`:`alias`]
 	 *...
 	 *  - MUST set `alias` to a valid UTF-8 string, with any
 	 *   `alias` trailing-bytes equal to 0.
@@ -401,20 +408,14 @@ static void config_register_opts(struct lightningd *ld)
 			       " regtest, viacoin or viacoin-testnet)");
 	opt_register_early_noarg("--testnet", opt_set_testnet, ld,
 				 "Alias for --network=testnet");
+	opt_register_early_noarg("--signet", opt_set_signet, ld,
+				 "Alias for --network=signet");
 	opt_register_early_noarg("--mainnet", opt_set_mainnet, ld,
 				 "Alias for --network=bitcoin");
 	opt_register_early_arg("--allow-deprecated-apis",
 			       opt_set_bool_arg, opt_show_bool,
 			       &deprecated_apis,
 			       "Enable deprecated options, JSONRPC commands, fields, etc.");
-	opt_register_arg("--autocleaninvoice-cycle",
-			 opt_set_u64, opt_show_u64,
-			 &ld->ini_autocleaninvoice_cycle,
-			 "Perform cleanup of expired invoices every given seconds, or do not autoclean if 0");
-	opt_register_arg("--autocleaninvoice-expired-by",
-			 opt_set_u64, opt_show_u64,
-			 &ld->ini_autocleaninvoice_expiredby,
-			 "If expired invoice autoclean enabled, invoices that have expired for at least this given seconds are cleaned");
 	opt_register_arg("--proxy", opt_add_proxy_addr, NULL,
 			ld,"Set a socks v5 proxy IP address and port");
 	opt_register_arg("--tor-service-password", opt_set_talstr, NULL,
@@ -446,13 +447,61 @@ static char *opt_subprocess_debug(const char *optarg, struct lightningd *ld)
 	return NULL;
 }
 
-static char *opt_set_dev_unknown_channel_satoshis(const char *optarg,
-						  struct lightningd *ld)
+static char *opt_force_privkey(const char *optarg, struct lightningd *ld)
 {
-	tal_free(ld->dev_unknown_channel_satoshis);
-	ld->dev_unknown_channel_satoshis = tal(ld, struct amount_sat);
-	return opt_set_u64(optarg,
-			   &ld->dev_unknown_channel_satoshis->satoshis); /* Raw: dev code */
+	tal_free(ld->dev_force_privkey);
+	ld->dev_force_privkey = tal(ld, struct privkey);
+	if (!hex_decode(optarg, strlen(optarg),
+			ld->dev_force_privkey, sizeof(*ld->dev_force_privkey)))
+		return tal_fmt(NULL, "Unable to parse privkey '%s'", optarg);
+	return NULL;
+}
+
+static char *opt_force_bip32_seed(const char *optarg, struct lightningd *ld)
+{
+	tal_free(ld->dev_force_bip32_seed);
+	ld->dev_force_bip32_seed = tal(ld, struct secret);
+	if (!hex_decode(optarg, strlen(optarg),
+			ld->dev_force_bip32_seed,
+			sizeof(*ld->dev_force_bip32_seed)))
+		return tal_fmt(NULL, "Unable to parse secret '%s'", optarg);
+	return NULL;
+}
+
+static char *opt_force_channel_secrets(const char *optarg,
+				       struct lightningd *ld)
+{
+	char **strs;
+	tal_free(ld->dev_force_channel_secrets);
+	tal_free(ld->dev_force_channel_secrets_shaseed);
+	ld->dev_force_channel_secrets = tal(ld, struct secrets);
+	ld->dev_force_channel_secrets_shaseed = tal(ld, struct sha256);
+
+	strs = tal_strsplit(tmpctx, optarg, "/", STR_EMPTY_OK);
+	if (tal_count(strs) != 7) /* Last is NULL */
+		return "Expected 6 hex secrets separated by /";
+
+	if (!hex_decode(strs[0], strlen(strs[0]),
+			&ld->dev_force_channel_secrets->funding_privkey,
+			sizeof(ld->dev_force_channel_secrets->funding_privkey))
+	    || !hex_decode(strs[1], strlen(strs[1]),
+			   &ld->dev_force_channel_secrets->revocation_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->revocation_basepoint_secret))
+	    || !hex_decode(strs[2], strlen(strs[2]),
+			   &ld->dev_force_channel_secrets->payment_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->payment_basepoint_secret))
+	    || !hex_decode(strs[3], strlen(strs[3]),
+			   &ld->dev_force_channel_secrets->delayed_payment_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->delayed_payment_basepoint_secret))
+	    || !hex_decode(strs[4], strlen(strs[4]),
+			   &ld->dev_force_channel_secrets->htlc_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->htlc_basepoint_secret))
+	    || !hex_decode(strs[5], strlen(strs[5]),
+			   ld->dev_force_channel_secrets_shaseed,
+			   sizeof(*ld->dev_force_channel_secrets_shaseed)))
+		return "Expected 6 hex secrets separated by /";
+
+	return NULL;
 }
 
 static void dev_register_opts(struct lightningd *ld)
@@ -491,9 +540,12 @@ static void dev_register_opts(struct lightningd *ld)
 	opt_register_arg("--dev-gossip-time", opt_set_u32, opt_show_u32,
 			 &ld->dev_gossip_time,
 			 "UNIX time to override gossipd to use.");
-	opt_register_arg("--dev-unknown-channel-satoshis",
-			 opt_set_dev_unknown_channel_satoshis, NULL, ld,
-			 "Amount to pretend is in channels which we can't find funding tx for.");
+	opt_register_arg("--dev-force-privkey", opt_force_privkey, NULL, ld,
+			 "Force HSM to use this as node private key");
+	opt_register_arg("--dev-force-bip32-seed", opt_force_bip32_seed, NULL, ld,
+			 "Force HSM to use this as bip32 seed");
+	opt_register_arg("--dev-force-channel-secrets", opt_force_channel_secrets, NULL, ld,
+			 "Force HSM to use these for all per-channel secrets");
 }
 #endif
 
@@ -813,6 +865,12 @@ void register_opts(struct lightningd *ld)
 	opt_register_arg("--bitcoin-rpcport", opt_set_talstr, NULL,
 			 &ld->topology->bitcoind->rpcport,
 			 "bitcoind RPC port");
+	opt_register_arg("--bitcoin-retry-timeout",
+			 opt_set_u64, opt_show_u64,
+			 &ld->topology->bitcoind->retry_timeout,
+			 "how long to keep trying to contact bitcoind "
+			 "before fatally exiting");
+
 	opt_register_arg("--pid-file=<file>", opt_set_talstr, opt_show_charp,
 			 &ld->pidfile,
 			 "Specify pid file");
@@ -971,6 +1029,7 @@ static void add_config(struct lightningd *ld,
 		    || opt->cb == (void *)version_and_exit
 		    /* These two show up as --network= */
 		    || opt->cb == (void *)opt_set_testnet
+		    || opt->cb == (void *)opt_set_signet
 		    || opt->cb == (void *)opt_set_mainnet
 		    || opt->cb == (void *)opt_lightningd_usage
 		    || opt->cb == (void *)test_subdaemons_and_exit
@@ -1064,7 +1123,7 @@ static void add_config(struct lightningd *ld,
 	}
 
 	if (answer) {
-		struct json_escaped *esc = json_escape(NULL, answer);
+		struct json_escape *esc = json_escape(NULL, answer);
 		json_add_escaped_string(response, name0, take(esc));
 	}
 	tal_free(name0);
@@ -1086,7 +1145,6 @@ static struct command_result *json_listconfigs(struct command *cmd,
 
 	if (!configtok) {
 		response = json_stream_success(cmd);
-		json_object_start(response, NULL);
 		json_add_string(response, "# version", version());
 	}
 
@@ -1111,10 +1169,8 @@ static struct command_result *json_listconfigs(struct command *cmd,
 				      name + 1, len - 1))
 				continue;
 
-			if (!response) {
+			if (!response)
 				response = json_stream_success(cmd);
-				json_object_start(response, NULL);
-			}
 			add_config(cmd->ld, response, &opt_table[i],
 				   name+1, len-1);
 		}
@@ -1126,15 +1182,14 @@ static struct command_result *json_listconfigs(struct command *cmd,
 				    json_tok_full_len(configtok),
 				    json_tok_full(buffer, configtok));
 	}
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 
 static const struct json_command listconfigs_command = {
 	"listconfigs",
+	"utility",
 	json_listconfigs,
 	"List all configuration options, or with [config], just that one.",
-
 	.verbose = "listconfigs [config]\n"
 	"Outputs an object, with each field a config options\n"
 	"(Option names which start with # are comments)\n"

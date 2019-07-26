@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 from lightning import Plugin
+import time
 
-
-plugin = Plugin(autopatch=True)
+plugin = Plugin()
 
 
 @plugin.method("hello")
@@ -32,6 +32,21 @@ def on_connect(plugin, id, address):
 @plugin.subscribe("disconnect")
 def on_disconnect(plugin, id):
     plugin.log("Received disconnect event for peer {}".format(id))
+
+
+@plugin.subscribe("invoice_payment")
+def on_payment(plugin, invoice_payment):
+    plugin.log("Received invoice_payment event for label {}, preimage {},"
+               " and amount of {}".format(invoice_payment.get("label"),
+                                          invoice_payment.get("preimage"),
+                                          invoice_payment.get("msat")))
+
+
+@plugin.hook("htlc_accepted")
+def on_htlc_accepted(onion, htlc, plugin):
+    plugin.log('on_htlc_accepted called')
+    time.sleep(20)
+    return {'result': 'continue'}
 
 
 plugin.add_option('greeting', 'Hello', 'The greeting I should use.')

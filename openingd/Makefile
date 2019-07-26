@@ -46,9 +46,11 @@ OPENINGD_COMMON_OBJS :=				\
 	common/daemon_conn.o			\
 	common/derive_basepoints.o		\
 	common/dev_disconnect.o			\
+	common/features.o			\
 	common/funding_tx.o			\
 	common/gen_status_wire.o		\
 	common/gen_peer_status_wire.o		\
+	common/gossip_store.o			\
 	common/htlc_wire.o			\
 	common/initial_channel.o		\
 	common/initial_commit_tx.o		\
@@ -56,6 +58,7 @@ OPENINGD_COMMON_OBJS :=				\
 	common/keyset.o				\
 	common/memleak.o			\
 	common/msg_queue.o			\
+	common/per_peer_state.o			\
 	common/peer_billboard.o			\
 	common/peer_failed.o			\
 	common/permute_tx.o			\
@@ -77,10 +80,10 @@ OPENINGD_COMMON_OBJS :=				\
 $(LIGHTNINGD_OPENING_OBJS): $(LIGHTNINGD_HEADERS)
 
 openingd/gen_opening_wire.h: $(WIRE_GEN) openingd/opening_wire.csv
-	$(WIRE_GEN) --header $@ opening_wire_type < openingd/opening_wire.csv > $@
+	$(WIRE_GEN) --page header $@ opening_wire_type < openingd/opening_wire.csv > $@
 
 openingd/gen_opening_wire.c: $(WIRE_GEN) openingd/opening_wire.csv
-	$(WIRE_GEN) ${@:.c=.h} opening_wire_type < openingd/opening_wire.csv > $@
+	$(WIRE_GEN) --page impl ${@:.c=.h} opening_wire_type < openingd/opening_wire.csv > $@
 
 LIGHTNINGD_OPENING_OBJS := $(LIGHTNINGD_OPENING_SRC:.c=.o) $(LIGHTNINGD_OPENING_GEN_SRC:.c=.o)
 

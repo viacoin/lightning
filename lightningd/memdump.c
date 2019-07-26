@@ -74,13 +74,14 @@ static struct command_result *json_memdump(struct command *cmd,
 		return command_param_failed();
 
 	response = json_stream_success(cmd);
-	add_memdump(response, NULL, NULL, cmd);
+	add_memdump(response, "memdump", NULL, cmd);
 
 	return command_success(cmd, response);
 }
 
 static const struct json_command dev_memdump_command = {
 	"dev-memdump",
+	"developer",
 	json_memdump,
 	"Show memory objects currently in use"
 };
@@ -195,9 +196,7 @@ static void report_leak_info2(struct leak_info *leak_info)
 {
 	struct json_stream *response = json_stream_success(leak_info->cmd);
 
-	json_object_start(response, NULL);
 	scan_mem(leak_info->cmd, response, leak_info->cmd->ld, leak_info->leaker);
-	json_object_end(response);
 
 	was_pending(command_success(leak_info->cmd, response));
 }
@@ -210,7 +209,7 @@ static void report_leak_info(struct command *cmd, struct subd *leaker)
 	leak_info->leaker = leaker;
 
 	/* Leak detection in a reply handler thinks we're leaking conn. */
-	notleak(new_reltimer(&leak_info->cmd->ld->timers, leak_info->cmd,
+	notleak(new_reltimer(leak_info->cmd->ld->timers, leak_info->cmd,
 			     time_from_sec(0),
 			     report_leak_info2, leak_info));
 }
@@ -327,6 +326,7 @@ static struct command_result *json_memleak(struct command *cmd,
 
 static const struct json_command dev_memleak_command = {
 	"dev-memleak",
+	"developer",
 	json_memleak,
 	"Show unreferenced memory objects"
 };

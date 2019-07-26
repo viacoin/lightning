@@ -1,9 +1,10 @@
 from decimal import Decimal
 import json
 import logging
+from math import floor, log10
 import socket
 
-__version__ = "0.0.7.1"
+__version__ = "0.0.7.3"
 
 
 class RpcError(ValueError):
@@ -81,9 +82,40 @@ class Millisatoshi:
         Return a string of form 12.34567890btc or 12.34567890123btc.
         """
         if self.millisatoshis % 1000:
-            return '{:.8f}btc'.format(self.to_btc())
-        else:
             return '{:.11f}btc'.format(self.to_btc())
+        else:
+            return '{:.8f}btc'.format(self.to_btc())
+
+    def to_approx_str(self, digits: int = 3):
+        """Returns the shortmost string using common units representation.
+
+        Rounds to significant `digits`. Default: 3
+        """
+        round_to_n = lambda x, n: round(x, -int(floor(log10(x))) + (n - 1))
+        result = None
+
+        # we try to increase digits to check if we did loose out on precision
+        # without gaining a shorter string, since this is a rarely used UI
+        # function, performance is not an issue. Adds at least one iteration.
+        while True:
+            # first round everything down to effective digits
+            amount_rounded = round_to_n(self.millisatoshis, digits)
+            # try different units and take shortest resulting normalized string
+            amounts_str = [
+                "%gbtc" % (amount_rounded / 1000 / 10**8),
+                "%gsat" % (amount_rounded / 1000),
+                "%gmsat" % (amount_rounded),
+            ]
+            test_result = min(amounts_str, key=len)
+
+            # check result and do another run if necessary
+            if test_result == result:
+                return result
+            elif not result or len(test_result) <= len(result):
+                digits = digits + 1
+                result = test_result
+            else:
+                return result
 
     def to_json(self):
         return self.__repr__()
@@ -113,10 +145,10 @@ class Millisatoshi:
         return Millisatoshi(int(self) - int(other))
 
     def __mul__(self, other):
-        return Millisatoshi(int(self) * other)
+        return Millisatoshi(int(int(self) * other))
 
     def __truediv__(self, other):
-        return Millisatoshi(int(self) / other)
+        return Millisatoshi(int(int(self) / other))
 
     def __floordiv__(self, other):
         return Millisatoshi(int(self) // other)
@@ -133,39 +165,11 @@ class UnixDomainSocketRpc(object):
         self.executor = executor
         self.logger = logger
 
-        # Do we require the compatibility mode?
-        self._compat = True
         self.next_id = 0
 
     def _writeobj(self, sock, obj):
         s = json.dumps(obj, cls=self.encoder_cls)
         sock.sendall(bytearray(s, 'UTF-8'))
-
-    def _readobj_compat(self, sock, buff=b''):
-        if not self._compat:
-            return self._readobj(sock, buff)
-        while True:
-            try:
-                b = sock.recv(max(1024, len(buff)))
-                buff += b
-
-                if b'\n\n' in buff:
-                    # The next read will use the non-compatible read instead
-                    self._compat = False
-
-                if len(b) == 0:
-                    return {'error': 'Connection to RPC server lost.'}
-                if b' }\n' not in buff:
-                    continue
-                # Convert late to UTF-8 so glyphs split across recvs do not
-                # impact us
-                buff = buff.decode("UTF-8")
-                objs, len_used = self.decoder.raw_decode(buff)
-                buff = buff[len_used:].lstrip().encode("UTF-8")
-                return objs, buff
-            except ValueError:
-                # Probably didn't read enough
-                buff = buff.lstrip().encode("UTF-8")
 
     def _readobj(self, sock, buff=b''):
         """Read a JSON object, starting with buff; returns object and any buffer left over"""
@@ -217,7 +221,7 @@ class UnixDomainSocketRpc(object):
             "id": self.next_id,
         })
         self.next_id += 1
-        resp, _ = self._readobj_compat(sock)
+        resp, _ = self._readobj(sock)
         sock.close()
 
         self.logger.debug("Received response for %s call: %r", method, resp)
@@ -284,263 +288,26 @@ class LightningRpc(UnixDomainSocketRpc):
     def __init__(self, socket_path, executor=None, logger=logging):
         super().__init__(socket_path, executor, logging, self.LightningJSONEncoder, self.LightningJSONDecoder())
 
-    def getpeer(self, peer_id, level=None):
+    def autocleaninvoice(self, cycle_seconds=None, expired_by=None):
         """
-        Show peer with {peer_id}, if {level} is set, include {log}s
-        """
-        payload = {
-            "id": peer_id,
-            "level": level
-        }
-        res = self.call("listpeers", payload)
-        return res.get("peers") and res["peers"][0] or None
-
-    def listnodes(self, node_id=None):
-        """
-        Show all nodes in our local network view, filter on node {id}
-        if provided
+        Sets up automatic cleaning of expired invoices. {cycle_seconds} sets
+        the cleaning frequency in seconds (defaults to 3600) and {expired_by}
+        sets the minimum time an invoice should have been expired for to be
+        cleaned in seconds (defaults to 86400).
         """
         payload = {
-            "id": node_id
+            "cycle_seconds": cycle_seconds,
+            "expired_by": expired_by
         }
-        return self.call("listnodes", payload)
+        return self.call("autocleaninvoice", payload)
 
-    def getroute(self, node_id, msatoshi, riskfactor, cltv=9, fromid=None, fuzzpercent=None, exclude=[], maxhops=20):
+    def check(self, command_to_check, **kwargs):
         """
-        Show route to {id} for {msatoshi}, using {riskfactor} and optional
-        {cltv} (default 9). If specified search from {fromid} otherwise use
-        this node as source. Randomize the route with up to {fuzzpercent}
-        (0.0 -> 100.0, default 5.0). {exclude} is an optional array of
-        scid/direction to exclude. Limit the number of hops in the route to
-        {maxhops}.
+        Checks if a command is valid without running it.
         """
-        payload = {
-            "id": node_id,
-            "msatoshi": msatoshi,
-            "riskfactor": riskfactor,
-            "cltv": cltv,
-            "fromid": fromid,
-            "fuzzpercent": fuzzpercent,
-            "exclude": exclude,
-            "maxhops": maxhops
-        }
-        return self.call("getroute", payload)
-
-    def listchannels(self, short_channel_id=None, source=None):
-        """
-        Show all known channels, accept optional {short_channel_id} or {source}
-        """
-        payload = {
-            "short_channel_id": short_channel_id,
-            "source": source
-        }
-        return self.call("listchannels", payload)
-
-    def invoice(self, msatoshi, label, description, expiry=None, fallbacks=None, preimage=None, exposeprivatechannels=None):
-        """
-        Create an invoice for {msatoshi} with {label} and {description} with
-        optional {expiry} seconds (default 1 hour)
-        """
-        payload = {
-            "msatoshi": msatoshi,
-            "label": label,
-            "description": description,
-            "expiry": expiry,
-            "fallbacks": fallbacks,
-            "preimage": preimage,
-            "exposeprivatechannels": exposeprivatechannels
-        }
-        return self.call("invoice", payload)
-
-    def listinvoices(self, label=None):
-        """
-        Show invoice {label} (or all, if no {label))
-        """
-        payload = {
-            "label": label
-        }
-        return self.call("listinvoices", payload)
-
-    def delinvoice(self, label, status):
-        """
-        Delete unpaid invoice {label} with {status}
-        """
-        payload = {
-            "label": label,
-            "status": status
-        }
-        return self.call("delinvoice", payload)
-
-    def waitanyinvoice(self, lastpay_index=None):
-        """
-        Wait for the next invoice to be paid, after {lastpay_index}
-        (if supplied)
-        """
-        payload = {
-            "lastpay_index": lastpay_index
-        }
-        return self.call("waitanyinvoice", payload)
-
-    def waitinvoice(self, label):
-        """
-        Wait for an incoming payment matching the invoice with {label}
-        """
-        payload = {
-            "label": label
-        }
-        return self.call("waitinvoice", payload)
-
-    def decodepay(self, bolt11, description=None):
-        """
-        Decode {bolt11}, using {description} if necessary
-        """
-        payload = {
-            "bolt11": bolt11,
-            "description": description
-        }
-        return self.call("decodepay", payload)
-
-    def help(self, command=None):
-        """
-        Show available commands, or just {command} if supplied.
-        """
-        payload = {
-            "command": command,
-        }
-        return self.call("help", payload)
-
-    def stop(self):
-        """
-        Shut down the lightningd process
-        """
-        return self.call("stop")
-
-    def getlog(self, level=None):
-        """
-        Show logs, with optional log {level} (info|unusual|debug|io)
-        """
-        payload = {
-            "level": level
-        }
-        return self.call("getlog", payload)
-
-    def dev_rhash(self, secret):
-        """
-        Show SHA256 of {secret}
-        """
-        payload = {
-            "secret": secret
-        }
-        return self.call("dev-rhash", payload)
-
-    def dev_crash(self):
-        """
-        Crash lightningd by calling fatal()
-        """
-        return self.call("dev-crash")
-
-    def dev_query_scids(self, id, scids):
-        """
-        Ask peer for a particular set of scids
-        """
-        payload = {
-            "id": id,
-            "scids": scids
-        }
-        return self.call("dev-query-scids", payload)
-
-    def getinfo(self):
-        """
-        Show information about this node
-        """
-        return self.call("getinfo")
-
-    def sendpay(self, route, payment_hash, description=None, msatoshi=None):
-        """
-        Send along {route} in return for preimage of {payment_hash}
-        """
-        payload = {
-            "route": route,
-            "payment_hash": payment_hash,
-            "description": description,
-            "msatoshi": msatoshi,
-        }
-        return self.call("sendpay", payload)
-
-    def waitsendpay(self, payment_hash, timeout=None):
-        """
-        Wait for payment for preimage of {payment_hash} to complete
-        """
-        payload = {
-            "payment_hash": payment_hash,
-            "timeout": timeout
-        }
-        return self.call("waitsendpay", payload)
-
-    def pay(self, bolt11, msatoshi=None, label=None, riskfactor=None, description=None):
-        """
-        Send payment specified by {bolt11} with {msatoshi}
-        (ignored if {bolt11} has an amount), optional {label}
-        and {riskfactor} (default 1.0)
-        """
-        payload = {
-            "bolt11": bolt11,
-            "msatoshi": msatoshi,
-            "label": label,
-            "riskfactor": riskfactor,
-            # Deprecated.
-            "description": description,
-        }
-        return self.call("pay", payload)
-
-    def listpayments(self, bolt11=None, payment_hash=None):
-        """
-        Show outgoing payments, regarding {bolt11} or {payment_hash} if set
-        Can only specify one of {bolt11} or {payment_hash}
-        """
-        assert not (bolt11 and payment_hash)
-        payload = {
-            "bolt11": bolt11,
-            "payment_hash": payment_hash
-        }
-        return self.call("listpayments", payload)
-
-    def connect(self, peer_id, host=None, port=None):
-        """
-        Connect to {peer_id} at {host} and {port}
-        """
-        payload = {
-            "id": peer_id,
-            "host": host,
-            "port": port
-        }
-        return self.call("connect", payload)
-
-    def listpeers(self, peerid=None, level=None):
-        """
-        Show current peers, if {level} is set, include {log}s"
-        """
-        payload = {
-            "id": peerid,
-            "level": level,
-        }
-        return self.call("listpeers", payload)
-
-    def fundchannel(self, node_id, satoshi, feerate=None, announce=True, minconf=None):
-        """
-        Fund channel with {id} using {satoshi} satoshis
-        with feerate of {feerate} (uses default feerate if unset).
-        If {announce} is False, don't send channel announcements.
-        Only select outputs with {minconf} confirmations
-        """
-        payload = {
-            "id": node_id,
-            "satoshi": satoshi,
-            "feerate": feerate,
-            "announce": announce,
-            "minconf": minconf,
-        }
-        return self.call("fundchannel", payload)
+        payload = {"command_to_check": command_to_check}
+        payload.update({k: v for k, v in kwargs.items()})
+        return self.call("check", payload)
 
     def close(self, peer_id, force=None, timeout=None):
         """
@@ -555,14 +322,51 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("close", payload)
 
-    def dev_sign_last_tx(self, peer_id):
+    def connect(self, peer_id, host=None, port=None):
         """
-        Sign and show the last commitment transaction with peer {id}
+        Connect to {peer_id} at {host} and {port}
         """
         payload = {
-            "id": peer_id
+            "id": peer_id,
+            "host": host,
+            "port": port
         }
-        return self.call("dev-sign-last-tx", payload)
+        return self.call("connect", payload)
+
+    def decodepay(self, bolt11, description=None):
+        """
+        Decode {bolt11}, using {description} if necessary
+        """
+        payload = {
+            "bolt11": bolt11,
+            "description": description
+        }
+        return self.call("decodepay", payload)
+
+    def delexpiredinvoice(self, maxexpirytime=None):
+        """
+        Delete all invoices that have expired on or before the given {maxexpirytime}
+        """
+        payload = {
+            "maxexpirytime": maxexpirytime
+        }
+        return self.call("delexpiredinvoice", payload)
+
+    def delinvoice(self, label, status):
+        """
+        Delete unpaid invoice {label} with {status}
+        """
+        payload = {
+            "label": label,
+            "status": status
+        }
+        return self.call("delinvoice", payload)
+
+    def dev_crash(self):
+        """
+        Crash lightningd by calling fatal()
+        """
+        return self.call("dev-crash")
 
     def dev_fail(self, peer_id):
         """
@@ -573,25 +377,13 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("dev-fail", payload)
 
-    def dev_reenable_commit(self, peer_id):
+    def dev_forget_channel(self, peerid, force=False):
+        """ Forget the channel with id=peerid
         """
-        Re-enable the commit timer on peer {id}
-        """
-        payload = {
-            "id": peer_id
-        }
-        return self.call("dev-reenable-commit", payload)
-
-    def ping(self, peer_id, length=128, pongbytes=128):
-        """
-        Send {peer_id} a ping of length {len} asking for {pongbytes}"
-        """
-        payload = {
-            "id": peer_id,
-            "len": length,
-            "pongbytes": pongbytes
-        }
-        return self.call("ping", payload)
+        return self.call(
+            "dev-forget-channel",
+            payload={"id": peerid, "force": force}
+        )
 
     def dev_memdump(self):
         """
@@ -605,35 +397,24 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("dev-memleak")
 
-    def withdraw(self, destination, satoshi, feerate=None, minconf=None):
+    def dev_query_scids(self, id, scids):
         """
-        Send to {destination} address {satoshi} (or "all")
-        amount via Bitcoin transaction. Only select outputs
-        with {minconf} confirmations
+        Ask peer for a particular set of scids
         """
         payload = {
-            "destination": destination,
-            "satoshi": satoshi,
-            "feerate": feerate,
-            "minconf": minconf,
+            "id": id,
+            "scids": scids
         }
-        return self.call("withdraw", payload)
+        return self.call("dev-query-scids", payload)
 
-    def newaddr(self, addresstype=None):
-        """Get a new address of type {addresstype} of the internal wallet.
+    def dev_reenable_commit(self, peer_id):
         """
-        return self.call("newaddr", {"addresstype": addresstype})
-
-    def listfunds(self):
+        Re-enable the commit timer on peer {id}
         """
-        Show funds available for opening channels
-        """
-        return self.call("listfunds")
-
-    def listforwards(self):
-        """List all forwarded payments and their information
-        """
-        return self.call("listforwards")
+        payload = {
+            "id": peer_id
+        }
+        return self.call("dev-reenable-commit", payload)
 
     def dev_rescan_outputs(self):
         """
@@ -641,13 +422,23 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("dev-rescan-outputs")
 
-    def dev_forget_channel(self, peerid, force=False):
-        """ Forget the channel with id=peerid
+    def dev_rhash(self, secret):
         """
-        return self.call(
-            "dev-forget-channel",
-            payload={"id": peerid, "force": force}
-        )
+        Show SHA256 of {secret}
+        """
+        payload = {
+            "secret": secret
+        }
+        return self.call("dev-rhash", payload)
+
+    def dev_sign_last_tx(self, peer_id):
+        """
+        Sign and show the last commitment transaction with peer {id}
+        """
+        payload = {
+            "id": peer_id
+        }
+        return self.call("dev-sign-last-tx", payload)
 
     def disconnect(self, peer_id, force=False):
         """
@@ -670,3 +461,365 @@ class LightningRpc(UnixDomainSocketRpc):
             "slow": slow
         }
         return self.call("feerates", payload)
+
+    def fundchannel(self, node_id, satoshi, feerate=None, announce=True, minconf=None, utxos=None):
+        """
+        Fund channel with {id} using {satoshi} satoshis with feerate
+        of {feerate} (uses default feerate if unset).
+        If {announce} is False, don't send channel announcements.
+        Only select outputs with {minconf} confirmations.
+        If {utxos} is specified (as a list of 'txid:vout' strings),
+        fund a channel from these specifics utxos.
+        """
+        payload = {
+            "id": node_id,
+            "satoshi": satoshi,
+            "feerate": feerate,
+            "announce": announce,
+            "minconf": minconf,
+            "utxos": utxos
+        }
+        return self.call("fundchannel", payload)
+
+    def fundchannel_start(self, node_id, satoshi, feerate=None, announce=True):
+        """
+        Start channel funding with {id} for {satoshi} satoshis
+        with feerate of {feerate} (uses default feerate if unset).
+        If {announce} is False, don't send channel announcements.
+        Returns a Bech32 {funding_address} for an external wallet
+        to create a funding transaction for. Requires a call to
+        'fundchannel_complete' to complete channel establishment
+        with peer.
+        """
+        payload = {
+            "id": node_id,
+            "satoshi": satoshi,
+            "feerate": feerate,
+            "announce": announce,
+        }
+        return self.call("fundchannel_start", payload)
+
+    def fundchannel_cancel(self, node_id):
+        """
+        Cancel a 'started' fundchannel with node {id}.
+        """
+        payload = {
+            "id": node_id,
+        }
+        return self.call("fundchannel_cancel", payload)
+
+    def fundchannel_complete(self, node_id, funding_txid, funding_txout):
+        """
+        Complete channel establishment with {id}, using {funding_txid} at {funding_txout}
+        """
+        payload = {
+            "id": node_id,
+            "txid": funding_txid,
+            "txout": funding_txout,
+        }
+        return self.call("fundchannel_complete", payload)
+
+    def getinfo(self):
+        """
+        Show information about this node
+        """
+        return self.call("getinfo")
+
+    def getlog(self, level=None):
+        """
+        Show logs, with optional log {level} (info|unusual|debug|io)
+        """
+        payload = {
+            "level": level
+        }
+        return self.call("getlog", payload)
+
+    def getpeer(self, peer_id, level=None):
+        """
+        Show peer with {peer_id}, if {level} is set, include {log}s
+        """
+        payload = {
+            "id": peer_id,
+            "level": level
+        }
+        res = self.call("listpeers", payload)
+        return res.get("peers") and res["peers"][0] or None
+
+    def getroute(self, node_id, msatoshi, riskfactor, cltv=9, fromid=None, fuzzpercent=None, exclude=[], maxhops=20):
+        """
+        Show route to {id} for {msatoshi}, using {riskfactor} and optional
+        {cltv} (default 9). If specified search from {fromid} otherwise use
+        this node as source. Randomize the route with up to {fuzzpercent}
+        (0.0 -> 100.0, default 5.0). {exclude} is an optional array of
+        scid/direction to exclude. Limit the number of hops in the route to
+        {maxhops}.
+        """
+        payload = {
+            "id": node_id,
+            "msatoshi": msatoshi,
+            "riskfactor": riskfactor,
+            "cltv": cltv,
+            "fromid": fromid,
+            "fuzzpercent": fuzzpercent,
+            "exclude": exclude,
+            "maxhops": maxhops
+        }
+        return self.call("getroute", payload)
+
+    def help(self, command=None):
+        """
+        Show available commands, or just {command} if supplied.
+        """
+        payload = {
+            "command": command,
+        }
+        return self.call("help", payload)
+
+    def invoice(self, msatoshi, label, description, expiry=None, fallbacks=None, preimage=None, exposeprivatechannels=None):
+        """
+        Create an invoice for {msatoshi} with {label} and {description} with
+        optional {expiry} seconds (default 1 week)
+        """
+        payload = {
+            "msatoshi": msatoshi,
+            "label": label,
+            "description": description,
+            "expiry": expiry,
+            "fallbacks": fallbacks,
+            "preimage": preimage,
+            "exposeprivatechannels": exposeprivatechannels
+        }
+        return self.call("invoice", payload)
+
+    def listchannels(self, short_channel_id=None, source=None):
+        """
+        Show all known channels, accept optional {short_channel_id} or {source}
+        """
+        payload = {
+            "short_channel_id": short_channel_id,
+            "source": source
+        }
+        return self.call("listchannels", payload)
+
+    def listconfigs(self, config=None):
+        """List this node's config
+        """
+        payload = {
+            "config": config
+        }
+        return self.call("listconfigs", payload)
+
+    def listforwards(self):
+        """List all forwarded payments and their information
+        """
+        return self.call("listforwards")
+
+    def listfunds(self):
+        """
+        Show funds available for opening channels
+        """
+        return self.call("listfunds")
+
+    def listtransactions(self):
+        """
+        Show wallet history
+        """
+        return self.call("listtransactions")
+
+    def listinvoices(self, label=None):
+        """
+        Show invoice {label} (or all, if no {label))
+        """
+        payload = {
+            "label": label
+        }
+        return self.call("listinvoices", payload)
+
+    def listnodes(self, node_id=None):
+        """
+        Show all nodes in our local network view, filter on node {id}
+        if provided
+        """
+        payload = {
+            "id": node_id
+        }
+        return self.call("listnodes", payload)
+
+    def listpayments(self, bolt11=None, payment_hash=None):
+        """
+        Show outgoing payments, regarding {bolt11} or {payment_hash} if set
+        Can only specify one of {bolt11} or {payment_hash}
+        """
+        assert not (bolt11 and payment_hash)
+        payload = {
+            "bolt11": bolt11,
+            "payment_hash": payment_hash
+        }
+        return self.call("listpayments", payload)
+
+    def listpeers(self, peerid=None, level=None):
+        """
+        Show current peers, if {level} is set, include {log}s"
+        """
+        payload = {
+            "id": peerid,
+            "level": level,
+        }
+        return self.call("listpeers", payload)
+
+    def listsendpays(self, bolt11=None, payment_hash=None):
+        """Show all sendpays results, or only for `bolt11` or `payment_hash`"""
+        payload = {
+            "bolt11": bolt11,
+            "payment_hash": payment_hash
+        }
+        return self.call("listsendpays", payload)
+
+    def newaddr(self, addresstype=None):
+        """Get a new address of type {addresstype} of the internal wallet.
+        """
+        return self.call("newaddr", {"addresstype": addresstype})
+
+    def pay(self, bolt11, msatoshi=None, label=None, riskfactor=None, description=None):
+        """
+        Send payment specified by {bolt11} with {msatoshi}
+        (ignored if {bolt11} has an amount), optional {label}
+        and {riskfactor} (default 1.0)
+        """
+        payload = {
+            "bolt11": bolt11,
+            "msatoshi": msatoshi,
+            "label": label,
+            "riskfactor": riskfactor,
+            # Deprecated.
+            "description": description,
+        }
+        return self.call("pay", payload)
+
+    def paystatus(self, bolt11=None):
+        """Detail status of attempts to pay {bolt11} or any"""
+        payload = {
+            "bolt11": bolt11
+        }
+        return self.call("paystatus", payload)
+
+    def ping(self, peer_id, length=128, pongbytes=128):
+        """
+        Send {peer_id} a ping of length {len} asking for {pongbytes}"
+        """
+        payload = {
+            "id": peer_id,
+            "len": length,
+            "pongbytes": pongbytes
+        }
+        return self.call("ping", payload)
+
+    def sendpay(self, route, payment_hash, description=None, msatoshi=None):
+        """
+        Send along {route} in return for preimage of {payment_hash}
+        """
+        payload = {
+            "route": route,
+            "payment_hash": payment_hash,
+            "description": description,
+            "msatoshi": msatoshi,
+        }
+        return self.call("sendpay", payload)
+
+    def setchannelfee(self, id, base=None, ppm=None):
+        """
+        Set routing fees for a channel/peer {id} (or 'all'). {base} is a value in millisatoshi
+        that is added as base fee to any routed payment. {ppm} is a value added proportionally
+        per-millionths to any routed payment volume in satoshi.
+        """
+        payload = {
+            "id": id,
+            "base": base,
+            "ppm": ppm
+        }
+        return self.call("setchannelfee", payload)
+
+    def stop(self):
+        """
+        Shut down the lightningd process
+        """
+        return self.call("stop")
+
+    def waitanyinvoice(self, lastpay_index=None):
+        """
+        Wait for the next invoice to be paid, after {lastpay_index}
+        (if supplied)
+        """
+        payload = {
+            "lastpay_index": lastpay_index
+        }
+        return self.call("waitanyinvoice", payload)
+
+    def waitinvoice(self, label):
+        """
+        Wait for an incoming payment matching the invoice with {label}
+        """
+        payload = {
+            "label": label
+        }
+        return self.call("waitinvoice", payload)
+
+    def waitsendpay(self, payment_hash, timeout=None):
+        """
+        Wait for payment for preimage of {payment_hash} to complete
+        """
+        payload = {
+            "payment_hash": payment_hash,
+            "timeout": timeout
+        }
+        return self.call("waitsendpay", payload)
+
+    def withdraw(self, destination, satoshi, feerate=None, minconf=None):
+        """
+        Send to {destination} address {satoshi} (or "all")
+        amount via Bitcoin transaction. Only select outputs
+        with {minconf} confirmations
+        """
+        payload = {
+            "destination": destination,
+            "satoshi": satoshi,
+            "feerate": feerate,
+            "minconf": minconf,
+        }
+        return self.call("withdraw", payload)
+
+    def txprepare(self, destination, satoshi, feerate=None, minconf=None):
+        """
+        Prepare a bitcoin transaction which sends to {destination} address
+        {satoshi} (or "all") amount via Bitcoin transaction. Only select outputs
+        with {minconf} confirmations.
+
+        Outputs will be reserved until you call txdiscard or txsend, or
+        lightningd restarts.
+        """
+        payload = {
+            "destination": destination,
+            "satoshi": satoshi,
+            "feerate": feerate,
+            "minconf": minconf,
+        }
+        return self.call("txprepare", payload)
+
+    def txdiscard(self, txid):
+        """
+        Cancel a bitcoin transaction returned from txprepare.  The outputs
+        it was spending are released for other use.
+        """
+        payload = {
+            "txid": txid
+        }
+        return self.call("txdiscard", payload)
+
+    def txsend(self, txid):
+        """
+        Sign and broadcast a bitcoin transaction returned from txprepare.
+        """
+        payload = {
+            "txid": txid
+        }
+        return self.call("txsend", payload)

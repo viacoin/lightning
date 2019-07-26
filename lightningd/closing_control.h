@@ -5,10 +5,10 @@
 
 struct channel_id;
 struct crypto_state;
+struct per_peer_state;
 
 void peer_start_closingd(struct channel *channel,
-			 const struct crypto_state *cs,
-			 int peer_fd, int gossip_fd,
+			 struct per_peer_state *pps,
 			 bool reconnected,
 			 const u8 *channel_reestablish);
 

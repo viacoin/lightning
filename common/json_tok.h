@@ -9,7 +9,7 @@ struct amount_msat;
 struct amount_sat;
 struct command;
 struct command_result;
-struct json_escaped;
+struct json_escape;
 struct sha256;
 
 /* Extract json array token */
@@ -42,7 +42,7 @@ struct command_result *param_string(struct command *cmd, const char *name,
 /* Extract a label. It is either an escaped string or a number. */
 struct command_result *param_label(struct command *cmd, const char *name,
 				   const char * buffer, const jsmntok_t *tok,
-				   struct json_escaped **label);
+				   struct json_escape **label);
 
 /* Extract number from this (may be a string, or a number literal) */
 struct command_result *param_number(struct command *cmd, const char *name,
@@ -64,12 +64,12 @@ struct command_result *param_u64(struct command *cmd, const char *name,
 				 const char *buffer, const jsmntok_t *tok,
 				 uint64_t **num);
 
-/* Extra msatoshi amount from this string */
+/* Extract msatoshi amount from this string */
 struct command_result *param_msat(struct command *cmd, const char *name,
 				  const char *buffer, const jsmntok_t *tok,
 				  struct amount_msat **msat);
 
-/* Extra satoshi amount from this string */
+/* Extract satoshi amount from this string */
 struct command_result *param_sat(struct command *cmd, const char *name,
 				 const char *buffer, const jsmntok_t *tok,
 				 struct amount_sat **sat);
@@ -85,4 +85,8 @@ struct command_result *param_tok(struct command *cmd, const char *name,
 				 const char *buffer, const jsmntok_t * tok,
 				 const jsmntok_t **out);
 
+/* Ignore the token.  Not usually used. */
+struct command_result *param_ignore(struct command *cmd, const char *name,
+				    const char *buffer, const jsmntok_t *tok,
+				    const void *unused);
 #endif /* LIGHTNING_COMMON_JSON_TOK_H */

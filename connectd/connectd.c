@@ -277,12 +277,17 @@ static void connected_to_peer(struct daemon *daemon,
  * it to forward gossip to/from the peer.  The gossip daemon needs to know a
  * few of the features of the peer and its id (for reporting).
  *
+ * Every peer also has read-only access to the gossip_store, which is handed
+ * out by gossipd too, and also a "gossip_state" indicating where we're up to.
+ *
  * The 'localfeatures' is a field in the `init` message, indicating properties
  * when you're connected to it like we are: there are also 'globalfeatures'
- * which specify requirements to route a payment through a node. */
-static int get_gossipfd(struct daemon *daemon,
-			const struct node_id *id,
-			const u8 *localfeatures)
+ * which specify requirements to route a payment through a node.
+ */
+static bool get_gossipfds(struct daemon *daemon,
+			  const struct node_id *id,
+			  const u8 *localfeatures,
+			  struct per_peer_state *pps)
 {
 	bool gossip_queries_feature, initial_routing_sync, success;
 	u8 *msg;
@@ -308,7 +313,7 @@ static int get_gossipfd(struct daemon *daemon,
 			      strerror(errno));
 
 	msg = wire_sync_read(tmpctx, GOSSIPCTL_FD);
-	if (!fromwire_gossip_new_peer_reply(msg, &success))
+	if (!fromwire_gossip_new_peer_reply(pps, msg, &success, &pps->gs))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Failed parsing msg gossipctl: %s",
 			      tal_hex(tmpctx, msg));
@@ -318,12 +323,14 @@ static int get_gossipfd(struct daemon *daemon,
 	if (!success) {
 		status_broken("Gossipd did not give us an fd: losing peer %s",
 			      type_to_string(tmpctx, struct node_id, id));
-		return -1;
+		return false;
 	}
 
-	/* Otherwise, the next thing in the socket will be the file descriptor
+	/* Otherwise, the next thing in the socket will be the file descriptors
 	 * for the per-peer daemon. */
-	return fdpass_recv(GOSSIPCTL_FD);
+	pps->gossip_fd = fdpass_recv(GOSSIPCTL_FD);
+	pps->gossip_store_fd = fdpass_recv(GOSSIPCTL_FD);
+	return true;
 }
 
 /*~ This is an ad-hoc marshalling structure where we store arguments so we
@@ -331,7 +338,9 @@ static int get_gossipfd(struct daemon *daemon,
 struct peer_reconnected {
 	struct daemon *daemon;
 	struct node_id id;
-	const u8 *peer_connected_msg;
+	struct wireaddr_internal addr;
+	struct crypto_state cs;
+	const u8 *globalfeatures;
 	const u8 *localfeatures;
 };
 
@@ -349,8 +358,8 @@ static struct io_plan *retry_peer_connected(struct io_conn *conn,
 
 	/*~ Usually the pattern is to return this directly, but we have to free
 	 * our temporary structure. */
-	plan = peer_connected(conn, pr->daemon, &pr->id,
-			      take(pr->peer_connected_msg),
+	plan = peer_connected(conn, pr->daemon, &pr->id, &pr->addr, &pr->cs,
+			      take(pr->globalfeatures),
 			      take(pr->localfeatures));
 	tal_free(pr);
 	return plan;
@@ -361,7 +370,9 @@ static struct io_plan *retry_peer_connected(struct io_conn *conn,
 static struct io_plan *peer_reconnected(struct io_conn *conn,
 					struct daemon *daemon,
 					const struct node_id *id,
-					const u8 *peer_connected_msg TAKES,
+					const struct wireaddr_internal *addr,
+					const struct crypto_state *cs,
+					const u8 *globalfeatures TAKES,
 					const u8 *localfeatures TAKES)
 {
 	u8 *msg;
@@ -378,13 +389,14 @@ static struct io_plan *peer_reconnected(struct io_conn *conn,
 	pr = tal(daemon, struct peer_reconnected);
 	pr->daemon = daemon;
 	pr->id = *id;
+	pr->cs = *cs;
+	pr->addr = *addr;
 
 	/*~ Note that tal_dup_arr() will do handle the take() of
-	 * peer_connected_msg and localfeatures (turning it into a simply
+	 * globalfeatures and localfeatures (turning it into a simply
 	 * tal_steal() in those cases). */
-	pr->peer_connected_msg
-		= tal_dup_arr(pr, u8, peer_connected_msg,
-			      tal_count(peer_connected_msg), 0);
+	pr->globalfeatures
+		= tal_dup_arr(pr, u8, globalfeatures, tal_count(globalfeatures), 0);
 	pr->localfeatures
 		= tal_dup_arr(pr, u8, localfeatures, tal_count(localfeatures), 0);
 
@@ -404,35 +416,53 @@ static struct io_plan *peer_reconnected(struct io_conn *conn,
 struct io_plan *peer_connected(struct io_conn *conn,
 			       struct daemon *daemon,
 			       const struct node_id *id,
-			       const u8 *peer_connected_msg TAKES,
+			       const struct wireaddr_internal *addr,
+			       const struct crypto_state *cs,
+			       const u8 *globalfeatures TAKES,
 			       const u8 *localfeatures TAKES)
 {
-	int gossip_fd;
+	u8 *msg;
+	struct per_peer_state *pps;
 
 	if (node_set_get(&daemon->peers, id))
-		return peer_reconnected(conn, daemon, id, peer_connected_msg,
-					localfeatures);
+		return peer_reconnected(conn, daemon, id, addr, cs,
+					globalfeatures, localfeatures);
 
 	/* We've successfully connected. */
 	connected_to_peer(daemon, conn, id);
 
-	gossip_fd = get_gossipfd(daemon, id, localfeatures);
-
-	/* We promised we'd take it by marking it TAKEN above; simply free it. */
+	/* We promised we'd take it by marking it TAKEN above; prepare to free it. */
+	if (taken(globalfeatures))
+		tal_steal(tmpctx, globalfeatures);
 	if (taken(localfeatures))
-		tal_free(localfeatures);
+		tal_steal(tmpctx, localfeatures);
+
+	/* This contains the per-peer state info; gossipd fills in pps->gs */
+	pps = new_per_peer_state(tmpctx, cs);
+#if DEVELOPER
+	/* Overridden by lightningd, but initialize to keep valgrind happy */
+	pps->dev_gossip_broadcast_msec = 0;
+#endif
 
 	/* If gossipd can't give us a file descriptor, we give up connecting. */
-	if (gossip_fd < 0)
+	if (!get_gossipfds(daemon, id, localfeatures, pps))
 		return io_close(conn);
+
+	/* Create message to tell master peer has connected. */
+	msg = towire_connect_peer_connected(NULL, id, addr, pps,
+					    globalfeatures, localfeatures);
 
 	/*~ daemon_conn is a message queue for inter-daemon communication: we
 	 * queue up the `connect_peer_connected` message to tell lightningd
 	 * we have connected, and give the the peer and gossip fds. */
-	daemon_conn_send(daemon->master, peer_connected_msg);
+	daemon_conn_send(daemon->master, take(msg));
 	/* io_conn_fd() extracts the fd from ccan/io's io_conn */
 	daemon_conn_send_fd(daemon->master, io_conn_fd(conn));
-	daemon_conn_send_fd(daemon->master, gossip_fd);
+	daemon_conn_send_fd(daemon->master, pps->gossip_fd);
+	daemon_conn_send_fd(daemon->master, pps->gossip_store_fd);
+
+	/* Don't try to close these on freeing. */
+	pps->gossip_store_fd = pps->gossip_fd = -1;
 
 	/*~ Finally, we add it to the set of pubkeys: tal_dup will handle
 	 * take() args for us, by simply tal_steal()ing it. */

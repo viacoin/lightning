@@ -10,6 +10,7 @@
 #include <channeld/full_channel.h>
 #include <common/channel_config.h>
 #include <common/htlc.h>
+#include <common/htlc_trim.h>
 #include <common/htlc_tx.h>
 #include <common/htlc_wire.h>
 #include <common/key_derive.h>
@@ -291,6 +292,69 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	return txs;
 }
 
+/* If @side is faced with these HTLCs, how much will it have left
+ * above reserve (eg. to pay fees).  Returns false if would be < 0. */
+static bool get_room_above_reserve(const struct channel *channel,
+				   const struct channel_view *view,
+				   const struct htlc **adding,
+				   const struct htlc **removing,
+				   enum side side,
+				   struct amount_msat *balance)
+{
+	bool ok;
+	/* Reserve is set by the *other* side */
+	struct amount_sat reserve = channel->config[!side].channel_reserve;
+
+	*balance = view->owed[side];
+
+	ok = true;
+	for (size_t i = 0; i < tal_count(removing); i++)
+		ok &= balance_remove_htlc(balance, removing[i], side);
+
+	for (size_t i = 0; i < tal_count(adding); i++)
+		ok &= balance_add_htlc(balance, adding[i], side);
+
+	/* Can happen if amount completely exceeds capacity */
+	if (!ok) {
+		status_trace("Failed to add %zu remove %zu htlcs",
+			     tal_count(adding), tal_count(removing));
+		return false;
+	}
+
+	if (!amount_msat_sub_sat(balance, *balance, reserve)) {
+		status_trace("%s cannot afford htlc: would make balance %s"
+			     " below reserve %s",
+			     side_to_str(side),
+			     type_to_string(tmpctx, struct amount_msat,
+					    balance),
+			     type_to_string(tmpctx, struct amount_sat,
+					    &reserve));
+		return false;
+	}
+	return true;
+}
+
+static struct amount_sat fee_for_htlcs(const struct channel *channel,
+				       const struct channel_view *view,
+				       const struct htlc **committed,
+				       const struct htlc **adding,
+				       const struct htlc **removing,
+				       enum side side)
+{
+	u32 feerate = view->feerate_per_kw;
+	struct amount_sat dust_limit = channel->config[side].dust_limit;
+	size_t untrimmed;
+
+	untrimmed = commit_tx_num_untrimmed(committed, feerate, dust_limit,
+					    side)
+		+ commit_tx_num_untrimmed(adding, feerate, dust_limit,
+					  side)
+		- commit_tx_num_untrimmed(removing, feerate, dust_limit,
+					  side);
+
+	return commit_tx_base_fee(feerate, untrimmed);
+}
+
 static enum channel_add_err add_htlc(struct channel *channel,
 				     enum htlc_state state,
 				     u64 id,
@@ -299,16 +363,14 @@ static enum channel_add_err add_htlc(struct channel *channel,
 				     const struct sha256 *payment_hash,
 				     const u8 routing[TOTAL_PACKET_SIZE],
 				     struct htlc **htlcp,
-				     bool enforce_aggregate_limits)
+				     bool enforce_aggregate_limits,
+				     struct amount_sat *htlc_fee)
 {
 	struct htlc *htlc, *old;
 	struct amount_msat msat_in_htlcs, committed_msat, adding_msat, removing_msat;
-	struct amount_sat fee;
 	enum side sender = htlc_state_owner(state), recipient = !sender;
 	const struct htlc **committed, **adding, **removing;
 	const struct channel_view *view;
-	bool ok;
-	size_t i;
 
 	htlc = tal(tmpctx, struct htlc);
 
@@ -431,70 +493,86 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	 *    reserve):
 	 *    - SHOULD fail the channel.
 	 */
-	if (channel->funder == htlc_owner(htlc)) {
-		u32 feerate = view->feerate_per_kw;
-		struct amount_sat dust_limit = channel->config[recipient].dust_limit;
-		size_t untrimmed;
-
-		untrimmed = commit_tx_num_untrimmed(committed, feerate, dust_limit,
-						    recipient)
-			+ commit_tx_num_untrimmed(adding, feerate, dust_limit,
-						  recipient)
-			- commit_tx_num_untrimmed(removing, feerate, dust_limit,
-						  recipient);
-
-		fee = commit_tx_base_fee(feerate, untrimmed);
-	} else
-		fee = AMOUNT_SAT(0);
-
-	assert((s64)fee.satoshis >= 0); /* Raw: explicit signedness test */
-
 	if (enforce_aggregate_limits) {
-		/* Figure out what balance sender would have after applying all
-		 * pending changes. */
-		struct amount_msat balance = view->owed[sender];
+		struct amount_msat balance;
+		struct amount_sat fee = fee_for_htlcs(channel, view,
+						      committed,
+						      adding,
+						      removing,
+						      recipient);
+		/* set fee output pointer if given */
+		if (htlc_fee)
+			*htlc_fee = fee;
+
 		/* This is a little subtle:
 		 *
 		 * The change is being applied to the receiver but it will
 		 * come back to the sender after revoke_and_ack.  So the check
 		 * here is that the balance to the sender doesn't go below the
 		 * sender's reserve. */
-		const struct amount_sat reserve
-			= channel->config[!sender].channel_reserve;
-
-		assert(amount_msat_greater_eq(balance, AMOUNT_MSAT(0)));
-		ok = true;
-		for (i = 0; i < tal_count(removing); i++)
-			ok &= balance_remove_htlc(&balance, removing[i], sender);
-		assert(amount_msat_greater_eq(balance, AMOUNT_MSAT(0)));
-		for (i = 0; i < tal_count(adding); i++)
-			ok &= balance_add_htlc(&balance, adding[i], sender);
-
-		/* Overflow shouldn't happen, but if it does, complain */
-		if (!ok) {
-			status_broken("Failed to add %zu remove %zu htlcs",
-				      tal_count(adding), tal_count(removing));
+		if (!get_room_above_reserve(channel, view,
+					    adding, removing, sender,
+					    &balance))
 			return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
+
+		if (channel->funder == sender) {
+			if (amount_msat_less_sat(balance, fee)) {
+				status_trace("Cannot afford fee %s with %s above reserve",
+					     type_to_string(tmpctx, struct amount_sat,
+							    &fee),
+					     type_to_string(tmpctx, struct amount_msat,
+							    &balance));
+				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
+			}
 		}
 
-		if (!amount_msat_sub_sat(&balance, balance, fee)) {
-			status_trace("Cannot afford fee %s with balance %s",
-				     type_to_string(tmpctx, struct amount_sat,
-						    &fee),
-				     type_to_string(tmpctx, struct amount_msat,
-						    &balance));
-			return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
-		}
-		if (!amount_msat_greater_eq_sat(balance, reserve)) {
-			status_trace("Cannot afford fee %s: would make balance %s"
-				     " below reserve %s",
-				     type_to_string(tmpctx, struct amount_sat,
-						    &fee),
-				     type_to_string(tmpctx, struct amount_msat,
-						    &balance),
-				     type_to_string(tmpctx, struct amount_sat,
-						    &reserve));
-			return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
+		/* Try not to add a payment which will take funder into fees
+		 * on either our side or theirs. */
+		if (sender == LOCAL) {
+			if (!get_room_above_reserve(channel, view,
+						    adding, removing,
+						    channel->funder,
+						    &balance))
+				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
+			/* Should be able to afford both their own commit tx
+			 * fee, and other's commit tx fee, which are subtly
+			 * different! */
+			fee = fee_for_htlcs(channel, view,
+					    committed,
+					    adding,
+					    removing,
+					    channel->funder);
+			/* set fee output pointer if given */
+			if (htlc_fee && amount_sat_greater(fee, *htlc_fee))
+				*htlc_fee = fee;
+			if (amount_msat_less_sat(balance, fee)) {
+				status_trace("Funder could not afford own fee %s with %s above reserve",
+					     type_to_string(tmpctx,
+							    struct amount_sat,
+							    &fee),
+					     type_to_string(tmpctx,
+							    struct amount_msat,
+							    &balance));
+				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
+			}
+			fee = fee_for_htlcs(channel, view,
+					    committed,
+					    adding,
+					    removing,
+					    !channel->funder);
+			/* set fee output pointer if given */
+			if (htlc_fee && amount_sat_greater(fee, *htlc_fee))
+				*htlc_fee = fee;
+			if (amount_msat_less_sat(balance, fee)) {
+				status_trace("Funder could not afford peer's fee %s with %s above reserve",
+					     type_to_string(tmpctx,
+							    struct amount_sat,
+							    &fee),
+					     type_to_string(tmpctx,
+							    struct amount_msat,
+							    &balance));
+				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
+			}
 		}
 	}
 
@@ -520,7 +598,8 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 				      u32 cltv_expiry,
 				      const struct sha256 *payment_hash,
 				      const u8 routing[TOTAL_PACKET_SIZE],
-				      struct htlc **htlcp)
+				      struct htlc **htlcp,
+				      struct amount_sat *htlc_fee)
 {
 	enum htlc_state state;
 
@@ -530,7 +609,7 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 		state = RCVD_ADD_HTLC;
 
 	return add_htlc(channel, state, id, amount, cltv_expiry,
-			payment_hash, routing, htlcp, true);
+			payment_hash, routing, htlcp, true, htlc_fee);
 }
 
 struct htlc *channel_get_htlc(struct channel *channel, enum side sender, u64 id)
@@ -829,6 +908,13 @@ bool can_funder_afford_feerate(const struct channel *channel, u32 feerate_per_kw
 			      type_to_string(tmpctx, struct amount_sat,
 					     &channel->config[!channel->funder].channel_reserve));
 
+	status_trace("We need %s at feerate %u for %zu untrimmed htlcs: we have %s/%s",
+		     type_to_string(tmpctx, struct amount_sat, &needed),
+		     feerate_per_kw, untrimmed,
+		     type_to_string(tmpctx, struct amount_msat,
+				    &channel->view[LOCAL].owed[channel->funder]),
+		     type_to_string(tmpctx, struct amount_msat,
+				    &channel->view[REMOTE].owed[channel->funder]));
 	return amount_msat_greater_eq_sat(channel->view[!channel->funder].owed[channel->funder],
 					  needed);
 }
@@ -1084,7 +1170,7 @@ bool channel_force_htlcs(struct channel *channel,
 			     htlcs[i].id, htlcs[i].amount,
 			     htlcs[i].cltv_expiry,
 			     &htlcs[i].payment_hash,
-			     htlcs[i].onion_routing_packet, &htlc, false);
+			     htlcs[i].onion_routing_packet, &htlc, false, NULL);
 		if (e != CHANNEL_ERR_ADD_OK) {
 			status_trace("%s HTLC %"PRIu64" failed error %u",
 				     htlc_state_owner(hstates[i]) == LOCAL

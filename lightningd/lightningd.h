@@ -112,7 +112,7 @@ struct lightningd {
 	u8 *rgb; /* tal_len() == 3. */
 
 	/* Any pending timers. */
-	struct timers timers;
+	struct timers *timers;
 
 	/* Port we're listening on */
 	u16 portnum;
@@ -178,16 +178,17 @@ struct lightningd {
 	/* PID file */
 	char *pidfile;
 
-	/* Initial autocleaninvoice settings. */
-	u64 ini_autocleaninvoice_cycle;
-	u64 ini_autocleaninvoice_expiredby;
-
 	/* Number of blocks we wait for a channel to get funded
 	 * if we are the fundee. */
 	u32 max_funding_unconfirmed;
 
 	/* If we want to debug a subdaemon/plugin. */
 	const char *dev_debug_subprocess;
+
+	/* RPC which asked us to shutdown, if non-NULL */
+	struct io_conn *stop_conn;
+	/* RPC response to send once we've shut down. */
+	const char *stop_response;
 
 #if DEVELOPER
 	/* If we have a --dev-disconnect file */
@@ -202,11 +203,18 @@ struct lightningd {
 	/* Timestamp to use for gossipd, iff non-zero */
 	u32 dev_gossip_time;
 
-	/* What to override unknown channels with, iff non-NULL */
-	struct amount_sat *dev_unknown_channel_satoshis;
-
 	/* Things we've marked as not leaking. */
 	const void **notleaks;
+
+	/* This is the forced private key for the node. */
+	struct privkey *dev_force_privkey;
+
+	/* This is the forced bip32 seed for the node. */
+	struct secret *dev_force_bip32_seed;
+
+	/* These are the forced channel secrets for the node. */
+	struct secrets *dev_force_channel_secrets;
+	struct sha256 *dev_force_channel_secrets_shaseed;
 #endif /* DEVELOPER */
 
 	/* tor support */
@@ -217,6 +225,10 @@ struct lightningd {
 
 	struct plugins *plugins;
 };
+
+/* Turning this on allows a tal allocation to return NULL, rather than aborting.
+ * Use only on carefully tested code! */
+extern bool tal_oom_ok;
 
 const struct chainparams *get_chainparams(const struct lightningd *ld);
 

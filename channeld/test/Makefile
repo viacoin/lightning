@@ -11,6 +11,7 @@ CHANNELD_TEST_COMMON_OBJS :=			\
 	common/amount.o				\
 	common/daemon_conn.o			\
 	common/htlc_state.o			\
+	common/htlc_trim.o			\
 	common/htlc_tx.o			\
 	common/initial_commit_tx.o		\
 	common/key_derive.o			\
@@ -22,8 +23,8 @@ CHANNELD_TEST_COMMON_OBJS :=			\
 
 update-mocks: $(CHANNELD_TEST_SRC:%=update-mocks/%)
 
-$(CHANNELD_TEST_PROGRAMS): $(CCAN_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(LIBBASE58_OBJS) $(CHANNELD_TEST_COMMON_OBJS)
+$(CHANNELD_TEST_PROGRAMS): $(CCAN_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(CHANNELD_TEST_COMMON_OBJS)
 
 $(CHANNELD_TEST_OBJS): $(LIGHTNING_CHANNELD_HEADERS) $(LIGHTNING_CHANNELD_SRC)
 
-check: $(CHANNELD_TEST_PROGRAMS:%=unittest/%)
+check-units: $(CHANNELD_TEST_PROGRAMS:%=unittest/%)

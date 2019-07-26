@@ -4,6 +4,7 @@
 #include "config.h"
 #include <bitcoin/block.h>
 #include <ccan/short_types/short_types.h>
+#include <ccan/tal/str/str.h>
 #include <common/amount.h>
 #include <stdbool.h>
 
@@ -15,6 +16,9 @@ struct bip32_key_version {
 struct chainparams {
 	const char *network_name;
 	const char *bip173_name;
+	/*'bip70_name' is corresponding to the 'chain' field of
+	 * the API 'getblockchaininfo' */
+	const char *bip70_name;
 	const struct bitcoin_blkid genesis_blockhash;
 	const int rpc_port;
 	const char *cli;
@@ -23,6 +27,8 @@ struct chainparams {
 	const struct amount_sat max_funding;
 	const struct amount_msat max_payment;
 	const u32 when_lightning_became_cool;
+	const u8 p2pkh_version;
+	const u8 p2sh_version;
 
 	/* Whether this is a test network or not */
 	const bool testnet;
@@ -47,5 +53,10 @@ const struct chainparams *chainparams_by_bip173(const char *bip173_name);
  * chainparams_by_chainhash - Helper to get a network by its genesis blockhash
  */
 const struct chainparams *chainparams_by_chainhash(const struct bitcoin_blkid *chain_hash);
+
+/**
+ * chainparams_get_network_names - Produce a comma-separated list of network names
+ */
+const char *chainparams_get_network_names(const tal_t *ctx);
 
 #endif /* LIGHTNING_BITCOIN_CHAINPARAMS_H */
