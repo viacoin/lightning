@@ -45,6 +45,7 @@ class Field(object):
         self.count = 1
         self.len_field_of = None
         self.len_field = None
+        self.implicit_len = False
 
         self.extension_names = extensions
         self.is_optional = optional
@@ -69,19 +70,30 @@ class Field(object):
         # the len-field caches our name
         len_field.len_field_of = self.name
 
+    def add_implicit_len(self):
+        self.count = False
+        self.implicit_len = True
+
     def is_array(self):
         return self.count > 1
 
     def is_varlen(self):
         return not self.count
 
+    def is_implicit_len(self):
+        return self.implicit_len
+
     def is_extension(self):
         return bool(self.extension_names)
 
-    def size(self):
+    def size(self, implicit_expression=None):
         if self.count:
             return self.count
-        return self.len_field
+        if self.len_field:
+            return self.len_field
+        assert self.is_implicit_len()
+        assert implicit_expression
+        return implicit_expression
 
     def needs_context(self):
         """ A field needs a context if it's varsized """
@@ -103,9 +115,12 @@ class Field(object):
         return ', const {} *{}'.format(type_name, self.name)
 
     def arg_desc_from(self):
+        type_name = self.type_obj.type_name()
+        if self.type_obj.is_const_ptr_ptr_type():
+            return ', const {} **{}'.format(type_name, self.name)
+
         if self.len_field_of:
             return ''
-        type_name = self.type_obj.type_name()
         if self.is_array():
             return ', {} {}[{}]'.format(type_name, self.name, self.count)
         ptrs = '*'
@@ -122,17 +137,27 @@ class FieldSet(object):
         self.len_fields = {}
 
     def add_data_field(self, field_name, type_obj, count=1,
-                       extensions=[], comments=[], optional=False):
+                       extensions=[], comments=[], optional=False,
+                       implicit_len_ok=False):
         field = Field(field_name, type_obj, extensions=extensions,
                       field_comments=comments, optional=optional)
         if bool(count):
             try:
                 field.add_count(int(count))
             except ValueError:
-                len_field = self.find_data_field(count)
-                field.add_len_field(len_field)
-                self.len_fields[len_field.name] = len_field
+                if count in self.fields:
+                    len_field = self.find_data_field(count)
+                    field.add_len_field(len_field)
+                    self.len_fields[len_field.name] = len_field
+                else:
+                    # '...' means "rest of TLV"
+                    assert implicit_len_ok
+                    assert count == '...'
+                    field.add_implicit_len()
 
+        # You can't have any fields after an implicit-length field.
+        if len(self.fields) != 0:
+            assert not self.fields[next(reversed(self.fields))].is_implicit_len()
         self.fields[field_name] = field
 
     def find_data_field(self, field_name):
@@ -160,6 +185,8 @@ class Type(FieldSet):
         'bool',
         'amount_sat',
         'amount_msat',
+        'bigsize',
+        'varint'
     ]
 
     typedefs = [
@@ -172,6 +199,8 @@ class Type(FieldSet):
         'secp256k1_ecdsa_recoverable_signature',
         'wirestring',
         'double',
+        'bigsize',
+        'varint',
     ]
 
     truncated_typedefs = [
@@ -190,16 +219,20 @@ class Type(FieldSet):
         'bitcoin_tx',
         'wirestring',
         'per_peer_state',
+        'bitcoin_tx_output',
+        'exclude_entry',
+        'fee_states',
     ]
 
     # Some BOLT types are re-typed based on their field name
-    # ('fieldname partial', 'original type'): ('true type', 'collapse array?')
+    # ('fieldname partial', 'original type', 'outer type'): ('true type', 'collapse array?')
     name_field_map = {
         ('txid', 'sha256'): ('bitcoin_txid', False),
         ('amt', 'u64'): ('amount_msat', False),
         ('msat', 'u64'): ('amount_msat', False),
         ('satoshis', 'u64'): ('amount_sat', False),
-        ('node_id', 'pubkey'): ('node_id', False),
+        ('node_id', 'pubkey', 'channel_announcement'): ('node_id', False),
+        ('node_id', 'pubkey', 'node_announcement'): ('node_id', False),
         ('temporary_channel_id', 'u8'): ('channel_id', True),
         ('secret', 'u8'): ('secret', True),
         ('preimage', 'u8'): ('preimage', True),
@@ -215,8 +248,14 @@ class Type(FieldSet):
         # FIXME: omits 'pad'
     }
 
+    # Types that are const pointer-to-pointers, such as chainparams, i.e.,
+    # they set a reference to some const entry.
+    const_ptr_ptr_types = [
+        'chainparams'
+    ]
+
     @staticmethod
-    def true_type(type_name, field_name=None):
+    def true_type(type_name, field_name=None, outer_name=None):
         """ Returns 'true' type of a given type and a flag if
             we've remapped a variable size/array type to a single struct
             (an example of this is 'temporary_channel_id' which is specified
@@ -226,9 +265,10 @@ class Type(FieldSet):
             type_name = Type.name_remap[type_name]
 
         if field_name:
-            for (partial, t), true_type in Type.name_field_map.items():
-                if partial in field_name and t == type_name:
-                    return true_type
+            for t, true_type in Type.name_field_map.items():
+                if t[0] in field_name and t[1] == type_name:
+                    if len(t) == 2 or outer_name == t[2]:
+                        return true_type
         return (type_name, False)
 
     def __init__(self, name):
@@ -278,6 +318,9 @@ class Type(FieldSet):
     def is_subtype(self):
         return bool(self.fields)
 
+    def is_const_ptr_ptr_type(self):
+        return self.name in self.const_ptr_ptr_types
+
     def is_truncated(self):
         return self.name in self.truncated_typedefs
 
@@ -314,6 +357,7 @@ class Message(FieldSet):
         self.struct_prefix = struct_prefix
         self.enumname = None
         self.msg_comments = comments
+        self.if_token = None
 
     def has_option(self):
         return self.option is not None
@@ -326,6 +370,9 @@ class Message(FieldSet):
         if self.struct_prefix:
             return self.struct_prefix + "_" + self.name
         return self.name
+
+    def add_if(self, if_token):
+        self.if_token = if_token
 
 
 class Tlv(object):
@@ -348,6 +395,9 @@ class Tlv(object):
 
     def find_message(self, name):
         return self.messages[name]
+
+    def ordered_msgs(self):
+        return sorted(self.messages.values(), key=lambda item: int(item.number))
 
 
 class Master(object):
@@ -381,13 +431,14 @@ class Master(object):
     def add_extension_msg(self, name, msg):
         self.extension_msgs[name] = msg
 
-    def add_type(self, type_name, field_name=None):
+    def add_type(self, type_name, field_name=None, outer_name=None):
         optional = False
         if type_name.startswith('?'):
             type_name = type_name[1:]
             optional = True
         # Check for special type name re-mapping
-        type_name, collapse_original = Type.true_type(type_name, field_name)
+        type_name, collapse_original = Type.true_type(type_name, field_name,
+                                                      outer_name)
 
         if type_name not in self.types:
             self.types[type_name] = Type(type_name)
@@ -472,6 +523,7 @@ def main(options, args=None, output=sys.stdout, lines=None):
     genline = next_line(args, lines)
 
     comment_set = []
+    token_name = None
 
     # Create a new 'master' that serves as the coordinator for the file generation
     master = Master()
@@ -484,7 +536,11 @@ def main(options, args=None, output=sys.stdout, lines=None):
             if not bool(line):
                 master.add_comments(comment_set)
                 comment_set = []
+                token_name = None
                 continue
+
+            if len(tokens) > 2:
+                token_name = tokens[1]
 
             if token_type == 'subtype':
                 subtype, _, _ = master.add_type(tokens[1])
@@ -496,7 +552,7 @@ def main(options, args=None, output=sys.stdout, lines=None):
                 if not subtype:
                     raise ValueError('Unknown subtype {} for data.\nat {}:{}'
                                      .format(tokens[1], ln, line))
-                type_obj, collapse, optional = master.add_type(tokens[3], tokens[2])
+                type_obj, collapse, optional = master.add_type(tokens[3], tokens[2], tokens[1])
                 if optional:
                     raise ValueError('Subtypes cannot have optional fields {}.{}\n at {}:{}'
                                      .format(subtype.name, tokens[2], ln, line))
@@ -514,7 +570,7 @@ def main(options, args=None, output=sys.stdout, lines=None):
 
                 comment_set = []
             elif token_type == 'tlvdata':
-                type_obj, collapse, optional = master.add_type(tokens[4], tokens[3])
+                type_obj, collapse, optional = master.add_type(tokens[4], tokens[3], tokens[1])
                 if optional:
                     raise ValueError('TLV messages cannot have optional fields {}.{}\n at {}:{}'
                                      .format(tokens[2], tokens[3], ln, line))
@@ -533,7 +589,7 @@ def main(options, args=None, output=sys.stdout, lines=None):
                     count = tokens[5]
 
                 msg.add_data_field(tokens[3], type_obj, count, comments=list(comment_set),
-                                   optional=optional)
+                                   optional=optional, implicit_len_ok=True)
                 comment_set = []
             elif token_type == 'msgtype':
                 master.add_message(tokens[1:], comments=list(comment_set))
@@ -542,7 +598,14 @@ def main(options, args=None, output=sys.stdout, lines=None):
                 msg = master.find_message(tokens[1])
                 if not msg:
                     raise ValueError('Unknown message type {}. {}:{}'.format(tokens[1], ln, line))
-                type_obj, collapse, optional = master.add_type(tokens[3], tokens[2])
+                type_obj, collapse, optional = master.add_type(tokens[3], tokens[2], tokens[1])
+
+                if collapse:
+                    count = 1
+                elif len(tokens) < 5:
+                    raise ValueError('problem with parsing {}:{}'.format(ln, line))
+                else:
+                    count = tokens[4]
 
                 # if this is an 'extension' field*, we want to add a new 'message' type
                 # in the future, extensions will be handled as TLV's
@@ -552,18 +615,24 @@ def main(options, args=None, output=sys.stdout, lines=None):
                 #   differently. for the sake of clarity here, for bolt-wire messages,
                 #   we'll refer to 'optional' message fields as 'extensions')
                 #
-                if bool(tokens[5:]):  # is an extension field
+                if tokens[5:] == []:
+                    msg.add_data_field(tokens[2], type_obj, count, comments=list(comment_set),
+                                       optional=optional)
+                else:  # is one or more extension fields
                     if optional:
                         raise ValueError("Extension fields cannot be optional. {}:{}"
                                          .format(ln, line))
-                    extension_name = "{}_{}".format(tokens[1], tokens[5])
                     orig_msg = msg
-                    msg = master.find_message(extension_name)
-                    if not msg:
-                        msg = copy.deepcopy(orig_msg)
-                        msg.enumname = msg.name
-                        msg.name = extension_name
-                        master.add_extension_msg(msg.name, msg)
+                    for extension in tokens[5:]:
+                        extension_name = "{}_{}".format(tokens[1], extension)
+                        msg = master.find_message(extension_name)
+                        if not msg:
+                            msg = copy.deepcopy(orig_msg)
+                            msg.enumname = msg.name
+                            msg.name = extension_name
+                            master.add_extension_msg(msg.name, msg)
+                        msg.add_data_field(tokens[2], type_obj, count, comments=list(comment_set), optional=optional)
+
                     # If this is a print_wire page, add the extension fields to the
                     # original message, so we can print them if present.
                     if options.print_wire:
@@ -572,17 +641,14 @@ def main(options, args=None, output=sys.stdout, lines=None):
                                                 comments=list(comment_set),
                                                 optional=optional)
 
-                if collapse:
-                    count = 1
-                else:
-                    count = tokens[4]
-
-                msg.add_data_field(tokens[2], type_obj, count, comments=list(comment_set),
-                                   optional=optional)
-
                 comment_set = []
             elif token_type.startswith('#include'):
                 master.add_include(token_type)
+            elif token_type.startswith('#if'):
+                msg = master.find_message(token_name)
+                if (msg):
+                    if_token = token_type[token_type.index(' ') + 1:]
+                    msg.add_if(if_token)
             elif token_type.startswith('#'):
                 comment_set.append(token_type[1:])
             else:
@@ -602,6 +668,7 @@ if __name__ == "__main__":
     parser.add_argument("-P", "--print_wire", help="generate wire printing source files",
                         action="store_true", default=False)
     parser.add_argument("--page", choices=['header', 'impl'], help="page to print")
+    parser.add_argument('--expose-tlv-type', action='append', default=[])
     parser.add_argument('header_filename', help='The filename of the header')
     parser.add_argument('enum_name', help='The name of the enum to produce')
     parser.add_argument("files", help='Files to read in (or stdin)', nargs=REMAINDER)

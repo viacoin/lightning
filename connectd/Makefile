@@ -39,8 +39,10 @@ LIGHTNINGD_HEADERS_GEN += $(LIGHTNINGD_CONNECT_HEADERS)
 CONNECTD_COMMON_OBJS :=				\
 	common/amount.o				\
 	common/base32.o				\
+	common/base64.o				\
 	common/bech32.o				\
 	common/bech32_util.o			\
+	common/bigsize.o			\
 	common/bip32.o				\
 	common/crypto_state.o			\
 	common/cryptomsg.o			\
@@ -50,6 +52,7 @@ CONNECTD_COMMON_OBJS :=				\
 	common/dev_disconnect.o			\
 	common/features.o			\
 	common/gen_status_wire.o		\
+	common/gossip_rcvd_filter.o		\
 	common/key_derive.o			\
 	common/memleak.o			\
 	common/msg_queue.o			\

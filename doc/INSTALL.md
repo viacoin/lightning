@@ -22,11 +22,9 @@ You will need several development libraries:
 
 For actually doing development and running the tests, you will also need:
 * pip3: to install python-bitcoinlib
-* asciidoc: for formatting the man pages (if you change them)
 * valgrind: for extra debugging checks
 
-You will also need a version of bitcoind with segregated witness and
-estimatesmartfee economical node, such as the 0.15 or above.
+You will also need a version of bitcoind with segregated witness and `estimatesmartfee` economical node, such as the 0.16 or above.
 
 To Build on Ubuntu
 ---------------------
@@ -38,7 +36,8 @@ Get dependencies:
     sudo apt-get update
     sudo apt-get install -y \
       autoconf automake build-essential git libtool libgmp-dev \
-      libsqlite3-dev python python3 python3-mako net-tools zlib1g-dev libsodium-dev
+      libsqlite3-dev python python3 python3-mako net-tools zlib1g-dev libsodium-dev \
+      git gettext
 
 If you don't have Bitcoin installed locally you'll need to install that
 as well:
@@ -48,20 +47,21 @@ as well:
     sudo apt-get update
     sudo apt-get install -y bitcoind
 
-For development or running tests, get additional dependencies:
-
-    sudo apt-get install -y asciidoc valgrind python3-pip
-    sudo pip3 install -r tests/requirements.txt
-
 Clone lightning:
 
     git clone https://github.com/ElementsProject/lightning.git
     cd lightning
+    
+For development or running tests, get additional dependencies:
+
+    sudo apt-get install -y valgrind python3-pip libpq-dev
+    sudo pip3 install -r tests/requirements.txt -r doc/requirements.txt
 
 Build lightning:
 
     ./configure
     make
+    sudo make install
 
 Running lightning:
 
@@ -83,15 +83,15 @@ $ sudo dnf update -y && \
                 'C Development Tools and Libraries' \
                 'Development Tools' && \
         sudo dnf install -y \
-                asciidoc \
                 clang \
+                gettext \
+                git \
                 gmp-devel \
                 libsq3-devel \
                 python2-devel \
                 python3-devel \
                 python3-pip \
                 python3-setuptools \
-                net-tools \
                 net-tools \
                 valgrind \
                 wget \
@@ -135,7 +135,9 @@ OS version: FreeBSD 11.1-RELEASE or above
 Get dependencies:
 
     # pkg install -y \
-      autoconf automake git gmp asciidoc gmake libtool python python3 sqlite3 libsodium
+      autoconf automake bash gettext git gmp gmake libtool \
+      python python3 sqlite3 libsodium py36-mako py36-pip
+    # pip install mrkd
 
 If you don't have Bitcoin installed locally you'll need to install that
 as well:
@@ -148,6 +150,9 @@ Clone lightning:
     $ cd lightning
 
 Build lightning:
+
+**Note**: Make sure you've set an utf-8 locale, e.g. 
+`export LC_CTYPE=en_US.UTF-8`, otherwise manpage installation may fail.
 
     $ ./configure
     $ gmake
@@ -171,7 +176,7 @@ Use nix-shell launch a shell with a full clightning dev environment:
 ```
 $ nix-shell -Q -p gdb sqlite autoconf git clang libtool gmp sqlite autoconf \
 autogen automake libsodium 'python3.withPackages (p: [p.bitcoinlib])' \
-valgrind asciidoc --run make
+valgrind --run make
 ```
 
 To Build on macOS
@@ -179,7 +184,23 @@ To Build on macOS
 
 Assuming you have Xcode and Homebrew installed. Install dependencies:
 
-    $ brew install autoconf automake libtool python3 gmp gnu-sed
+    $ brew install autoconf automake libtool python3 gmp gnu-sed gettext
+    $ ln -s /usr/local/Cellar/gettext/0.20.1/bin/xgettext /usr/local/opt
+    $ export PATH="/usr/local/opt:$PATH"
+
+If you need SQLite (or get a SQLite mismatch build error):
+
+    $ brew install sqlite
+    $ export LDFLAGS="-L/usr/local/opt/sqlite/lib"
+    $ export CPPFLAGS="-I/usr/local/opt/sqlite/include"
+
+If you need Python 3.x for mako (or get a mako build error):
+
+    $ brew install pyenv
+    $ echo -e 'if command -v pyenv 1>/dev/null 2>&1; then\n  eval "$(pyenv init -)"\nfi' >> ~/.bash_profile
+    $ source ~/.bash_profile
+    $ pyenv install 3.7.4
+    $ pip install --upgrade pip
 
 If you don't have bitcoind installed locally you'll need to install that
 as well:
@@ -195,6 +216,11 @@ Clone lightning:
 
     $ git clone https://github.com/ElementsProject/lightning.git
     $ cd lightning
+
+Configure Python 3.x & get mako:
+
+    $ pyenv local 3.7.4
+    $ pip install mako
 
 Build lightning:
 

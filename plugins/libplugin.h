@@ -3,6 +3,7 @@
 #define LIGHTNING_PLUGINS_LIBPLUGIN_H
 #include "config.h"
 
+#include <ccan/time/time.h>
 #include <common/json.h>
 #include <common/json_command.h>
 #include <common/json_helpers.h>
@@ -15,6 +16,11 @@ struct json_out;
 struct plugin_conn;
 
 extern bool deprecated_apis;
+
+enum plugin_restartability {
+	PLUGIN_STATIC,
+	PLUGIN_RESTARTABLE
+};
 
 /* Create an array of these, one for each command you support. */
 struct plugin_command {
@@ -36,6 +42,22 @@ struct plugin_option {
 	void *arg;
 };
 
+/* Create an array of these, one for each notification you subscribe to. */
+struct plugin_notification {
+	const char *name;
+	void (*handle)(struct command *cmd,
+	               const char *buf,
+	               const jsmntok_t *params);
+};
+
+/* Create an array of these, one for each hook you subscribe to. */
+struct plugin_hook {
+	const char *name;
+	struct command_result *(*handle)(struct command *cmd,
+	                                 const char *buf,
+	                                 const jsmntok_t *params);
+};
+
 /* Helper to create a zero or single-value JSON object; if @str is NULL,
  * object is empty. */
 struct json_out *json_out_obj(const tal_t *ctx,
@@ -55,6 +77,11 @@ command_done_err(struct command *cmd,
 		 int code,
 		 const char *errmsg,
 		 const struct json_out *data);
+
+/* Send a raw error response. Useful for forwarding a previous
+ * error after cleanup */
+struct command_result *command_err_raw(struct command *cmd,
+				       const char *json_str);
 
 /* This command is finished, here's the result object; @cmd cannot be NULL. */
 struct command_result *WARN_UNUSED_RESULT
@@ -131,7 +158,7 @@ struct plugin_timer *plugin_timer(struct plugin_conn *rpc,
 				  struct command_result *(*cb)(void));
 
 /* Log something */
-void PRINTF_FMT(2, 3) plugin_log(enum log_level l, const char *fmt, ...);
+void plugin_log(enum log_level l, const char *fmt, ...) PRINTF_FMT(2, 3);
 
 /* Macro to define arguments */
 #define plugin_option(name, type, description, set, arg)			\
@@ -147,7 +174,14 @@ char *charp_option(const char *arg, char **p);
 
 /* The main plugin runner: append with 0 or more plugin_option(), then NULL. */
 void NORETURN LAST_ARG_NULL plugin_main(char *argv[],
-					void (*init)(struct plugin_conn *rpc),
+					void (*init)(struct plugin_conn *rpc,
+						     const char *buf, const jsmntok_t *),
+					const enum plugin_restartability restartability,
 					const struct plugin_command *commands,
-					size_t num_commands, ...);
+					size_t num_commands,
+					const struct plugin_notification *notif_subs,
+					size_t num_notif_subs,
+					const struct plugin_hook *hook_subs,
+					size_t num_hook_subs,
+					...);
 #endif /* LIGHTNING_PLUGINS_LIBPLUGIN_H */

@@ -91,7 +91,7 @@ Here's a list of parts, with notes:
 Debugging
 ---------
 
-You can build c-lightning with DEVELOPER=1 to use dev commands listed in ``cli/lightning-cli help``. ``./configure --enable-developer`` will do that. You can log console messages with log_info() in lightningd and status_trace() in other subdaemons.
+You can build c-lightning with DEVELOPER=1 to use dev commands listed in ``cli/lightning-cli help``. ``./configure --enable-developer`` will do that. You can log console messages with log_info() in lightningd and status_debug() in other subdaemons.
 
 You can debug crashing subdaemons with the argument
 `--dev-debugger=channeld`, where `channeld` is the subdaemon name.  It
@@ -109,15 +109,15 @@ Database
 
 c-lightning state is persisted in `lightning-dir`.
 It is a sqlite database stored in the `lightningd.sqlite3` file, typically
-under `~/.lightning`.
+under `~/.lightning/<network>/`.
 You can run queries against this file like so:
 
-    $ sqlite3 ~/.lightning/lightningd.sqlite3 \
+    $ sqlite3 ~/.lightning/bitcoin/lightningd.sqlite3 \
       "SELECT HEX(prev_out_tx), prev_out_index, status FROM outputs"
 
 Or you can launch into the sqlite3 repl and check things out from there:
 
-    $ sqlite3 ~/.lightning/lightningd.sqlite3
+    $ sqlite3 ~/.lightning/bitcoin/lightningd.sqlite3
     SQLite version 3.21.0 2017-10-24 18:55:49
     Enter ".help" for usage hints.
     sqlite> .tables
@@ -135,7 +135,7 @@ as some queries may lock the database and cause crashes.
 #### Common variables
 Table `vars` contains global variables used by lightning node.
 
-    $ sqlite3 ~/.lightning/lightningd.sqlite3
+    $ sqlite3 ~/.lightning/bitcoin/lightningd.sqlite3
     SQLite version 3.21.0 2017-10-24 18:55:49
     Enter ".help" for usage hints.
     sqlite> .headers on
@@ -204,14 +204,19 @@ There are three kinds of tests:
   and `make update-mocks` will automatically generate stub functions which will
   allow you to link (and conveniently crash if they're called).
 
-* **blackbox tests** - These test setup a mini-regtest environment and test
+* **blackbox tests** - These tests setup a mini-regtest environment and test
   lightningd as a whole.  They can be run individually:
 
-  `PYTHONPATH=contrib/pylightning py.test -v tests/`.
+  `PYTHONPATH=contrib/pylightning:contrib/pyln-client:contrib/pyln-testing py.test -v tests/`
 
   You can also append `-k TESTNAME` to run a single test.  Environment variables
   `DEBUG_SUBD=<subdaemon>` and `TIMEOUT=<seconds>` can be useful for debugging
   subdaemons on individual tests.
+
+* **pylightning tests** - will check contrib pylightning for codestyle and run
+  the tests in `contrib/pylightning/tests` afterwards:
+
+  `make check-python`
 
 Our Travis CI instance (see `.travis.yml`) runs all these for each
 pull request.

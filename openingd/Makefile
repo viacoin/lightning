@@ -37,6 +37,7 @@ LIGHTNINGD_HEADERS_NOGEN += $(LIGHTNINGD_OPENING_HEADERS_NOGEN)
 OPENINGD_COMMON_OBJS :=				\
 	common/amount.o				\
 	common/base32.o				\
+	common/bigsize.o			\
 	common/bip32.o				\
 	common/channel_config.o			\
 	common/crypto_state.o			\
@@ -47,10 +48,13 @@ OPENINGD_COMMON_OBJS :=				\
 	common/derive_basepoints.o		\
 	common/dev_disconnect.o			\
 	common/features.o			\
+	common/fee_states.o			\
 	common/funding_tx.o			\
 	common/gen_status_wire.o		\
 	common/gen_peer_status_wire.o		\
+	common/gossip_rcvd_filter.o		\
 	common/gossip_store.o			\
+	common/htlc_state.o			\
 	common/htlc_wire.o			\
 	common/initial_channel.o		\
 	common/initial_commit_tx.o		\

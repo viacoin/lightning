@@ -1,3 +1,4 @@
+#include <bitcoin/chainparams.h>
 #include <ccan/err/err.h>
 #include <ccan/intmap/intmap.h>
 #include <ccan/json_out/json_out.h>
@@ -34,6 +35,8 @@ static size_t in_timer;
 
 bool deprecated_apis;
 
+const struct chainparams *chainparams;
+
 struct plugin_timer {
 	struct timer timer;
 	struct command_result *(*cb)(void);
@@ -48,7 +51,7 @@ struct plugin_conn {
 static struct plugin_conn rpc_conn;
 
 struct command {
-	u64 id;
+	u64 *id;
 	const char *methodname;
 	bool usage_only;
 };
@@ -156,12 +159,15 @@ static struct command *read_json_request(const tal_t *ctx,
 
 	method = json_get_member(membuf_elems(&conn->mb), toks, "method");
 	*params = json_get_member(membuf_elems(&conn->mb), toks, "params");
-	/* FIXME: Notifications don't have id! */
 	id = json_get_member(membuf_elems(&conn->mb), toks, "id");
-	if (!json_to_u64(membuf_elems(&conn->mb), id, &cmd->id))
-		plugin_err("JSON id '%*.s' is not a number",
-			   id->end - id->start,
-			   membuf_elems(&conn->mb) + id->start);
+	if (id) {
+		cmd->id = tal(cmd, u64);
+		if (!json_to_u64(membuf_elems(&conn->mb), id, cmd->id))
+			plugin_err("JSON id '%*.s' is not a number",
+			           id->end - id->start,
+			           membuf_elems(&conn->mb) + id->start);
+	} else
+		cmd->id = NULL;
 	cmd->usage_only = false;
 	cmd->methodname = json_strdup(cmd, membuf_elems(&conn->mb), method);
 
@@ -210,7 +216,7 @@ command_done_raw(struct command *cmd,
 		 const char *label,
 		 const char *str, int size)
 {
-	struct json_out *jout = start_json_rpc(cmd, cmd->id);
+	struct json_out *jout = start_json_rpc(cmd, *cmd->id);
 
 	memcpy(json_out_member_direct(jout, label, size), str, size);
 
@@ -221,7 +227,7 @@ command_done_raw(struct command *cmd,
 struct command_result *WARN_UNUSED_RESULT
 command_success(struct command *cmd, const struct json_out *result)
 {
-	struct json_out *jout = start_json_rpc(cmd, cmd->id);
+	struct json_out *jout = start_json_rpc(cmd, *cmd->id);
 
 	json_out_add_splice(jout, "result", result);
 	finish_and_send_json(STDOUT_FILENO, jout);
@@ -231,7 +237,7 @@ command_success(struct command *cmd, const struct json_out *result)
 struct command_result *WARN_UNUSED_RESULT
 command_success_str(struct command *cmd, const char *str)
 {
-	struct json_out *jout = start_json_rpc(cmd, cmd->id);
+	struct json_out *jout = start_json_rpc(cmd, *cmd->id);
 
 	if (str)
 		json_out_addstr(jout, "result", str);
@@ -249,7 +255,7 @@ struct command_result *command_done_err(struct command *cmd,
 					const char *errmsg,
 					const struct json_out *data)
 {
-	struct json_out *jout = start_json_rpc(cmd, cmd->id);
+	struct json_out *jout = start_json_rpc(cmd, *cmd->id);
 
 	json_out_start(jout, "error", '{');
 	json_out_add(jout, "code", false, "%d", code);
@@ -261,6 +267,13 @@ struct command_result *command_done_err(struct command *cmd,
 
 	finish_and_send_json(STDOUT_FILENO, jout);
 	return end_cmd(cmd);
+}
+
+struct command_result *command_err_raw(struct command *cmd,
+				       const char *json_str)
+{
+	return command_done_raw(cmd, "error",
+				json_str, strlen(json_str));
 }
 
 struct command_result *timer_complete(void)
@@ -473,7 +486,12 @@ static struct command_result *
 handle_getmanifest(struct command *getmanifest_cmd,
 		   const struct plugin_command *commands,
 		   size_t num_commands,
-		   const struct plugin_option *opts)
+		   const struct plugin_notification *notif_subs,
+		   size_t num_notif_subs,
+		   const struct plugin_hook *hook_subs,
+		   size_t num_hook_subs,
+		   const struct plugin_option *opts,
+		   const enum plugin_restartability restartability)
 {
 	struct json_out *params = json_out_new(tmpctx);
 
@@ -501,6 +519,18 @@ handle_getmanifest(struct command *getmanifest_cmd,
 		json_out_end(params, '}');
 	}
 	json_out_end(params, ']');
+
+	json_out_start(params, "subscriptions", '[');
+	for (size_t i = 0; i < num_notif_subs; i++)
+		json_out_addstr(params, NULL, notif_subs[i].name);
+	json_out_end(params, ']');
+
+	json_out_start(params, "hooks", '[');
+	for (size_t i = 0; i < num_hook_subs; i++)
+		json_out_addstr(params, NULL, hook_subs[i].name);
+	json_out_end(params, ']');
+
+	json_out_addstr(params, "dynamic", restartability == PLUGIN_RESTARTABLE ? "true" : "false");
 	json_out_end(params, '}');
 	json_out_finished(params);
 
@@ -511,21 +541,28 @@ static struct command_result *handle_init(struct command *init_cmd,
 					  const char *buf,
 					  const jsmntok_t *params,
 					  const struct plugin_option *opts,
-					  void (*init)(struct plugin_conn *))
+					  void (*init)(struct plugin_conn *,
+						       const char *buf, const jsmntok_t *))
 {
-	const jsmntok_t *rpctok, *dirtok, *opttok, *t;
+	const jsmntok_t *configtok, *rpctok, *dirtok, *opttok, *nettok, *t;
 	struct sockaddr_un addr;
 	size_t i;
-	char *dir;
+	char *dir, *network;
 	struct json_out *param_obj;
 
+	configtok = json_delve(buf, params, ".configuration");
+
 	/* Move into lightning directory: other files are relative */
-	dirtok = json_delve(buf, params, ".configuration.lightning-dir");
+	dirtok = json_delve(buf, configtok, ".lightning-dir");
 	dir = json_strdup(tmpctx, buf, dirtok);
 	if (chdir(dir) != 0)
 		plugin_err("chdir to %s: %s", dir, strerror(errno));
 
-	rpctok = json_delve(buf, params, ".configuration.rpc-file");
+	nettok = json_delve(buf, configtok, ".network");
+	network = json_strdup(tmpctx, buf, nettok);
+	chainparams = chainparams_for_network(network);
+
+	rpctok = json_delve(buf, configtok, ".rpc-file");
 	rpc_conn.fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (rpctok->end - rpctok->start + 1 > sizeof(addr.sun_path))
 		plugin_err("rpc filename '%.*s' too long",
@@ -545,7 +582,7 @@ static struct command_result *handle_init(struct command *init_cmd,
 					  take(param_obj),
 					  &rpc_conn,
 					  ".allow-deprecated-apis"),
-				"true");
+				  "true");
 	opttok = json_get_member(buf, params, "options");
 	json_for_each_obj(i, t, opttok) {
 		char *opt = json_strdup(NULL, buf, t);
@@ -564,7 +601,7 @@ static struct command_result *handle_init(struct command *init_cmd,
 	}
 
 	if (init)
-		init(&rpc_conn);
+		init(&rpc_conn, buf, configtok);
 
 	return command_success_str(init_cmd, NULL);
 }
@@ -593,13 +630,36 @@ static void handle_new_command(const tal_t *ctx,
 			       struct plugin_conn *request_conn,
 			       struct plugin_conn *rpc_conn,
 			       const struct plugin_command *commands,
-			       size_t num_commands)
+			       size_t num_commands,
+			       const struct plugin_notification *notif_subs,
+			       size_t num_notif_subs,
+			       const struct plugin_hook *hook_subs,
+			       size_t num_hook_subs)
 {
 	struct command *cmd;
 	const jsmntok_t *params;
 	int reqlen;
 
 	cmd = read_json_request(ctx, request_conn, rpc_conn, &params, &reqlen);
+	/* If this is a notification. */
+	if (!cmd->id) {
+		for (size_t i = 0; i < num_notif_subs; i++) {
+			if (streq(cmd->methodname, notif_subs[i].name)) {
+				notif_subs[i].handle(cmd, membuf_elems(&request_conn->mb),
+				                     params);
+				membuf_consume(&request_conn->mb, reqlen);
+			}
+		}
+		return;
+	}
+	for (size_t i = 0; i < num_hook_subs; i++) {
+		if (streq(cmd->methodname, hook_subs[i].name)) {
+			hook_subs[i].handle(cmd, membuf_elems(&request_conn->mb),
+					   params);
+			membuf_consume(&request_conn->mb, reqlen);
+			return;
+		}
+	}
 	for (size_t i = 0; i < num_commands; i++) {
 		if (streq(cmd->methodname, commands[i].name)) {
 			commands[i].handle(cmd, membuf_elems(&request_conn->mb),
@@ -624,7 +684,7 @@ static void setup_command_usage(const struct plugin_command *commands,
 
 		usage_cmd->methodname = commands[i].name;
 		res = commands[i].handle(usage_cmd, NULL, NULL);
-		assert(res == NULL);
+		assert(res == &complete);
 		assert(strmap_get(&usagemap, commands[i].name));
 	}
 }
@@ -698,9 +758,16 @@ void plugin_log(enum log_level l, const char *fmt, ...)
 }
 
 void plugin_main(char *argv[],
-		 void (*init)(struct plugin_conn *rpc),
+		 void (*init)(struct plugin_conn *rpc,
+						     const char *buf, const jsmntok_t *),
+		 const enum plugin_restartability restartability,
 		 const struct plugin_command *commands,
-		 size_t num_commands, ...)
+		 size_t num_commands,
+		 const struct plugin_notification *notif_subs,
+		 size_t num_notif_subs,
+		 const struct plugin_hook *hook_subs,
+		 size_t num_hook_subs,
+		 ...)
 {
 	struct plugin_conn request_conn;
 	const tal_t *ctx = tal(NULL, char);
@@ -731,7 +798,7 @@ void plugin_main(char *argv[],
 		    membuf_tal_realloc);
 	uintmap_init(&out_reqs);
 
-	va_start(ap, num_commands);
+	va_start(ap, num_hook_subs);
 	while ((optname = va_arg(ap, const char *)) != NULL) {
 		struct plugin_option o;
 		o.name = optname;
@@ -749,7 +816,8 @@ void plugin_main(char *argv[],
 		plugin_err("Expected getmanifest not %s", cmd->methodname);
 
 	membuf_consume(&request_conn.mb, reqlen);
-	handle_getmanifest(cmd, commands, num_commands, opts);
+	handle_getmanifest(cmd, commands, num_commands, notif_subs, num_notif_subs,
+	                   hook_subs, num_hook_subs, opts, restartability);
 
 	cmd = read_json_request(tmpctx, &request_conn, &rpc_conn,
 				&params, &reqlen);
@@ -776,7 +844,8 @@ void plugin_main(char *argv[],
 		/* If we already have some input, process now. */
 		if (membuf_num_elems(&request_conn.mb) != 0) {
 			handle_new_command(ctx, &request_conn, &rpc_conn,
-					   commands, num_commands);
+					   commands, num_commands, notif_subs, num_notif_subs,
+					   hook_subs, num_hook_subs);
 			continue;
 		}
 		if (membuf_num_elems(&rpc_conn.mb) != 0) {
@@ -803,7 +872,8 @@ void plugin_main(char *argv[],
 
 		if (fds[0].revents & POLLIN)
 			handle_new_command(ctx, &request_conn, &rpc_conn,
-					   commands, num_commands);
+					   commands, num_commands, notif_subs, num_notif_subs,
+					   hook_subs, num_hook_subs);
 		if (fds[1].revents & POLLIN)
 			handle_rpc_reply(&rpc_conn);
 	}

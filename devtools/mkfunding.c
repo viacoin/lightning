@@ -1,6 +1,10 @@
 /* For example, in the spec tests we use the following keys:
  *
  * lightning/devtools/mkfunding 16835ac8c154b616baac524163f41fb0c4f82c7b972ad35d4d6f18d854f6856b 1 0.01btc 253 76edf0c303b9e692da9cb491abedef46ca5b81d32f102eb4648461b239cb0f99 0000000000000000000000000000000000000000000000000000000000000010 0000000000000000000000000000000000000000000000000000000000000020
+ *
+ * lightning/devtools/mkfunding 16835ac8c154b616baac524163f41fb0c4f82c7b972ad35d4d6f18d854f6856b 0 0.02btc 253 bc2f48a76a6b8815940accaf01981d3b6347a68fbe844f81c50ecbadf27cd179 0000000000000000000000000000000000000000000000000000000000000030 0000000000000000000000000000000000000000000000000000000000000040
+ *
+ * lightning/devtools/mkfunding 16835ac8c154b616baac524163f41fb0c4f82c7b972ad35d4d6f18d854f6856b 3 0.03btc 253 16c5027616e940d1e72b4c172557b3b799a93c0582f924441174ea556aadd01c 0000000000000000000000000000000000000000000000000000000000000050 0000000000000000000000000000000000000000000000000000000000000060
  */
 #include <bitcoin/address.h>
 #include <bitcoin/script.h>
@@ -17,7 +21,9 @@
 #include <common/utxo.h>
 #include <stdio.h>
 
-void status_fmt(enum log_level level, const char *fmt, ...)
+void status_fmt(enum log_level level,
+		const struct node_id *node_id,
+		const char *fmt, ...)
 {
 }
 
@@ -46,8 +52,10 @@ int main(int argc, char *argv[])
 	const struct utxo **utxomap;
 	struct bitcoin_signature sig;
 	struct bitcoin_txid txid;
+	u8 **witnesses;
 
 	setup_locale();
+	chainparams = chainparams_for_network("bitcoin");
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY |
 						 SECP256K1_CONTEXT_SIGN);
@@ -88,6 +96,8 @@ int main(int argc, char *argv[])
 
 	/* nVersion, input count, output count, nLocktime */
 	weight = 4 * (4 + 1 + 1 + 4);
+	/* Add segwit fields: marker + flag */
+	weight += 1 + 1;
 	/* Single output: Satoshis, script length, p2wsh. */
 	weight += 4 * (8 + 1 + BITCOIN_SCRIPTPUBKEY_P2WSH_LEN);
 	/* Single input: txid, index, scriptlen, nSequence */
@@ -106,7 +116,7 @@ int main(int argc, char *argv[])
 	utxomap[0] = &input;
 
 	/* No change output, so we don't need a bip32 base. */
-	tx = funding_tx(NULL, &outnum, utxomap, funding_amount,
+	tx = funding_tx(NULL, chainparams, &outnum, utxomap, funding_amount,
 			&funding_localkey, &funding_remotekey,
 			AMOUNT_SAT(0), NULL, NULL);
 
@@ -115,17 +125,20 @@ int main(int argc, char *argv[])
 	sign_tx_input(tx, 0, NULL, p2wpkh_scriptcode(NULL, &inputkey),
 		      &input_privkey, &inputkey,
 		      SIGHASH_ALL, &sig);
+	witnesses = bitcoin_witness_p2wpkh(NULL, &sig, &inputkey);
+	bitcoin_tx_input_set_witness(tx, 0, witnesses);
 
 	printf("# funding sig: %s\n", sig_as_hex(&sig));
+	printf("# funding witnesses: [\n");
+	for (size_t i = 0; i < tal_count(witnesses); i++)
+		printf("\t%s\n", tal_hex(NULL, witnesses[i]));
+	printf("# ]\n");
  	printf("# funding amount: %s\n",
 	       type_to_string(NULL, struct amount_sat, &funding_amount));
 
 	bitcoin_txid(tx, &txid);
  	printf("# funding txid: %s\n",
 	       type_to_string(NULL, struct bitcoin_txid, &txid));
-
-	bitcoin_tx_input_set_witness(
-		    tx, 0, bitcoin_witness_p2wpkh(NULL, &sig, &inputkey));
 
 	printf("tx: %s\n", tal_hex(NULL, linearize_tx(NULL, tx)));
 

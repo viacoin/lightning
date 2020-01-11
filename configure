@@ -34,12 +34,12 @@ default_coptflags()
 default_cwarnflags()
 {
     F=$BASE_WARNFLAGS
-    # Clang doesn't like -Wno-error=maybe-uninitialized, but doesn't seem
+    # Clang doesn't like -Wno-maybe-uninitialized, but doesn't seem
     # to give spurious warnings, either.
     if [ "$2" = 1 ]; then
 	# With old gccs, or optimization != -O3, we need to suppress some warnings.
 	if [ -n "${1##*-O3*}" ] || [ "$3" != "1" ]; then
-	    F="$F -Wno-error=maybe-uninitialized"
+	    F="$F -Wno-maybe-uninitialized"
 	fi
     fi
     echo "$F"
@@ -66,6 +66,22 @@ default_pytest()
             fi
         fi
     done
+}
+
+require()
+{
+    name="$1"
+    resolution="$2"
+    shift 2
+
+    echo -n "checking for $name... "
+    if "$@" 2>/dev/null; then
+	echo 'found'
+	return
+    fi
+    echo 'not found'
+    echo "$resolution" >&2
+    exit 1
 }
 
 default_valgrind_setting()
@@ -96,6 +112,7 @@ set_defaults()
     COPTFLAGS=${COPTFLAGS-$(default_coptflags "$DEVELOPER")}
     CONFIGURATOR_CC=${CONFIGURATOR_CC-$CC}
     VALGRIND=${VALGRIND:-$(default_valgrind_setting)}
+    TEST_NETWORK=${TEST_NETWORK:-regtest}
 }
 
 usage()
@@ -122,13 +139,13 @@ usage()
     usage_with_default "--enable/disable-developer" "$DEVELOPER" "enable" "disable"
     echo "    Developer mode, good for testing"
     usage_with_default "--enable/disable-experimental-features" "$EXPERIMENTAL_FEATURES" "enable" "disable"
-    echo "    Developer mode, good for testing"
+    echo "    Enable experimental features"
     usage_with_default "--enable/disable-compat" "$COMPAT" "enable" "disable"
     echo "    Compatibility mode, good to disable to see if your software breaks"
     usage_with_default "--enable/disable-valgrind" "(autodetect)"
-    echo "    Valgrind binary to use for tests"
+    echo "    Run tests with Valgrind"
     usage_with_default "--enable/disable-static" "$STATIC" "enable" "disable"
-    echo "    Static link binary"
+    echo "    Static link sqlite3, gmp and zlib libraries"
     usage_with_default "--enable/disable-address-sanitizer" "$ASAN" "enable" "disable"
     echo "    Compile with address-sanitizer"
     exit 1
@@ -209,8 +226,11 @@ if [ "$ASAN" = "1" ]; then
     fi
 fi
 
+# Doesn't set a var, but makes sure it exists
+require 'python3-mako' "You need the mako module for python3: see doc/INSTALL.md" python3 -c 'import mako'
+
 rm -f $CONFIG_VAR_FILE.$$
-$CONFIGURATOR --extra-tests --autotools-style --var-file=$CONFIG_VAR_FILE.$$ --header-file=$CONFIG_HEADER --configurator-cc="$CONFIGURATOR_CC" "$CC" ${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS <<EOF
+$CONFIGURATOR --extra-tests --autotools-style --var-file=$CONFIG_VAR_FILE.$$ --header-file=$CONFIG_HEADER --configurator-cc="$CONFIGURATOR_CC" "$CC" ${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS -I/usr/local/include -L/usr/local/lib <<EOF
 var=HAVE_GOOD_LIBSODIUM
 desc=libsodium with IETF chacha20 variants
 style=DEFINES_EVERYTHING|EXECUTE|MAY_NOT_COMPILE
@@ -218,9 +238,16 @@ link=-lsodium
 code=
 #include <sodium.h>
 #include <stdio.h>
+#include <string.h>
 
 int main(void)
 {
+	crypto_secretstream_xchacha20poly1305_state crypto_state;
+	unsigned char header[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
+	unsigned char data[] = { 1, 2, 3 };
+
+	crypto_secretstream_xchacha20poly1305_init_push(&crypto_state, header,
+	                                                data);
 	printf("%p\n", crypto_aead_chacha20poly1305_ietf_encrypt);
 	printf("%d\n", crypto_aead_chacha20poly1305_ietf_NPUBBYTES);
 	return 0;
@@ -237,6 +264,34 @@ code=
 int main(void)
 {
 	printf("%p\n", sqlite3_expanded_sql);
+	return 0;
+}
+/*END*/
+var=HAVE_SQLITE3
+desc=sqlite3
+style=DEFINES_EVERYTHING|EXECUTE|MAY_NOT_COMPILE
+link=-lsqlite3
+code=
+#include <sqlite3.h>
+#include <stdio.h>
+
+int main(void)
+{
+	printf("%p\n", sqlite3_prepare_v2);
+	return 0;
+}
+/*END*/
+var=HAVE_POSTGRES
+desc=postgres
+style=DEFINES_EVERYTHING|EXECUTE|MAY_NOT_COMPILE
+link=-lpq
+code=
+#include <postgresql/libpq-fe.h>
+#include <stdio.h>
+
+int main(void)
+{
+	printf("libpq version %d\n", PQlibVersion());
 	return 0;
 }
 /*END*/
@@ -258,6 +313,29 @@ code=
 #if __GNUC__ < 7
 #error "Not modern GCC"
 #endif
+/*END*/
+var=HAVE_PWRITEV
+desc=pwritev() defined
+style=DEFINES_EVERYTHING|EXECUTE|MAY_NOT_COMPILE
+code=
+#include <sys/uio.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+int main(void)
+{
+	struct iovec iov[2];
+	int fd = open("/dev/null", O_WRONLY);
+
+	iov[0].iov_base = "hello";
+	iov[0].iov_len = 5;
+	iov[1].iov_base = " world";
+	iov[1].iov_len = 6;
+	if (pwritev(fd, iov, 2, 0) == 11)
+		return 0;
+	return 1;
+}
 /*END*/
 EOF
 mv $CONFIG_VAR_FILE.$$ $CONFIG_VAR_FILE
@@ -282,6 +360,7 @@ add_var COMPAT "$COMPAT" $CONFIG_HEADER
 add_var PYTEST "$PYTEST"
 add_var STATIC "$STATIC"
 add_var ASAN "$ASAN"
+add_var TEST_NETWORK "$TEST_NETWORK"
 
 # Hack to avoid sha256 name clash with libwally: will be fixed when that
 # becomes a standalone shared lib.

@@ -1,6 +1,7 @@
 #include <bitcoin/address.h>
 #include <bitcoin/base58.h>
 #include <bitcoin/script.h>
+#include <ccan/cast/cast.h>
 #include <ccan/tal/str/str.h>
 #include <common/addr.h>
 #include <common/bech32.h>
@@ -10,6 +11,7 @@
 #include <common/key_derive.h>
 #include <common/param.h>
 #include <common/status.h>
+#include <common/utils.h>
 #include <common/utxo.h>
 #include <common/wallet_tx.h>
 #include <common/withdraw_tx.h>
@@ -29,13 +31,6 @@
 #include <wallet/wallet.h>
 #include <wally_bip32.h>
 #include <wire/wire_sync.h>
-
-struct withdrawal {
-	struct command *cmd;
-	struct wallet_tx *wtx;
-	u8 *destination;
-	const char *hextx;
-};
 
 /**
  * wallet_withdrawal_broadcast - The tx has been broadcast (or it failed)
@@ -74,33 +69,9 @@ static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind UNUSED,
 		was_pending(command_success(cmd, response));
 	} else {
 		was_pending(command_fail(cmd, LIGHTNINGD,
-					 "Error broadcasting transaction: %s",
+					 "Error broadcasting transaction: %s. Unsent tx discarded",
 					 output));
 	}
-}
-
-static struct command_result *param_bitcoin_address(struct command *cmd,
-						    const char *name,
-						    const char *buffer,
-						    const jsmntok_t *tok,
-						    const u8 **scriptpubkey)
-{
-	/* Parse address. */
-	switch (json_tok_address_scriptpubkey(cmd,
-					      get_chainparams(cmd->ld),
-					      buffer, tok,
-					      scriptpubkey)) {
-	case ADDRESS_PARSE_UNRECOGNIZED:
-		return command_fail(cmd, LIGHTNINGD,
-				    "Could not parse destination address");
-	case ADDRESS_PARSE_WRONG_NETWORK:
-		return command_fail(cmd, LIGHTNINGD,
-				    "Destination address is not on network %s",
-				    get_chainparams(cmd->ld)->network_name);
-	case ADDRESS_PARSE_SUCCESS:
-		return NULL;
-	}
-	abort();
 }
 
 /* Signs the tx, broadcasts it: broadcast calls wallet_withdrawal_broadcast */
@@ -116,7 +87,8 @@ static struct command_result *broadcast_and_wait(struct command *cmd,
 					     utx->wtx->amount,
 					     utx->wtx->change,
 					     utx->wtx->change_key_index,
-					     utx->destination,
+					     cast_const2(const struct bitcoin_tx_output **,
+							 utx->outputs),
 					     utx->wtx->utxos);
 
 	if (!wire_sync_write(cmd->ld->hsm_fd, take(msg)))
@@ -128,6 +100,7 @@ static struct command_result *broadcast_and_wait(struct command *cmd,
 	if (!fromwire_hsm_sign_withdrawal_reply(utx, msg, &signed_tx))
 		fatal("HSM gave bad sign_withdrawal_reply %s",
 		      tal_hex(tmpctx, msg));
+	signed_tx->chainparams = utx->tx->chainparams;
 
 	/* Sanity check */
 	bitcoin_txid(signed_tx, &signed_txid);
@@ -150,57 +123,278 @@ static struct command_result *broadcast_and_wait(struct command *cmd,
 
 /* Common code for withdraw and txprepare.
  *
- * Returns NULL on success, and fills in wtx, destination and
+ * Returns NULL on success, and fills in wtx, output and
  * maybe changekey (owned by cmd).  Otherwise, cmd has failed, so don't
  * access it! (It's been freed). */
 static struct command_result *json_prepare_tx(struct command *cmd,
 					      const char *buffer,
 					      const jsmntok_t *params,
-					      struct unreleased_tx **utx)
+					      struct unreleased_tx **utx,
+					      bool for_withdraw)
 {
-	u32 *feerate_per_kw;
-	struct command_result *res;
+	u32 *feerate_per_kw = NULL;
+	struct command_result *result;
 	u32 *minconf, maxheight;
 	struct pubkey *changekey;
+	struct bitcoin_tx_output **outputs;
+	const jsmntok_t *outputstok = NULL, *t;
+	const u8 *destination = NULL;
+	size_t out_len, i;
+	const struct utxo **chosen_utxos = NULL;
 
 	*utx = tal(cmd, struct unreleased_tx);
 	(*utx)->wtx = tal(*utx, struct wallet_tx);
 	wtx_init(cmd, (*utx)->wtx, AMOUNT_SAT(-1ULL));
 
-	if (!param(cmd, buffer, params,
-		   p_req("destination", param_bitcoin_address,
-			 &(*utx)->destination),
-		   p_req("satoshi", param_wtx, (*utx)->wtx),
-		   p_opt("feerate", param_feerate, &feerate_per_kw),
-		   p_opt_def("minconf", param_number, &minconf, 1),
-		   NULL))
-		return command_param_failed();
+	if (!for_withdraw) {
+		/* From v0.7.3, the new style for *txprepare* use array of outputs
+		 * to replace original 'destination' and 'satoshi' parameters.*/
+		/* For generating help, give new-style. */
+		if (!params || !deprecated_apis) {
+			if (!param(cmd, buffer, params,
+				   p_req("outputs", param_array, &outputstok),
+				   p_opt("feerate", param_feerate, &feerate_per_kw),
+				   p_opt_def("minconf", param_number, &minconf, 1),
+				   p_opt("utxos", param_utxos, &chosen_utxos),
+				   NULL))
+				return command_param_failed();
+		} else if (params->type == JSMN_ARRAY) {
+			const jsmntok_t *firsttok, *secondtok, *thirdtok, *fourthtok;
 
-	/* Destination is owned by cmd: change that to be owned by utx. */
-	tal_steal(*utx, (*utx)->destination);
+			/* FIXME: This change completely destroyes the support for `check`. */
+			if (!param(cmd, buffer, params,
+				   p_req("outputs_or_destination", param_tok, &firsttok),
+				   p_opt("feerate_or_sat", param_tok, &secondtok),
+				   p_opt("minconf_or_feerate", param_tok, &thirdtok),
+				   p_opt("utxos_or_minconf", param_tok, &fourthtok),
+				   NULL))
+				return command_param_failed();
+
+			if (firsttok->type == JSMN_ARRAY) {
+				/* New style:
+				 * *txprepare* 'outputs' ['feerate'] ['minconf'] ['utxos'] */
+
+				/* outputs (required) */
+				outputstok = firsttok;
+
+				/* feerate (optional) */
+				if (secondtok) {
+					result = param_feerate(cmd, "feerate", buffer,
+							       secondtok, &feerate_per_kw);
+					if (result)
+						return result;
+				}
+
+				/* minconf (optional) */
+				if (thirdtok) {
+					result = param_number(cmd, "minconf", buffer,
+							      thirdtok, &minconf);
+					if (result)
+						return result;
+				} else {
+					minconf = tal(cmd, u32);
+					*minconf = 1;
+				}
+
+				/* utxos (optional) */
+				if (fourthtok) {
+					result = param_utxos(cmd, "utxos", buffer,
+							     fourthtok, &chosen_utxos);
+					if (result)
+						return result;
+				}
+			} else {
+				/* Old style:
+				 * *txprepare* 'destination' 'satoshi' ['feerate'] ['minconf'] */
+
+				/* destination (required) */
+				result = param_bitcoin_address(cmd, "destination", buffer,
+							       firsttok, &destination);
+				if (result)
+					return result;
+
+				/* satoshi (required) */
+				if (!secondtok)
+					return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+							    "Need set 'satoshi' field.");
+				result = param_wtx(cmd, "satoshi", buffer,
+						   secondtok, (*utx)->wtx);
+				if (result)
+					return result;
+
+				/* feerate (optional) */
+				if (thirdtok) {
+					result = param_feerate(cmd, "feerate", buffer,
+							       thirdtok, &feerate_per_kw);
+					if (result)
+						return result;
+				}
+
+				/* minconf (optional) */
+				if (fourthtok) {
+					result = param_number(cmd, "minconf", buffer,
+							      fourthtok, &minconf);
+					if (result)
+						return result;
+				} else {
+					minconf = tal(cmd, u32);
+					*minconf = 1;
+				}
+			}
+		} else {
+			const jsmntok_t *satoshitok = NULL;
+			if (!param(cmd, buffer, params,
+				   p_opt("outputs", param_array, &outputstok),
+				   p_opt("destination", param_bitcoin_address,
+					 &destination),
+				   p_opt("satoshi", param_tok, &satoshitok),
+				   p_opt("feerate", param_feerate, &feerate_per_kw),
+				   p_opt_def("minconf", param_number, &minconf, 1),
+				   p_opt("utxos", param_utxos, &chosen_utxos),
+				   NULL))
+				/* If the parameters mixed the new style and the old style,
+				 * fail it. */
+				return command_param_failed();
+
+			if (!outputstok) {
+				if (!destination || !satoshitok)
+					return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+							    "Need set 'outputs' field.");
+
+				result = param_wtx(cmd, "satoshi", buffer,
+						   satoshitok, (*utx)->wtx);
+				if (result)
+					return result;
+			}
+		}
+	} else {
+		/* *withdraw* command still use 'destination' and 'satoshi' as parameters. */
+		if (!param(cmd, buffer, params,
+			   p_req("destination", param_bitcoin_address,
+				 &destination),
+			   p_req("satoshi", param_wtx, (*utx)->wtx),
+			   p_opt("feerate", param_feerate, &feerate_per_kw),
+			   p_opt_def("minconf", param_number, &minconf, 1),
+			   p_opt("utxos", param_utxos, &chosen_utxos),
+			   NULL))
+		return command_param_failed();
+	}
 
 	if (!feerate_per_kw) {
-		res = param_feerate_estimate(cmd, &feerate_per_kw,
-					     FEERATE_NORMAL);
-		if (res)
-			return res;
+		result = param_feerate_estimate(cmd, &feerate_per_kw,
+						FEERATE_NORMAL);
+		if (result)
+			return result;
 	}
 
 	maxheight = minconf_to_maxheight(*minconf, cmd->ld);
-	res = wtx_select_utxos((*utx)->wtx, *feerate_per_kw,
-			       tal_count((*utx)->destination), maxheight);
-	if (res)
-		return res;
+
+	/* *withdraw* command or old *txprepare* command.
+	 * Support only one output. */
+	if (destination) {
+		outputs = tal_arr(tmpctx, struct bitcoin_tx_output *, 1);
+		outputs[0] = tal(outputs, struct bitcoin_tx_output);
+		outputs[0]->script = tal_steal(outputs[0],
+					       cast_const(u8 *, destination));
+		outputs[0]->amount = (*utx)->wtx->amount;
+		out_len = tal_count(outputs[0]->script);
+
+		goto create_tx;
+	}
+
+	if (outputstok->size == 0)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Empty outputs");
+
+	outputs = tal_arr(tmpctx, struct bitcoin_tx_output *, outputstok->size);
+	out_len = 0;
+	(*utx)->wtx->all_funds = false;
+	(*utx)->wtx->amount = AMOUNT_SAT(0);
+	json_for_each_arr(i, t, outputstok) {
+		struct amount_sat *amount;
+		const u8 *destination;
+		enum address_parse_result res;
+
+		/* output format: {destination: amount} */
+		if (t->type != JSMN_OBJECT)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "The output format must be "
+					    "{destination: amount}");
+
+		res = json_to_address_scriptpubkey(cmd,
+						   chainparams,
+						   buffer, &t[1],
+						   &destination);
+		if (res == ADDRESS_PARSE_UNRECOGNIZED)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Could not parse destination address");
+		else if (res == ADDRESS_PARSE_WRONG_NETWORK)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Destination address is not on network %s",
+					    chainparams->network_name);
+
+		amount = tal(tmpctx, struct amount_sat);
+		if (!json_to_sat_or_all(buffer, &t[2], amount))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "'%.*s' is a invalid satoshi amount",
+					    t[2].end - t[2].start, buffer + t[2].start);
+
+		out_len += tal_count(destination);
+		outputs[i] = tal(outputs, struct bitcoin_tx_output);
+		outputs[i]->amount = *amount;
+		outputs[i]->script = tal_steal(outputs[i],
+					       cast_const(u8 *, destination));
+
+		/* In fact, the maximum amount of bitcoin satoshi is 2.1e15.
+		 * It can't be equal to/bigger than 2^64.
+		 * On the hand, the maximum amount of litoshi is 8.4e15,
+		 * which also can't overflow. */
+		/* This means this destination need "all" satoshi we have. */
+		if (amount_sat_eq(*amount, AMOUNT_SAT(-1ULL))) {
+			if (outputstok->size > 1)
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "outputs[%zi]: this destination wants"
+						    " all satoshi. The count of outputs"
+						    " can't be more than 1. ", i);
+			(*utx)->wtx->all_funds = true;
+			/* `AMOUNT_SAT(-1ULL)` is the max permissible for `wallet_select_all`. */
+			(*utx)->wtx->amount = *amount;
+			break;
+		}
+
+		if (!amount_sat_add(&(*utx)->wtx->amount, (*utx)->wtx->amount, *amount))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "outputs: The sum of first %zi outputs"
+					    " overflow. ", i);
+	}
+
+create_tx:
+	(*utx)->outputs = tal_steal(*utx, outputs);
+
+	if (chosen_utxos)
+		result = wtx_from_utxos((*utx)->wtx, *feerate_per_kw,
+					out_len, maxheight,
+					chosen_utxos);
+	else
+		result = wtx_select_utxos((*utx)->wtx, *feerate_per_kw,
+					  out_len, maxheight);
+
+	if (result)
+		return result;
+
+	/* Because of the max limit of AMOUNT_SAT(-1ULL),
+	 * `(*utx)->wtx->all_funds` won't change in `wtx_select_utxos()` */
+	if ((*utx)->wtx->all_funds)
+		outputs[0]->amount = (*utx)->wtx->amount;
 
 	if (!amount_sat_eq((*utx)->wtx->change, AMOUNT_SAT(0))) {
 		changekey = tal(tmpctx, struct pubkey);
 		if (!bip32_pubkey(cmd->ld->wallet->bip32_base, changekey,
 				  (*utx)->wtx->change_key_index))
 			return command_fail(cmd, LIGHTNINGD, "Keys generation failure");
-	}
-
-	(*utx)->tx = withdraw_tx(*utx, (*utx)->wtx->utxos,
-				 (*utx)->destination, (*utx)->wtx->amount,
+	} else
+		changekey = NULL;
+	(*utx)->tx = withdraw_tx(*utx, chainparams,
+				 (*utx)->wtx->utxos, (*utx)->outputs,
 				 changekey, (*utx)->wtx->change,
 				 cmd->ld->wallet->bip32_base,
 				 &(*utx)->change_outnum);
@@ -218,7 +412,7 @@ static struct command_result *json_txprepare(struct command *cmd,
 	struct command_result *res;
 	struct json_stream *response;
 
-	res = json_prepare_tx(cmd, buffer, params, &utx);
+	res = json_prepare_tx(cmd, buffer, params, &utx, false);
 	if (res)
 		return res;
 
@@ -282,6 +476,10 @@ static struct command_result *json_txsend(struct command *cmd,
 	/* We're the owning cmd now. */
 	utx->wtx->cmd = cmd;
 
+	wallet_transaction_add(cmd->ld->wallet, utx->tx, 0, 0);
+	wallet_transaction_annotate(cmd->ld->wallet, &utx->txid,
+				    TX_UNKNOWN, 0);
+
 	return broadcast_and_wait(cmd, utx);
 }
 
@@ -339,16 +537,14 @@ static struct command_result *json_withdraw(struct command *cmd,
 {
 	struct unreleased_tx *utx;
 	struct command_result *res;
-	struct bitcoin_txid txid;
 
-	res = json_prepare_tx(cmd, buffer, params, &utx);
+	res = json_prepare_tx(cmd, buffer, params, &utx, true);
 	if (res)
 		return res;
 
 	/* Store the transaction in the DB and annotate it as a withdrawal */
-	bitcoin_txid(utx->tx, &txid);
 	wallet_transaction_add(cmd->ld->wallet, utx->tx, 0, 0);
-	wallet_transaction_annotate(cmd->ld->wallet, &txid,
+	wallet_transaction_annotate(cmd->ld->wallet, &utx->txid,
 				    TX_WALLET_WITHDRAWAL, 0);
 
 	return broadcast_and_wait(cmd, utx);
@@ -391,10 +587,10 @@ encode_pubkey_to_addr(const tal_t *ctx,
 		sha256(&h, redeemscript, tal_count(redeemscript));
 		ripemd160(&h160, h.u.u8, sizeof(h));
 		out = p2sh_to_base58(ctx,
-				     get_chainparams(ld),
+				     chainparams,
 				     &h160);
 	} else {
-		hrp = get_chainparams(ld)->bip173_name;
+		hrp = chainparams->bip173_name;
 
 		/* out buffer is 73 + strlen(human readable part),
 		 * see common/bech32.h*/
@@ -530,7 +726,7 @@ static struct command_result *json_listaddrs(struct command *cmd,
 
 	for (s64 keyidx = 0; keyidx <= *bip32_max_index; keyidx++) {
 
-		if(keyidx == BIP32_INITIAL_HARDENED_CHILD){
+		if (keyidx == BIP32_INITIAL_HARDENED_CHILD){
 			break;
 		}
 
@@ -619,7 +815,7 @@ static struct command_result *json_listfunds(struct command *cmd,
 		        json_add_string(response, "address", out);
 		} else if (utxos[i]->scriptPubkey != NULL) {
 			out = encode_scriptpubkey_to_addr(
-			    cmd, get_chainparams(cmd->ld)->bip173_name,
+			    cmd, chainparams,
 			    utxos[i]->scriptPubkey);
 			if (out)
 				json_add_string(response, "address", out);
@@ -627,9 +823,10 @@ static struct command_result *json_listfunds(struct command *cmd,
 
 		if (utxos[i]->spendheight)
 			json_add_string(response, "status", "spent");
-		else if (utxos[i]->blockheight)
+		else if (utxos[i]->blockheight) {
 			json_add_string(response, "status", "confirmed");
-		else
+			json_add_num(response, "blockheight", *utxos[i]->blockheight);
+		} else
 			json_add_string(response, "status", "unconfirmed");
 
 		json_object_end(response);
@@ -643,6 +840,11 @@ static struct command_result *json_listfunds(struct command *cmd,
 		list_for_each(&p->channels, c, list) {
 			json_object_start(response, NULL);
 			json_add_node_id(response, "peer_id", &p->id);
+			/* Mirrors logic in listpeers */
+			json_add_bool(response, "connected",
+				      channel_active(c) && c->connected);
+			json_add_string(response, "state",
+					channel_state_name(c));
 			if (c->scid)
 				json_add_short_channel_id(response,
 							  "short_channel_id",
@@ -753,7 +955,6 @@ static const struct json_command dev_rescan_output_command = {
 };
 AUTODATA(json_command, &dev_rescan_output_command);
 
-#if EXPERIMENTAL_FEATURES
 struct {
 	enum wallet_tx_type t;
 	const char *name;
@@ -772,14 +973,98 @@ struct {
     {0, NULL}
 };
 
+#if EXPERIMENTAL_FEATURES
+static const char *txtype_to_string(enum wallet_tx_type t)
+{
+	for (size_t i = 0; wallet_tx_type_display_names[i].name != NULL; i++)
+		if (t == wallet_tx_type_display_names[i].t)
+			return wallet_tx_type_display_names[i].name;
+	return NULL;
+}
+
 static void json_add_txtypes(struct json_stream *result, const char *fieldname, enum wallet_tx_type value)
 {
 	json_array_start(result, fieldname);
-	for (size_t i=0; wallet_tx_type_display_names[i].name != NULL; i++) {
+	for (size_t i = 0; wallet_tx_type_display_names[i].name != NULL; i++) {
 		if (value & wallet_tx_type_display_names[i].t)
 			json_add_string(result, NULL, wallet_tx_type_display_names[i].name);
 	}
 	json_array_end(result);
+}
+#endif
+static void json_transaction_details(struct json_stream *response,
+				     const struct wallet_transaction *tx)
+{
+	struct wally_tx *wtx = tx->tx->wtx;
+
+		json_object_start(response, NULL);
+		json_add_txid(response, "hash", &tx->id);
+		json_add_hex_talarr(response, "rawtx", tx->rawtx);
+		json_add_u64(response, "blockheight", tx->blockheight);
+		json_add_num(response, "txindex", tx->txindex);
+#if EXPERIMENTAL_FEATURES
+		if (tx->annotation.type != 0)
+			json_add_txtypes(response, "type", tx->annotation.type);
+
+		if (tx->annotation.channel.u64 != 0)
+			json_add_short_channel_id(response, "channel", &tx->annotation.channel);
+#endif
+		json_add_u32(response, "locktime", wtx->locktime);
+		json_add_u32(response, "version", wtx->version);
+
+		json_array_start(response, "inputs");
+		for (size_t i = 0; i < wtx->num_inputs; i++) {
+			struct wally_tx_input *in = &wtx->inputs[i];
+			json_object_start(response, NULL);
+			json_add_hex(response, "txid", in->txhash, sizeof(in->txhash));
+			json_add_u32(response, "index", in->index);
+			json_add_u32(response, "sequence", in->sequence);
+#if EXPERIMENTAL_FEATURES
+			struct tx_annotation *ann = &tx->output_annotations[i];
+			const char *txtype = txtype_to_string(ann->type);
+			if (txtype != NULL)
+				json_add_string(response, "type", txtype);
+			if (ann->channel.u64 != 0)
+				json_add_short_channel_id(response, "channel", &ann->channel);
+#endif
+
+			json_object_end(response);
+		}
+		json_array_end(response);
+
+		json_array_start(response, "outputs");
+		for (size_t i = 0; i < wtx->num_outputs; i++) {
+			struct wally_tx_output *out = &wtx->outputs[i];
+			struct amount_asset amt = bitcoin_tx_output_get_amount(tx->tx, i);
+			struct amount_sat sat;
+
+			/* TODO We should eventually handle non-bitcoin assets as well. */
+			if (amount_asset_is_main(&amt))
+				sat = amount_asset_to_sat(&amt);
+			else
+				sat = AMOUNT_SAT(0);
+
+			json_object_start(response, NULL);
+
+			json_add_u32(response, "index", i);
+			json_add_amount_sat_only(response, "satoshis", sat);
+
+#if EXPERIMENTAL_FEATURES
+			struct tx_annotation *ann = &tx->output_annotations[i];
+			const char *txtype = txtype_to_string(ann->type);
+			if (txtype != NULL)
+				json_add_string(response, "type", txtype);
+
+			if (ann->channel.u64 != 0)
+				json_add_short_channel_id(response, "channel", &ann->channel);
+#endif
+			json_add_hex(response, "scriptPubKey", out->script, out->script_len);
+
+			json_object_end(response);
+		}
+		json_array_end(response);
+
+		json_object_end(response);
 }
 
 static struct command_result *json_listtransactions(struct command *cmd,
@@ -797,20 +1082,9 @@ static struct command_result *json_listtransactions(struct command *cmd,
 
 	response = json_stream_success(cmd);
 	json_array_start(response, "transactions");
-	for (size_t i=0; i<tal_count(txs); i++) {
-		json_object_start(response, NULL);
-		json_add_txid(response, "hash", &txs[i].id);
-		json_add_hex_talarr(response, "rawtx", txs[i].rawtx);
-		json_add_u64(response, "blockheight", txs[i].blockheight);
-		json_add_num(response, "txindex", txs[i].txindex);
-		json_add_txtypes(response, "type", txs[i].type);
-		if (txs[i].channel_id != 0) {
-			json_add_num(response, "channel_id", txs[i].channel_id);
-		} else {
-			json_add_null(response, "channel_id");
-		}
-		json_object_end(response);
-	}
+	for (size_t i = 0; i < tal_count(txs); i++)
+		json_transaction_details(response, &txs[i]);
+
 	json_array_end(response);
 	return command_success(cmd, response);
 }
@@ -827,4 +1101,3 @@ static const struct json_command listtransactions_command = {
     "it closes the channel and returns funds to the wallet."
 };
 AUTODATA(json_command, &listtransactions_command);
-#endif

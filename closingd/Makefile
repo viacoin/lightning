@@ -44,6 +44,7 @@ $(LIGHTNINGD_CLOSING_OBJS): $(LIGHTNINGD_HEADERS)
 CLOSINGD_COMMON_OBJS :=				\
 	common/amount.o				\
 	common/base32.o				\
+	common/bigsize.o			\
 	common/bip32.o				\
 	common/close_tx.o			\
 	common/crypto_state.o			\
@@ -56,6 +57,7 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/features.o			\
 	common/gen_peer_status_wire.o		\
 	common/gen_status_wire.o		\
+	common/gossip_rcvd_filter.o		\
 	common/gossip_store.o			\
 	common/htlc_wire.o			\
 	common/key_derive.o			\
@@ -65,6 +67,7 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/peer_failed.o			\
 	common/per_peer_state.o			\
 	common/permute_tx.o			\
+	common/pseudorand.o			\
 	common/read_peer_msg.o			\
 	common/socket_close.o			\
 	common/status.o				\

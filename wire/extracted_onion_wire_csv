@@ -1,4 +1,13 @@
 #include <wire/onion_defs.h>
+tlvtype,tlv_payload,amt_to_forward,2
+tlvdata,tlv_payload,amt_to_forward,amt_to_forward,tu64,
+tlvtype,tlv_payload,outgoing_cltv_value,4
+tlvdata,tlv_payload,outgoing_cltv_value,outgoing_cltv_value,tu32,
+tlvtype,tlv_payload,short_channel_id,6
+tlvdata,tlv_payload,short_channel_id,short_channel_id,short_channel_id,
+tlvtype,tlv_payload,payment_data,8
+tlvdata,tlv_payload,payment_data,payment_secret,byte,32
+tlvdata,tlv_payload,payment_data,total_msat,tu64,
 msgtype,invalid_realm,PERM|1
 msgtype,temporary_node_failure,NODE|2
 msgtype,permanent_node_failure,PERM|NODE|2
@@ -32,10 +41,14 @@ msgdata,expiry_too_soon,len,u16,
 msgdata,expiry_too_soon,channel_update,byte,len
 msgtype,incorrect_or_unknown_payment_details,PERM|15
 msgdata,incorrect_or_unknown_payment_details,htlc_msat,u64,
-msgtype,final_expiry_too_soon,17
+msgdata,incorrect_or_unknown_payment_details,height,u32,
 msgtype,final_incorrect_cltv_expiry,18
 msgdata,final_incorrect_cltv_expiry,cltv_expiry,u32,
 msgtype,final_incorrect_htlc_amount,19
 msgdata,final_incorrect_htlc_amount,incoming_htlc_amt,u64,
 msgtype,channel_disabled,UPDATE|20
 msgtype,expiry_too_far,21
+msgtype,invalid_onion_payload,PERM|22
+msgdata,invalid_onion_payload,type,varint,
+msgdata,invalid_onion_payload,offset,u16,
+msgtype,mpp_timeout,23

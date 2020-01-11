@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <bitcoin/script.h>
 #include <common/key_derive.h>
 #include <common/utils.h>
@@ -19,7 +20,9 @@ void towire_utxo(u8 **pptr, const struct utxo *utxo)
 	if (is_unilateral_close) {
 		towire_u64(pptr, utxo->close_info->channel_id);
 		towire_node_id(pptr, &utxo->close_info->peer_id);
-		towire_pubkey(pptr, &utxo->close_info->commitment_point);
+		towire_bool(pptr, utxo->close_info->commitment_point != NULL);
+		if (utxo->close_info->commitment_point)
+			towire_pubkey(pptr, utxo->close_info->commitment_point);
 	}
 }
 
@@ -41,7 +44,13 @@ struct utxo *fromwire_utxo(const tal_t *ctx, const u8 **ptr, size_t *max)
 		utxo->close_info = tal(utxo, struct unilateral_close_info);
 		utxo->close_info->channel_id = fromwire_u64(ptr, max);
 		fromwire_node_id(ptr, max, &utxo->close_info->peer_id);
-		fromwire_pubkey(ptr, max, &utxo->close_info->commitment_point);
+		if (fromwire_bool(ptr, max)) {
+			utxo->close_info->commitment_point = tal(utxo,
+								 struct pubkey);
+			fromwire_pubkey(ptr, max,
+					utxo->close_info->commitment_point);
+		} else
+			utxo->close_info->commitment_point = NULL;
 	} else {
 		utxo->close_info = NULL;
 	}
@@ -49,14 +58,18 @@ struct utxo *fromwire_utxo(const tal_t *ctx, const u8 **ptr, size_t *max)
 }
 
 struct bitcoin_tx *tx_spending_utxos(const tal_t *ctx,
+				     const struct chainparams *chainparams,
 				     const struct utxo **utxos,
 				     const struct ext_key *bip32_base,
-				     bool add_change_output)
+				     bool add_change_output,
+				     size_t num_output)
 {
 	struct pubkey key;
 	u8 *script;
-	size_t outcount = add_change_output ? 2 : 1;
-	struct bitcoin_tx *tx = bitcoin_tx(ctx, tal_count(utxos), outcount);
+
+	assert(num_output);
+	size_t outcount = add_change_output ? 1 + num_output : num_output;
+	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, tal_count(utxos), outcount);
 
 	for (size_t i = 0; i < tal_count(utxos); i++) {
 		if (utxos[i]->is_p2sh && bip32_base) {
@@ -68,7 +81,7 @@ struct bitcoin_tx *tx_spending_utxos(const tal_t *ctx,
 
 		bitcoin_tx_add_input(tx, &utxos[i]->txid, utxos[i]->outnum,
 				     BITCOIN_TX_DEFAULT_SEQUENCE,
-		 		     &utxos[i]->amount, script);
+		 		     utxos[i]->amount, script);
 	}
 
 	return tx;

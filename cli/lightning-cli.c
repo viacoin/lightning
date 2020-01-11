@@ -9,6 +9,7 @@
 #include <ccan/opt/opt.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/str/str.h>
+#include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/configdir.h>
 #include <common/json.h>
@@ -28,25 +29,6 @@
 #define ERROR_FROM_LIGHTNINGD 1
 #define ERROR_TALKING_TO_LIGHTNINGD 2
 #define ERROR_USAGE 3
-
-/* Tal wrappers for opt. */
-static void *opt_allocfn(size_t size)
-{
-	return tal_arr_label(NULL, char, size, TAL_LABEL("opt_allocfn", ""));
-}
-
-static void *tal_reallocfn(void *ptr, size_t size)
-{
-	if (!ptr)
-		return opt_allocfn(size);
-	tal_resize_(&ptr, 1, size, false);
-	return ptr;
-}
-
-static void tal_freefn(void *ptr)
-{
-	tal_free(ptr);
-}
 
 struct netaddr;
 
@@ -152,7 +134,8 @@ same_category:
 			   buffer);
 }
 
-static void human_help(char *buffer, const jsmntok_t *result, bool has_command) {
+static void human_help(char *buffer, const jsmntok_t *result)
+{
 	unsigned int i;
 	/* `curr` is used as a temporary token */
 	const jsmntok_t *curr;
@@ -182,8 +165,7 @@ static void human_help(char *buffer, const jsmntok_t *result, bool has_command) 
 		category = json_get_member(buffer, help[i], "category");
 		if (category && !json_tok_streq(buffer, category, prev_cat)) {
 			prev_cat = json_strdup(help, buffer, category);
-			if (!has_command)
-				printf("=== %s ===\n\n", prev_cat);
+			printf("=== %s ===\n\n", prev_cat);
 		}
 
 		command = json_get_member(buffer, help[i], "command");
@@ -195,13 +177,13 @@ static void human_help(char *buffer, const jsmntok_t *result, bool has_command) 
 	}
 	tal_free(help);
 
-	if (!has_command)
-		printf("---\nrun `lightning-cli help <command>` for more information on a specific command\n");
+	printf("---\nrun `lightning-cli help <command>` for more information on a specific command\n");
 }
 
 enum format {
 	JSON,
 	HUMAN,
+	HELPLIST,
 	DEFAULT_FORMAT,
 	RAW
 };
@@ -337,7 +319,7 @@ static void print_json(const char *str, const jsmntok_t *tok, const char *indent
 			else
 				printf(",\n%s", next_indent);
 			print_json(str, t, next_indent);
-			printf(" : ");
+			printf(": ");
 			print_json(str, t + 1, next_indent);
 			first = false;
 		}
@@ -369,7 +351,7 @@ static size_t read_nofail(int fd, void *buf, size_t len)
 
 /* We rely on the fact that lightningd terminates all JSON RPC responses with
  * "\n\n", so we can stream even if we can't parse. */
-static void oom_dump(int fd, char *resp, size_t resp_len, size_t off)
+static void oom_dump(int fd, char *resp, size_t off)
 {
 	warnx("Out of memory: sending raw output");
 
@@ -378,11 +360,64 @@ static void oom_dump(int fd, char *resp, size_t resp_len, size_t off)
 		/* Keep last char, to avoid splitting \n\n */
 		write_all(STDOUT_FILENO, resp, off-1);
 		resp[0] = resp[off-1];
-		off = 1 + read_nofail(fd, resp + 1, resp_len - 1);
+		off = 1 + read_nofail(fd, resp + 1, tal_bytelen(resp) - 1);
 	} while (resp[off-2] != '\n' || resp[off-1] != '\n');
 	write_all(STDOUT_FILENO, resp, off-1);
 	/* We assume giant answer means "success" */
 	exit(0);
+}
+
+/* We want to return failure if tal_resize fails */
+static void tal_error(const char *msg)
+{
+	if (streq(msg, "Reallocation failure"))
+		return;
+	abort();
+}
+
+static enum format delete_format_hint(const char *resp,
+				      jsmntok_t **toks,
+				      jsmntok_t *result)
+{
+	const jsmntok_t *hint;
+	enum format format = JSON;
+
+	hint = json_get_member(resp, result, "format-hint");
+	if (!hint)
+		return format;
+
+	if (json_tok_streq(resp, hint, "simple"))
+		format = HUMAN;
+
+	/* Don't let hint appear in the output! */
+	json_tok_remove(toks, result, hint-1, 1);
+	return format;
+}
+
+static enum format choose_format(const char *resp,
+				 jsmntok_t **toks,
+				 const char *method,
+				 const char *command,
+				 enum format format)
+{
+	/* If they specify a format, that's what we use. */
+	if (format != DEFAULT_FORMAT)
+		return format;
+
+	/* This works best when we order it. */
+	if (streq(method, "help") && command == NULL)
+		format = HELPLIST;
+	else {
+		const jsmntok_t *result = json_get_member(resp, *toks, "result");
+		if (result)
+			/* Use offset of result to get non-const ptr */
+			format = delete_format_hint(resp, toks,
+						    /* const-washing */
+						    *toks + (result - *toks));
+		else
+			format = JSON;
+	}
+	return format;
 }
 
 int main(int argc, char *argv[])
@@ -392,24 +427,28 @@ int main(int argc, char *argv[])
 	int fd, i;
 	size_t off;
 	const char *method;
-	char *cmd, *resp, *idstr, *rpc_filename;
+	char *cmd, *resp, *idstr;
 	struct sockaddr_un addr;
 	jsmntok_t *toks;
 	const jsmntok_t *result, *error, *id;
-	char *lightning_dir;
 	const tal_t *ctx = tal(NULL, char);
+	char *config_filename, *lightning_dir, *net_dir, *rpc_filename;
 	jsmn_parser parser;
 	int parserr;
 	enum format format = DEFAULT_FORMAT;
 	enum input input = DEFAULT_INPUT;
 	char *command = NULL;
-	size_t resp_len, num_toks;
 
 	err_set_progname(argv[0]);
 	jsmn_init(&parser);
 
-	opt_set_alloc(opt_allocfn, tal_reallocfn, tal_freefn);
-	configdir_register_opts(ctx, &lightning_dir, &rpc_filename);
+	tal_set_backend(NULL, NULL, NULL, tal_error);
+
+	setup_option_allocators();
+
+	initial_config_opts(ctx, argc, argv,
+			    &config_filename, &lightning_dir, &net_dir,
+			    &rpc_filename);
 
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "<command> [<params>...]", "Show this message. Use the command help (without hyphens -- \"lightning-cli help\") to get a list of all RPC commands");
@@ -438,16 +477,9 @@ int main(int argc, char *argv[])
 		method = "help";
 	}
 
-	if (format == DEFAULT_FORMAT) {
-		if (streq(method, "help"))
-			format = HUMAN;
-		else
-			format = JSON;
-	}
-
 	/* Launch a manpage if we have a help command with an argument. We do
 	 * not need to have lightningd running in this case. */
-	if (streq(method, "help") && format == HUMAN && argc >= 3) {
+	if (streq(method, "help") && format == DEFAULT_FORMAT && argc >= 3) {
 		command = argv[2];
 		char *page = tal_fmt(ctx, "lightning-%s", command);
 
@@ -461,9 +493,16 @@ int main(int argc, char *argv[])
 		tal_free(page);
 	}
 
-	if (chdir(lightning_dir) != 0)
+	/* If an absolute path to the RPC socket is given, it takes over other
+	 * configuration options. */
+	if (path_is_abs(rpc_filename)) {
+		net_dir = path_dirname(ctx, rpc_filename);
+		rpc_filename = path_basename(ctx, rpc_filename);
+	}
+
+	if (chdir(net_dir) != 0)
 		err(ERROR_TALKING_TO_LIGHTNINGD, "Moving into '%s'",
-		    lightning_dir);
+		    net_dir);
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (strlen(rpc_filename) + 1 > sizeof(addr.sun_path))
@@ -514,17 +553,15 @@ int main(int argc, char *argv[])
 		err(ERROR_TALKING_TO_LIGHTNINGD, "Writing command");
 
 	/* Start with 1000 characters, 100 tokens. */
-	resp_len = 1000;
-	resp = malloc(resp_len);
-	num_toks = 100;
-	toks = malloc(sizeof(jsmntok_t) * num_toks);
+	resp = tal_arr(ctx, char, 1000);
+	toks = tal_arr(ctx, jsmntok_t, 100);
 
 	off = 0;
 	parserr = 0;
 	while (parserr <= 0) {
 		/* Read more if parser says, or we have 0 tokens. */
 		if (parserr == 0 || parserr == JSMN_ERROR_PART) {
-			ssize_t i = read(fd, resp + off, resp_len - 1 - off);
+			ssize_t i = read(fd, resp + off, tal_bytelen(resp) - 1 - off);
 			if (i == 0)
 				errx(ERROR_TALKING_TO_LIGHTNINGD,
 				     "reading response: socket closed");
@@ -537,7 +574,7 @@ int main(int argc, char *argv[])
 		}
 
 		/* (Continue) parsing */
-		parserr = jsmn_parse(&parser, resp, off, toks, num_toks);
+		parserr = jsmn_parse(&parser, resp, off, toks, tal_count(toks));
 
 		switch (parserr) {
 		case JSMN_ERROR_INVAL:
@@ -545,23 +582,15 @@ int main(int argc, char *argv[])
 			     "Malformed response '%s'", resp);
 		case JSMN_ERROR_NOMEM: {
 			/* Need more tokens, double it */
-			jsmntok_t *newtoks = realloc(toks,
-						     sizeof(jsmntok_t)
-						     * num_toks * 2);
-			if (!newtoks)
-				oom_dump(fd, resp, resp_len, off);
-			toks = newtoks;
-			num_toks *= 2;
+			if (!tal_resize(&toks, tal_count(toks) * 2))
+				oom_dump(fd, resp, off);
 			break;
 		}
 		case JSMN_ERROR_PART:
 			/* Need more data: make room if necessary */
-			if (off == resp_len - 1) {
-				char *newresp = realloc(resp, resp_len * 2);
-				if (!newresp)
-					oom_dump(fd, resp, resp_len, off);
-				resp = newresp;
-				resp_len *= 2;
+			if (off == tal_bytelen(resp) - 1) {
+				if (!tal_resize(&resp, tal_count(resp) * 2))
+					oom_dump(fd, resp, off);
 			}
 			break;
 		}
@@ -571,6 +600,8 @@ int main(int argc, char *argv[])
 		errx(ERROR_TALKING_TO_LIGHTNINGD,
 		     "Non-object response '%s'", resp);
 
+	/* This can rellocate toks, so call before getting pointers to tokens */
+	format = choose_format(resp, &toks, method, command, format);
 	result = json_get_member(resp, toks, "result");
 	error = json_get_member(resp, toks, "error");
 	if (!error && !result)
@@ -586,26 +617,27 @@ int main(int argc, char *argv[])
 		     json_tok_full_len(id), json_tok_full(resp, id));
 
 	if (!error || json_tok_is_null(resp, error)) {
-		// if we have specific help command
-		if (format == HUMAN)
-			if (streq(method, "help") && command == NULL)
-				human_help(resp, result, false);
-			else
-				human_readable(resp, result, '\n');
-		else if (format == RAW)
+		switch (format) {
+		case HELPLIST:
+			human_help(resp, result);
+			break;
+		case HUMAN:
+			human_readable(resp, result, '\n');
+			break;
+		case JSON:
+			print_json(resp, result, "");
+			printf("\n");
+			break;
+		case RAW:
 			printf("%.*s\n",
 			       json_tok_full_len(result),
 			       json_tok_full(resp, result));
-		else {
-			print_json(resp, result, "");
-			printf("\n");
+			break;
+		default:
+			abort();
 		}
-		tal_free(lightning_dir);
-		tal_free(rpc_filename);
 		tal_free(ctx);
 		opt_free_table();
-		free(resp);
-		free(toks);
 		return 0;
 	}
 
@@ -616,11 +648,7 @@ int main(int argc, char *argv[])
 		print_json(resp, error, "");
 		printf("\n");
 	}
-	tal_free(lightning_dir);
-	tal_free(rpc_filename);
 	tal_free(ctx);
 	opt_free_table();
-	free(resp);
-	free(toks);
 	return 1;
 }

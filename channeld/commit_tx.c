@@ -45,7 +45,7 @@ static void add_offered_htlc_out(struct bitcoin_tx *tx, size_t n,
 	ripemd160(&ripemd, htlc->rhash.u.u8, sizeof(htlc->rhash.u.u8));
 	wscript = htlc_offered_wscript(tx, &ripemd, keyset);
 	p2wsh = scriptpubkey_p2wsh(tx, wscript);
-	bitcoin_tx_add_output(tx, p2wsh, &amount);
+	bitcoin_tx_add_output(tx, p2wsh, amount);
 	SUPERVERBOSE("# HTLC %" PRIu64 " offered %s wscript %s\n", htlc->id,
 		     type_to_string(tmpctx, struct amount_sat, &amount),
 		     tal_hex(wscript, wscript));
@@ -65,7 +65,7 @@ static void add_received_htlc_out(struct bitcoin_tx *tx, size_t n,
 	p2wsh = scriptpubkey_p2wsh(tx, wscript);
 	amount = amount_msat_to_sat_round_down(htlc->amount);
 
-	bitcoin_tx_add_output(tx, p2wsh, &amount);
+	bitcoin_tx_add_output(tx, p2wsh, amount);
 
 	SUPERVERBOSE("# HTLC %"PRIu64" received %s wscript %s\n",
 		     htlc->id,
@@ -146,7 +146,7 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 #endif
 
 	/* Worst-case sizing: both to-local and to-remote outputs. */
-	tx = bitcoin_tx(ctx, 1, untrimmed + 2);
+	tx = bitcoin_tx(ctx, chainparams, 1, untrimmed + 2);
 
 	/* We keep track of which outputs have which HTLCs */
 	*htlcmap = tal_arr(tx, const struct htlc *, tx->wtx->outputs_allocation_len);
@@ -202,7 +202,7 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 		u8 *p2wsh = scriptpubkey_p2wsh(tx, wscript);
 		struct amount_sat amount = amount_msat_to_sat_round_down(self_pay);
 
-		bitcoin_tx_add_output(tx, p2wsh, &amount);
+		bitcoin_tx_add_output(tx, p2wsh, amount);
 		(*htlcmap)[n] = NULL;
 		/* We don't assign cltvs[n]: if we use it, order doesn't matter.
 		 * However, valgrind will warn us something wierd is happening */
@@ -229,7 +229,7 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 		 * This output sends funds to the other peer and thus is a simple
 		 * P2WPKH to `remotepubkey`.
 		 */
-		int pos = bitcoin_tx_add_output(tx, p2wpkh, &amount);
+		int pos = bitcoin_tx_add_output(tx, p2wpkh, amount);
 		assert(pos == n);
 		(*htlcmap)[n] = NULL;
 		/* We don't assign cltvs[n]: if we use it, order doesn't matter.
@@ -286,7 +286,9 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 	 *    * `txin[0]` sequence: upper 8 bits are 0x80, lower 24 bits are upper 24 bits of the obscured commitment number
 	 */
 	u32 sequence = (0x80000000 | ((obscured_commitment_number>>24) & 0xFFFFFF));
-	bitcoin_tx_add_input(tx, funding_txid, funding_txout, sequence, &funding, NULL);
+	bitcoin_tx_add_input(tx, funding_txid, funding_txout, sequence, funding, NULL);
+
+	elements_tx_add_fee_output(tx);
 
 	return tx;
 }

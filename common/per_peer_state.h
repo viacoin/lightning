@@ -20,10 +20,8 @@ struct per_peer_state {
 	struct crypto_state cs;
 	/* NULL if it's not initialized yet */
 	struct gossip_state *gs;
-#if DEVELOPER
-	/* Normally 60000, but adjustable for dev mode */
-	u32 dev_gossip_broadcast_msec;
-#endif /* DEVELOPER */
+	/* Cache of msgs we have received, to avoid re-xmitting from store */
+	struct gossip_rcvd_filter *grf;
 	/* If not -1, closed on freeing */
 	int peer_fd, gossip_fd, gossip_store_fd;
 };
@@ -58,4 +56,8 @@ bool time_to_next_gossip(const struct per_peer_state *pps,
 
 /* Reset pps->next_gossip now we've drained gossip_store */
 void per_peer_state_reset_gossip_timer(struct per_peer_state *pps);
+
+/* Used to speed up gossip iff DEVELOPER*/
+extern bool dev_fast_gossip;
+
 #endif /* LIGHTNING_COMMON_PER_PEER_STATE_H */

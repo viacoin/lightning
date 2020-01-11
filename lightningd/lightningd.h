@@ -7,6 +7,7 @@
 #include <ccan/time/time.h>
 #include <ccan/timer/timer.h>
 #include <lightningd/htlc_end.h>
+#include <lightningd/htlc_set.h>
 #include <lightningd/plugin.h>
 #include <stdio.h>
 #include <wallet/txfilter.h>
@@ -42,14 +43,11 @@ struct config {
 	u32 fee_base;
 	u32 fee_per_satoshi;
 
+	/* htlcs per channel */
+	u32 max_concurrent_htlcs;
+
 	/* How long between changing commit and sending COMMIT message. */
 	u32 commit_time_ms;
-
-	/* How often to broadcast gossip (msec) */
-	u32 broadcast_interval_msec;
-
-	/* Channel update interval */
-	u32 channel_update_interval;
 
 	/* Do we let the funder set any fee rate they want */
 	bool ignore_fee_limits;
@@ -70,19 +68,26 @@ struct config {
 
 	/* Minimal amount of effective funding_satoshis for accepting channels */
 	u64 min_capacity_sat;
+
+	/* Allow to define the default behavior of tor services calls*/
+	bool use_v3_autotor;
+
+	/* This is the key we use to encrypt `hsm_secret`. */
+	struct secret *keypass;
 };
 
 struct lightningd {
 	/* The directory to find all the subdaemons. */
 	const char *daemon_dir;
 
-	/* Are we told to run in the background. */
-	bool daemon;
+	/* If we told to run in the background, this is our parent fd, otherwise
+	 * -1. */
+	int daemon_parent_fd;
 
 	int pid_fd;
 
-	/* Our config dir, and rpc file */
-	char *config_dir;
+	/* Our config basedir, network directory, and rpc file */
+	char *config_basedir, *config_netdir;
 
 	/* Location of the RPC socket. */
 	char *rpc_filename;
@@ -158,6 +163,9 @@ struct lightningd {
 	struct htlc_in_map htlcs_in;
 	struct htlc_out_map htlcs_out;
 
+	/* Sets of HTLCs we are holding onto for MPP. */
+	struct htlc_set_map htlc_sets;
+
 	struct wallet *wallet;
 
 	/* Outstanding waitsendpay commands. */
@@ -203,6 +211,10 @@ struct lightningd {
 	/* Timestamp to use for gossipd, iff non-zero */
 	u32 dev_gossip_time;
 
+	/* Speedup gossip propagation, for testing. */
+	bool dev_fast_gossip;
+	bool dev_fast_gossip_prune;
+
 	/* Things we've marked as not leaking. */
 	const void **notleaks;
 
@@ -215,6 +227,12 @@ struct lightningd {
 	/* These are the forced channel secrets for the node. */
 	struct secrets *dev_force_channel_secrets;
 	struct sha256 *dev_force_channel_secrets_shaseed;
+
+	struct channel_id *dev_force_tmp_channel_id;
+
+	/* For slow tests (eg protocol tests) don't die if HTLC not
+	 * committed in 30 secs */
+	bool dev_no_htlc_timeout;
 #endif /* DEVELOPER */
 
 	/* tor support */
@@ -223,14 +241,21 @@ struct lightningd {
 	char *tor_service_password;
 	bool pure_tor_setup;
 
+	/* Original directory for deprecated plugin-relative-to-cwd */
+	const char *original_directory;
+
 	struct plugins *plugins;
+
+	char *wallet_dsn;
+
+	bool encrypted_hsm;
+
+	mode_t initial_umask;
 };
 
 /* Turning this on allows a tal allocation to return NULL, rather than aborting.
  * Use only on carefully tested code! */
 extern bool tal_oom_ok;
-
-const struct chainparams *get_chainparams(const struct lightningd *ld);
 
 /* Check we can run subdaemons, and check their versions */
 void test_subdaemons(const struct lightningd *ld);

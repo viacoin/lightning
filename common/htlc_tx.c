@@ -5,6 +5,7 @@
 #include <common/keyset.h>
 
 static struct bitcoin_tx *htlc_tx(const tal_t *ctx,
+				  const struct chainparams *chainparams,
 				  const struct bitcoin_txid *commit_txid,
 				  unsigned int commit_output_number,
 				  struct amount_msat msat,
@@ -14,7 +15,7 @@ static struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 				  struct amount_sat htlc_fee,
 				  u32 locktime)
 {
-	struct bitcoin_tx *tx = bitcoin_tx(ctx, 1, 1);
+	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, 1, 1);
 	u8 *wscript;
 	struct amount_sat amount;
 
@@ -46,7 +47,7 @@ static struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 	 *    * `txin[0]` sequence: `0`
 	 */
 	amount = amount_msat_to_sat_round_down(msat);
-	bitcoin_tx_add_input(tx, commit_txid, commit_output_number, 0, &amount,
+	bitcoin_tx_add_input(tx, commit_txid, commit_output_number, 0, amount,
 			     NULL);
 
 	/* BOLT #3:
@@ -61,13 +62,16 @@ static struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 
 	wscript = bitcoin_wscript_htlc_tx(tx, to_self_delay, revocation_pubkey,
 					  local_delayedkey);
-	bitcoin_tx_add_output(tx, scriptpubkey_p2wsh(tx, wscript), &amount);
+	bitcoin_tx_add_output(tx, scriptpubkey_p2wsh(tx, wscript), amount);
+	elements_tx_add_fee_output(tx);
+
 	tal_free(wscript);
 
 	return tx;
 }
 
 struct bitcoin_tx *htlc_success_tx(const tal_t *ctx,
+				   const struct chainparams *chainparams,
 				   const struct bitcoin_txid *commit_txid,
 				   unsigned int commit_output_number,
 				   struct amount_msat htlc_msatoshi,
@@ -78,7 +82,7 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx,
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
-	return htlc_tx(ctx, commit_txid, commit_output_number, htlc_msatoshi,
+	return htlc_tx(ctx, chainparams, commit_txid, commit_output_number, htlc_msatoshi,
 		       to_self_delay,
 		       &keyset->self_revocation_key,
 		       &keyset->self_delayed_payment_key,
@@ -107,11 +111,12 @@ void htlc_success_tx_add_witness(struct bitcoin_tx *htlc_success,
 	witness = bitcoin_witness_htlc_success_tx(htlc_success,
 						  localhtlcsig, remotehtlcsig,
 						  payment_preimage, wscript);
-	bitcoin_tx_input_set_witness(htlc_success, 0, witness);
+	bitcoin_tx_input_set_witness(htlc_success, 0, take(witness));
 	tal_free(wscript);
 }
 
 struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
+				   const struct chainparams *chainparams,
 				   const struct bitcoin_txid *commit_txid,
 				   unsigned int commit_output_number,
 				   struct amount_msat htlc_msatoshi,
@@ -123,12 +128,11 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
-	return htlc_tx(ctx, commit_txid, commit_output_number, htlc_msatoshi,
-		       to_self_delay,
+	return htlc_tx(ctx, chainparams, commit_txid, commit_output_number,
+		       htlc_msatoshi, to_self_delay,
 		       &keyset->self_revocation_key,
 		       &keyset->self_delayed_payment_key,
-		       htlc_timeout_fee(feerate_per_kw),
-		       cltv_expiry);
+		       htlc_timeout_fee(feerate_per_kw), cltv_expiry);
 }
 
 /* Fill in the witness for HTLC-timeout tx produced above. */
@@ -147,7 +151,7 @@ void htlc_timeout_tx_add_witness(struct bitcoin_tx *htlc_timeout,
 
 	witness = bitcoin_witness_htlc_timeout_tx(htlc_timeout, localhtlcsig,
 						  remotehtlcsig, wscript);
-	bitcoin_tx_input_set_witness(htlc_timeout, 0, witness);
+	bitcoin_tx_input_set_witness(htlc_timeout, 0, take(witness));
 	tal_free(wscript);
 }
 

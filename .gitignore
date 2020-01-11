@@ -8,6 +8,7 @@
 *.gcno
 *.dSYM
 *.rej
+*.po
 *.pyc
 .cppcheck-suppress
 TAGS
@@ -17,6 +18,7 @@ ccan/ccan/cdump/tools/cdump-enumstr
 gen_*
 cli/lightning-cli
 tools/check-bolt
+tools/hsmtool
 coverage
 ccan/config.h
 __pycache__
@@ -38,4 +40,6 @@ tools/headerversions
 contrib/pylightning/build/
 contrib/pylightning/dist/
 contrib/pylightning/pylightning.egg-info/
-devtools/create-gossipstore
+contrib/pyln-*/build/
+contrib/pyln-*/dist/
+contrib/pyln-*/pyln_*.egg-info/

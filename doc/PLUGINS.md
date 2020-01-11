@@ -27,18 +27,24 @@ executable (e.g. use `chmod a+x plugin_name`)
 During startup of `lightningd` you can use the `--plugin=` option to
 register one or more plugins that should be started. In case you wish
 to start several plugins you have to use the `--plugin=` argument
-once for each plugin. An example call might look like:
+once for each plugin (or `--plugin-dir` or place them in the default
+plugin dirs, usually `/usr/local/libexec/c-lightning/plugins` and
+`~/.lightningd/plugins`). An example call might look like:
 
 ```
 lightningd --plugin=/path/to/plugin1 --plugin=path/to/plugin2
 ```
 
-`lightningd` will write JSON-RPC requests to the plugin's `stdin` and
+`lightningd` will run your plugins from the `--lightning-dir`/networkname, then
+will write JSON-RPC requests to the plugin's `stdin` and
 will read replies from its `stdout`. To initialize the plugin two RPC
 methods are required:
 
  - `getmanifest` asks the plugin for command line options and JSON-RPC
-   commands that should be passed through
+   commands that should be passed through.  This can be run before
+   `lightningd` checks that it is the sole user of the `lightning-dir`
+   directory (for `--help`) so your plugin should not touch files at this
+   point.
  - `init` is called after the command line options have been
    parsed and passes them through with the real values (if specified). This is also
    the signal that `lightningd`'s JSON-RPC over Unix Socket is now up
@@ -57,35 +63,36 @@ this example:
 
 ```json
 {
-	"options": [
-		{
-			"name": "greeting",
-			"type": "string",
-			"default": "World",
-			"description": "What name should I call you?"
-		}
-	],
-	"rpcmethods": [
-		{
-			"name": "hello",
-			"usage": "[name]",
-			"description": "Returns a personalized greeting for {greeting} (set via options)."
-		},
-		{
-			"name": "gettime",
-			"usage": "",
-			"description": "Returns the current time in {timezone}",
-			"long_description": "Returns the current time in the timezone that is given as the only parameter.\nThis description may be quite long and is allowed to span multiple lines."
-		}
-	],
-	"subscriptions": [
-		"connect",
-		"disconnect"
-	],
-	"hooks": [
-		"openchannel",
-		"htlc_accepted"
-	]
+  "options": [
+    {
+      "name": "greeting",
+      "type": "string",
+      "default": "World",
+      "description": "What name should I call you?"
+    }
+  ],
+  "rpcmethods": [
+    {
+      "name": "hello",
+      "usage": "[name]",
+      "description": "Returns a personalized greeting for {greeting} (set via options)."
+    },
+    {
+      "name": "gettime",
+      "usage": "",
+      "description": "Returns the current time in {timezone}",
+      "long_description": "Returns the current time in the timezone that is given as the only parameter.\nThis description may be quite long and is allowed to span multiple lines."
+    }
+  ],
+  "subscriptions": [
+    "connect",
+    "disconnect"
+  ],
+  "hooks": [
+    "openchannel",
+    "htlc_accepted"
+  ],
+  "dynamic": true
 }
 ```
 
@@ -102,6 +109,10 @@ are mandatory, while the `long_description` can be omitted (it'll be
 set to `description` if it was not provided). `usage` should surround optional
 parameter names in `[]`.
 
+The `dynamic` indicates if the plugin can be managed after `lightningd`
+has been started. Critical plugins that should not be stopped should set it
+to false.
+
 Plugins are free to register any `name` for their `rpcmethod` as long
 as the name was not previously registered. This includes both built-in
 methods, such as `help` and `getinfo`, as well as methods registered
@@ -117,13 +128,14 @@ simple JSON object containing the options:
 
 ```json
 {
-	"options": {
-		"greeting": "World"
-	},
-	"configuration": {
-		 "lightning-dir": "/home/user/.lightning",
-		 "rpc-file": "lightning-rpc"
-	}
+  "options": {
+    "greeting": "World"
+  },
+  "configuration": {
+    "lightning-dir": "/home/user/.lightning/testnet",
+    "rpc-file": "lightning-rpc",
+    "startup": true
+  }
 }
 ```
 
@@ -131,6 +143,9 @@ The plugin must respond to `init` calls, however the response can be
 arbitrary and will currently be discarded by `lightningd`. JSON-RPC
 commands were chosen over notifications in order not to force plugins
 to implement notifications which are not that well supported.
+
+The `startup` field allows a plugin to detect if it was started at
+`lightningd` startup (true), or at runtime (false).
 
 ## JSON-RPC passthrough
 
@@ -150,27 +165,31 @@ For example the above `getmanifest` result will register two methods,
 called `hello` and `gettime`:
 
 ```json
-    ...
-	"rpcmethods": [
-		{
-			"name": "hello",
-			"usage": "[name]",
-			"description": "Returns a personalized greeting for {greeting} (set via options)."
-		},
-		{
-			"name": "gettime",
-			"description": "Returns the current time in {timezone}",
-			"usage": "",
-			"long_description": "Returns the current time in the timezone that is given as the only parameter.\nThis description may be quite long and is allowed to span multiple lines."
-		}
-	],
-	...
+  ...
+  "rpcmethods": [
+    {
+      "name": "hello",
+      "usage": "[name]",
+      "description": "Returns a personalized greeting for {greeting} (set via options)."
+    },
+    {
+      "name": "gettime",
+      "description": "Returns the current time in {timezone}",
+      "usage": "",
+      "long_description": "Returns the current time in the timezone that is given as the only parameter.\nThis description may be quite long and is allowed to span multiple lines."
+    }
+  ],
+  ...
 ```
 
 The RPC call will be passed through unmodified, with the exception of
 the JSON-RPC call `id`, which is internally remapped to a unique
 integer instead, in order to avoid collisions. When passing the result
 back the `id` field is restored to its original value.
+
+Note that if your `result` for an RPC call includes `"format-hint":
+"simple"`, then `lightning-cli` will default to printing your output
+in "human-readable" flat form.
 
 ## Event notifications
 
@@ -200,6 +219,24 @@ corresponding payloads are listed below.
 
 ### Notification Types
 
+#### `channel_opened`
+
+A notification for topic `channel_opened` is sent if a peer successfully funded a channel
+with us. It contains the peer id, the funding amount (in millisatoshis), the funding
+transaction id, and a boolean indicating if the funding transaction has been included
+into a block.
+
+```json
+{
+  "channel_opened": {
+    "id": "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f",
+    "funding_satoshis": "100000000msat",
+    "funding_txid": "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+    "funding_locked": false
+  }
+}
+```
+
 #### `connect`
 
 A notification for topic `connect` is sent every time a new connection
@@ -207,8 +244,8 @@ to a peer is established.
 
 ```json
 {
-	"id": "02f6725f9c1c40333b67faea92fd211c183050f28df32cac3f9d69685fe9665432",
-	"address": "1.2.3.4"
+  "id": "02f6725f9c1c40333b67faea92fd211c183050f28df32cac3f9d69685fe9665432",
+  "address": "1.2.3.4"
 }
 ```
 
@@ -219,7 +256,7 @@ to a peer was lost.
 
 ```json
 {
-	"id": "02f6725f9c1c40333b67faea92fd211c183050f28df32cac3f9d69685fe9665432"
+  "id": "02f6725f9c1c40333b67faea92fd211c183050f28df32cac3f9d69685fe9665432"
 }
 ```
 
@@ -229,14 +266,13 @@ A notification for topic `invoice_payment` is sent every time an invoie is paid.
 
 ```json
 {
-	"invoice_payment": {
-		"label": "unique-label-for-invoice",
-		"preimage": "0000000000000000000000000000000000000000000000000000000000000000",
-		"msat": "10000msat"
-	}
+  "invoice_payment": {
+    "label": "unique-label-for-invoice",
+    "preimage": "0000000000000000000000000000000000000000000000000000000000000000",
+    "msat": "10000msat"
+  }
 }
 ```
-
 
 #### `warning`
 
@@ -247,11 +283,11 @@ message resolving failed...
 
 ```json
 {
-	"warning": {
-	"level": "warn",
-	"time": "1559743608.565342521",
-	"source": "lightningd(17652): 0821f80652fb840239df8dc99205792bba2e559a05469915804c08420230e23c7c chan #7854:",
-	"log": "Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: sent ERROR bad reestablish dataloss msg"
+  "warning": {
+    "level": "warn",
+    "time": "1559743608.565342521",
+    "source": "lightningd(17652): 0821f80652fb840239df8dc99205792bba2e559a05469915804c08420230e23c7c chan #7854:",
+    "log": "Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: sent ERROR bad reestablish dataloss msg"
   }
 }
 ```
@@ -260,21 +296,167 @@ message resolving failed...
 extremely bad is out of control, and it may lead to crash;
 2. `time` is the second since epoch;
 3. `source` means where the event happened, it may have the following
-forms:  
+forms:
 `<node_id> chan #<db_id_of_channel>:`,`lightningd(<lightningd_pid>):`,
 `plugin-<plugin_name>:`, `<daemon_name>(<daemon_pid>):`, `jsonrpc:`,
 `jcon fd <error_fd_to_jsonrpc>:`, `plugin-manager`;
 4. `log` is the context of the original log entry.
 
+#### `forward_event`
+
+A notification for topic `forward_event` is sent every time the status
+of a forward payment is set. The json format is same as the API
+`listforwards`.
+
+```json
+{
+  "forward_event": {
+    "payment_hash": "f5a6a059a25d1e329d9b094aeeec8c2191ca037d3f5b0662e21ae850debe8ea2",
+    "in_channel": "103x2x1",
+    "out_channel": "103x1x1",
+    "in_msatoshi": 100001001,
+    "in_msat": "100001001msat",
+    "out_msatoshi": 100000000,
+    "out_msat": "100000000msat",
+    "fee": 1001,
+    "fee_msat": "1001msat",
+    "status": "settled",
+    "received_time": 1560696342.368,
+    "resolved_time": 1560696342.556
+  }
+}
+```
+or
+
+```json
+{
+  "forward_event": {
+    "payment_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "in_channel": "103x2x1",
+    "out_channel": "110x1x0",
+    "in_msatoshi": 100001001,
+    "in_msat": "100001001msat",
+    "out_msatoshi": 100000000,
+    "out_msat": "100000000msat",
+    "fee": 1001,
+    "fee_msat": "1001msat",
+    "status": "local_failed",
+    "failcode": 16392,
+    "failreason": "WIRE_PERMANENT_CHANNEL_FAILURE",
+    "received_time": 1560696343.052
+  }
+}
+
+```
+ - The status includes `offered`, `settled`, `failed` and `local_failed`,
+   and they are all string type in json.
+   - When the forward payment is valid for us, we'll set `offered`
+     and send the forward payment to next hop to resolve;
+   - When the payment forwarded by us gets paid eventually, the forward
+     payment will change the status from `offered` to `settled`;
+   - If payment fails locally(like failing to resolve locally) or the
+     corresponding htlc with next hop fails(like htlc timeout), we will
+     set the status as `local_failed`. `local_failed` may be set before
+     setting `offered` or after setting `offered`. In fact, from the
+     time we receive the htlc of the previous hop, all we can know the
+     cause of the failure is treated as `local_failed`. `local_failed`
+     only occuors locally or happens in the htlc between us and next hop;
+     - If `local_failed` is set before `offered`, this
+       means we just received htlc from the previous hop and haven't
+       generate htlc for next hop. In this case, the json of `forward_event`
+       sets the fields of `out_msatoshi`, `out_msat`,`fee` and `out_channel`
+       as 0;
+       - Note: In fact, for this case we may be not sure if this incoming
+         htlc represents a pay to us or a payment we need to forward.
+         We just simply treat all incoming failed to resolve as
+         `local_failed`.
+     - Only in `local_failed` case, json includes `failcode` and
+       `failreason` fields;
+   - `failed` means the payment forwarded by us fails in the
+     latter hops, and the failure isn't related to us, so we aren't
+     accessed to the fail reason. `failed` must be set after
+     `offered`.
+     - `failed` case doesn't include `failcode` and `failreason`
+       fields;
+ - `received_time` means when we received the htlc of this payment from
+   the previous peer. It will be contained into all status case;
+ - `resolved_time` means when the htlc of this payment between us and the
+   next peer was resolved. The resolved result may success or fail, so
+   only `settled` and `failed` case contain `resolved_time`;
+ - The `failcode` and `failreason` are defined in [BOLT 4][bolt4-failure-codes].
+
+#### `sendpay_success`
+
+A notification for topic `sendpay_success` is sent every time a sendpay
+succeeds (with `complete` status). The json is the same as the return value of
+the commands `sendpay`/`waitsendpay` when these commands succeed.
+
+```json
+{
+  "sendpay_success": {
+    "id": 1,
+    "payment_hash": "5c85bf402b87d4860f4a728e2e58a2418bda92cd7aea0ce494f11670cfbfb206",
+    "destination": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d",
+    "msatoshi": 100000000,
+    "amount_msat": "100000000msat",
+    "msatoshi_sent": 100001001,
+    "amount_sent_msat": "100001001msat",
+    "created_at": 1561390572,
+    "status": "complete",
+    "payment_preimage": "9540d98095fd7f37687ebb7759e733934234d4f934e34433d4998a37de3733ee"
+  }
+}
+```
+`sendpay` doesn't wait for the result of sendpay and `waitsendpay`
+returns the result of sendpay in specified time or timeout, but
+`sendpay_success` will always return the result anytime when sendpay
+successes if is was subscribed.
+
+#### `sendpay_failure`
+
+A notification for topic `sendpay_failure` is sent every time a sendpay
+completes with `failed` status. The JSON is same as the return value of
+the commands `sendpay`/`waitsendpay` when these commands fail.
+
+```json
+{
+  "sendpay_failure": {
+    "code": 204,
+    "message": "failed: WIRE_UNKNOWN_NEXT_PEER (reply from remote)",
+    "data": {
+      "id": 2,
+      "payment_hash": "9036e3bdbd2515f1e653cb9f22f8e4c49b73aa2c36e937c926f43e33b8db8851",
+      "destination": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d",
+      "msatoshi": 100000000,
+      "amount_msat": "100000000msat",
+      "msatoshi_sent": 100001001,
+      "amount_sent_msat": "100001001msat",
+      "created_at": 1561395134,
+      "status": "failed",
+      "erring_index": 1,
+      "failcode": 16394,
+      "failcodename": "WIRE_UNKNOWN_NEXT_PEER",
+      "erring_node": "022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59",
+      "erring_channel": "103x2x1",
+      "erring_direction": 0
+    }
+  }
+}
+```
+`sendpay` doesn't wait for the result of sendpay and `waitsendpay`
+returns the result of sendpay in specified time or timeout, but
+`sendpay_failure` will always return the result anytime when sendpay
+fails if is was subscribed.
+
 ## Hooks
 
 Hooks allow a plugin to define custom behavior for `lightningd`
 without having to modify the c-lightning source code itself. A plugin
-declares that it'd like to consulted on what to do next for certain
+declares that it'd like to be consulted on what to do next for certain
 events in the daemon. A hook can then decide how `lightningd` should
 react to the given event.
 
-Hooks and notifications sounds very similar, however there are a few
+Hooks and notifications are very similar, however there are a few
 key differences:
 
  - Notifications are asynchronous, i.e., `lightningd` will send the
@@ -301,10 +483,9 @@ the cryptographic handshake. The parameters have the following structure if ther
 ```json
 {
   "peer": {
-	"id": "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f",
-	"addr": "34.239.230.56:9735",
-	"globalfeatures": "",
-	"localfeatures": ""
+    "id": "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f",
+    "addr": "34.239.230.56:9735",
+    "features": ""
   }
 }
 ```
@@ -335,7 +516,9 @@ It is currently extremely restricted:
 
 ```json
 {
-  "writes": [ "PRAGMA foreign_keys = ON" ]
+  "writes": [
+    "PRAGMA foreign_keys = ON"
+  ]
 }
 ```
 
@@ -349,9 +532,9 @@ This hook is called whenever a valid payment for an unpaid invoice has arrived.
 ```json
 {
   "payment": {
-	"label": "unique-label-for-invoice",
-	"preimage": "0000000000000000000000000000000000000000000000000000000000000000",
-	"msat": "10000msat"
+    "label": "unique-label-for-invoice",
+    "preimage": "0000000000000000000000000000000000000000000000000000000000000000",
+    "msat": "10000msat"
   }
 }
 ```
@@ -371,17 +554,17 @@ and it has passed basic sanity checks:
 ```json
 {
   "openchannel": {
-	"id": "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f",
-	"funding_satoshis": "100000000msat",
-	"push_msat": "0msat",
-	"dust_limit_satoshis": "546000msat",
-	"max_htlc_value_in_flight_msat": "18446744073709551615msat",
-	"channel_reserve_satoshis": "1000000msat",
-	"htlc_minimum_msat": "0msat",
-	"feerate_per_kw": 7500,
-	"to_self_delay": 5,
-	"max_accepted_htlcs": 483,
-	"channel_flags": 1
+    "id": "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f",
+    "funding_satoshis": "100000000msat",
+    "push_msat": "0msat",
+    "dust_limit_satoshis": "546000msat",
+    "max_htlc_value_in_flight_msat": "18446744073709551615msat",
+    "channel_reserve_satoshis": "1000000msat",
+    "htlc_minimum_msat": "0msat",
+    "feerate_per_kw": 7500,
+    "to_self_delay": 5,
+    "max_accepted_htlcs": 483,
+    "channel_flags": 1
   }
 }
 ```
@@ -394,6 +577,21 @@ the string `reject` or `continue`.  If `reject` and
 there's a member `error_message`, that member is sent to the peer
 before disconnection.
 
+For a 'continue'd result, you can also include a `close_to` address,
+which will be used as the output address for a mutual close transaction.
+
+e.g.
+
+```json
+{
+    "result": "continue",
+    "close_to": "bc1qlq8srqnz64wgklmqvurv7qnr4rvtq2u96hhfg2"
+}
+```
+
+Note that `close_to` must be a valid address for the current chain; an invalid address will cause the node to exit with an error.
+
+
 #### `htlc_accepted`
 
 The `htlc_accepted` hook is called whenever an incoming HTLC is accepted, and
@@ -405,12 +603,10 @@ The payload of the hook call has the following format:
 {
   "onion": {
     "payload": "",
-    "per_hop_v0": {
-      "realm": "00",
-      "short_channel_id": "1x2x3",
-      "forward_amount": "42msat",
-      "outgoing_cltv_value": 500014
-    }
+    "type": "legacy",
+    "short_channel_id": "1x2x3",
+    "forward_amount": "42msat",
+    "outgoing_cltv_value": 500014
   },
   "next_onion": "[1365bytes of serialized onion]",
   "shared_secret": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -423,22 +619,19 @@ The payload of the hook call has the following format:
 }
 ```
 
-The `per_hop_v0` will only be present if the per hop payload has format `0x00`
-as defined by the specification. If not present an object representing the
-type-length-vale (TLV) payload will be added (pending specification). For detailed information about each field please refer to [BOLT 04 of the specification][bolt4], the following is just a brief summary:
+For detailed information about each field please refer to [BOLT 04 of the specification][bolt4], the following is just a brief summary:
 
  - `onion.payload` contains the unparsed payload that was sent to us from the
    sender of the payment.
- - `onion.per_hop_v0`:
-   - `realm` will always be `00` since that value determines that we are using
-     the `per_hop_v0` format.
-   - `short_channel_id` determines the channel that the sender is hinting
-     should be used next (set to `0x0x0` if we are the recipient of the
-     payment).
-   - `forward_amount` is the amount we should be forwarding to the next hop,
+ - `onion.type` is `legacy` for realm 0 payments, `tlv` for realm > 1.
+ - `short_channel_id` determines the channel that the sender is hinting
+     should be used next.  Not present if we're the final destination.
+ - `forward_amount` is the amount we should be forwarding to the next hop,
      and should match the incoming funds in case we are the recipient.
-   - `outgoing_cltv_value` determines what the CLTV value for the HTLC that we
+ - `outgoing_cltv_value` determines what the CLTV value for the HTLC that we
      forward to the next hop should be.
+ - `total_msat` specifies the total amount to pay, if present.
+ - `payment_secret` specifies the payment secret (which the payer should have obtained from the invoice), if present.
  - `next_onion` is the fully processed onion that we should be sending to the
    next hop as part of the outgoing HTLC. Processed in this case means that we
    took the incoming onion, decrypted it, extracted the payload destined for
@@ -499,6 +692,73 @@ verdict during startup. This means that, if the plugin response wasn't
 processed before the HTLC was forwarded, failed, or resolved, then the plugin
 may see the same HTLC again during startup. It is therefore paramount that the
 plugin is idempotent if it talks to an external system.
+
+
+#### `rpc_command`
+
+The `rpc_command` hook allows a plugin to take over any RPC command. It sends
+the received JSON-RPC request to the registered plugin,
+
+```json
+{
+    "rpc_command": {
+        "id": 3,
+        "method": "method_name",
+        "params": {
+            "param_1": [],
+            "param_2": {},
+            "param_n": "",
+        }
+    }
+}
+```
+
+which can in turn:
+
+Let `lightningd` execute the command with
+
+```json
+{
+    "continue": true
+}
+```
+Replace the request made to `lightningd`:
+
+```json
+{
+    "replace": {
+        "id": 3,
+        "method": "method_name",
+        "params": {
+            "param_1": [],
+            "param_2": {},
+            "param_n": "",
+        }
+    }
+}
+```
+
+Return a custom response to the request sender:
+
+```json
+{
+    "return": {
+        "result": {
+        }
+    }
+}
+```
+
+Return a custom error to the request sender:
+
+```json
+{
+    "return": {
+        "error": {
+        }
+    }
+}
+```
 
 [jsonrpc-spec]: https://www.jsonrpc.org/specification
 [jsonrpc-notification-spec]: https://www.jsonrpc.org/specification#notification

@@ -2,12 +2,14 @@
 #include <bitcoin/script.h>
 #include <closingd/gen_closing_wire.h>
 #include <common/close_tx.h>
+#include <common/fee_states.h>
 #include <common/initial_commit_tx.h>
 #include <common/per_peer_state.h>
 #include <common/utils.h>
 #include <errno.h>
 #include <gossipd/gen_gossip_wire.h>
 #include <inttypes.h>
+#include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/closing_control.h>
@@ -21,10 +23,25 @@
 static struct amount_sat calc_tx_fee(struct amount_sat sat_in,
 				     const struct bitcoin_tx *tx)
 {
-	struct amount_sat amt, fee = sat_in;
+	struct amount_asset amt;
+	struct amount_sat fee = sat_in;
+	const u8 *oscript;
+	size_t scriptlen;
 	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
 		amt = bitcoin_tx_output_get_amount(tx, i);
-		if (!amount_sat_sub(&fee, fee, amt))
+		oscript = bitcoin_tx_output_get_script(NULL, tx, i);
+		scriptlen = tal_bytelen(oscript);
+		tal_free(oscript);
+
+		if (chainparams->is_elements && scriptlen == 0)
+			continue;
+
+		/* Ignore outputs that are not denominated in our main
+		 * currency. */
+		if (!amount_asset_is_main(&amt))
+			continue;
+
+		if (!amount_sat_sub(&fee, fee, amount_asset_to_sat(&amt)))
 			fatal("Tx spends more than input %s? %s",
 			      type_to_string(tmpctx, struct amount_sat, &sat_in),
 			      type_to_string(tmpctx, struct bitcoin_tx, tx));
@@ -54,7 +71,7 @@ static bool better_closing_fee(struct lightningd *ld,
 		  type_to_string(tmpctx, struct amount_sat, &last_fee));
 
 	/* Weight once we add in sigs. */
-	weight = measure_tx_weight(tx) + 74 * 2;
+	weight = bitcoin_tx_weight(tx) + 74 * 2;
 
 	/* If we don't have a feerate estimate, this gives feerate_floor */
 	min_feerate = feerate_min(ld, &feerate_unknown);
@@ -92,6 +109,7 @@ static void peer_received_closing_signature(struct channel *channel,
 				       tal_hex(msg, msg));
 		return;
 	}
+	tx->chainparams = chainparams;
 
 	/* FIXME: Make sure signature is correct! */
 	if (better_closing_fee(ld, channel, tx)) {
@@ -164,8 +182,9 @@ void peer_start_closingd(struct channel *channel,
 	int hsmfd;
 	struct secret last_remote_per_commit_secret;
 	struct lightningd *ld = channel->peer->ld;
+	u32 final_commit_feerate;
 
-	if (!channel->remote_shutdown_scriptpubkey) {
+	if (!channel->shutdown_scriptpubkey[REMOTE]) {
 		channel_internal_error(channel,
 				       "Can't start closing: no remote info");
 		return;
@@ -178,7 +197,8 @@ void peer_start_closingd(struct channel *channel,
 	channel_set_owner(channel,
 			  new_channel_subd(ld,
 					   "lightning_closingd",
-					   channel, channel->log, true,
+					   channel, &channel->peer->id,
+					   channel->log, true,
 					   closing_wire_type_name, closing_msg,
 					   channel_errmsg,
 					   channel_set_billboard,
@@ -203,8 +223,9 @@ void peer_start_closingd(struct channel *channel,
 	 *    fee of the final commitment transaction, as calculated in
 	 *    [BOLT #3](03-transactions.md#fee-calculation).
 	 */
-	feelimit = commit_tx_base_fee(channel->channel_info.feerate_per_kw[LOCAL],
-				      0);
+	final_commit_feerate = get_feerate(channel->channel_info.fee_states,
+					   channel->funder, LOCAL);
+	feelimit = commit_tx_base_fee(final_commit_feerate, 0);
 
 	/* Pick some value above slow feerate (or min possible if unknown) */
 	minfee = commit_tx_base_fee(feerate_min(ld, NULL), 0);
@@ -212,7 +233,7 @@ void peer_start_closingd(struct channel *channel,
 	/* If we can't determine feerate, start at half unilateral feerate. */
 	feerate = mutual_close_feerate(ld->topology);
 	if (!feerate) {
-		feerate = channel->channel_info.feerate_per_kw[LOCAL] / 2;
+		feerate = final_commit_feerate / 2;
 		if (feerate < feerate_floor())
 			feerate = feerate_floor();
 	}
@@ -244,9 +265,7 @@ void peer_start_closingd(struct channel *channel,
 	}
 
 	/* BOLT #2:
-	 *
-	 *   - if it supports `option_data_loss_protect`:
-	 *     - if `next_remote_revocation_number` equals 0:
+	 *     - if `next_revocation_number` equals 0:
 	 *       - MUST set `your_last_per_commitment_secret` to all zeroes
 	 *     - otherwise:
 	 *       - MUST set `your_last_per_commitment_secret` to the last
@@ -264,6 +283,7 @@ void peer_start_closingd(struct channel *channel,
 		return;
 	}
 	initmsg = towire_closing_init(tmpctx,
+				      chainparams,
 				      pps,
 				      &channel->funding_txid,
 				      channel->funding_outnum,
@@ -275,17 +295,15 @@ void peer_start_closingd(struct channel *channel,
 				      amount_msat_to_sat_round_down(their_msat),
 				      channel->our_config.dust_limit,
 				      minfee, feelimit, startfee,
-				      p2wpkh_for_keyidx(tmpctx, ld,
-							channel->final_key_idx),
-				      channel->remote_shutdown_scriptpubkey,
+				      channel->shutdown_scriptpubkey[LOCAL],
+				      channel->shutdown_scriptpubkey[REMOTE],
 				      reconnected,
 				      channel->next_index[LOCAL],
 				      channel->next_index[REMOTE],
 				      num_revocations,
 				      channel_reestablish,
-				      p2wpkh_for_keyidx(tmpctx, ld,
-							channel->final_key_idx),
-				      &last_remote_per_commit_secret);
+				      &last_remote_per_commit_secret,
+				      IFDEV(ld->dev_fast_gossip, false));
 
 	/* We don't expect a response: it will give us feedback on
 	 * signatures sent and received, then closing_complete. */

@@ -13,11 +13,17 @@ void activate_peers(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "activate_peers called!\n"); abort(); }
 /* Generated stub for add_plugin_dir */
 char *add_plugin_dir(struct plugins *plugins UNNEEDED, const char *dir UNNEEDED,
-		     bool nonexist_ok UNNEEDED)
+		     bool error_ok UNNEEDED)
 { fprintf(stderr, "add_plugin_dir called!\n"); abort(); }
 /* Generated stub for begin_topology */
 void begin_topology(struct chain_topology *topo UNNEEDED)
 { fprintf(stderr, "begin_topology called!\n"); abort(); }
+/* Generated stub for bigsize_get */
+size_t bigsize_get(const u8 *p UNNEEDED, size_t max UNNEEDED, bigsize_t *val UNNEEDED)
+{ fprintf(stderr, "bigsize_get called!\n"); abort(); }
+/* Generated stub for bigsize_put */
+size_t bigsize_put(u8 buf[BIGSIZE_MAX_LEN] UNNEEDED, bigsize_t v UNNEEDED)
+{ fprintf(stderr, "bigsize_put called!\n"); abort(); }
 /* Generated stub for channel_notify_new_block */
 void channel_notify_new_block(struct lightningd *ld UNNEEDED,
 			      u32 block_height UNNEEDED)
@@ -39,24 +45,18 @@ void daemon_setup(const char *argv0 UNNEEDED,
 /* Generated stub for daemon_shutdown */
 void daemon_shutdown(void)
 { fprintf(stderr, "daemon_shutdown called!\n"); abort(); }
-/* Generated stub for db_assert_no_outstanding_statements */
-void db_assert_no_outstanding_statements(void)
-{ fprintf(stderr, "db_assert_no_outstanding_statements called!\n"); abort(); }
 /* Generated stub for db_begin_transaction_ */
 void db_begin_transaction_(struct db *db UNNEEDED, const char *location UNNEEDED)
 { fprintf(stderr, "db_begin_transaction_ called!\n"); abort(); }
-/* Generated stub for db_close_for_fork */
-void db_close_for_fork(struct db *db UNNEEDED)
-{ fprintf(stderr, "db_close_for_fork called!\n"); abort(); }
 /* Generated stub for db_commit_transaction */
 void db_commit_transaction(struct db *db UNNEEDED)
 { fprintf(stderr, "db_commit_transaction called!\n"); abort(); }
 /* Generated stub for db_get_intvar */
 s64 db_get_intvar(struct db *db UNNEEDED, char *varname UNNEEDED, s64 defval UNNEEDED)
 { fprintf(stderr, "db_get_intvar called!\n"); abort(); }
-/* Generated stub for db_reopen_after_fork */
-void db_reopen_after_fork(struct db *db UNNEEDED)
-{ fprintf(stderr, "db_reopen_after_fork called!\n"); abort(); }
+/* Generated stub for db_in_transaction */
+bool db_in_transaction(struct db *db UNNEEDED)
+{ fprintf(stderr, "db_in_transaction called!\n"); abort(); }
 /* Generated stub for fatal */
 void   fatal(const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "fatal called!\n"); abort(); }
@@ -75,12 +75,12 @@ bool fromwire_status_peer_billboard(const tal_t *ctx UNNEEDED, const void *p UNN
 /* Generated stub for fromwire_status_peer_error */
 bool fromwire_status_peer_error(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct channel_id *channel UNNEEDED, wirestring **desc UNNEEDED, bool *soft_error UNNEEDED, struct per_peer_state **pps UNNEEDED, u8 **error_for_them UNNEEDED)
 { fprintf(stderr, "fromwire_status_peer_error called!\n"); abort(); }
-/* Generated stub for get_log_book */
-struct log_book *get_log_book(const struct log *log UNNEEDED)
-{ fprintf(stderr, "get_log_book called!\n"); abort(); }
 /* Generated stub for gossip_init */
 void gossip_init(struct lightningd *ld UNNEEDED, int connectd_fd UNNEEDED)
 { fprintf(stderr, "gossip_init called!\n"); abort(); }
+/* Generated stub for gossip_notify_new_block */
+void gossip_notify_new_block(struct lightningd *ld UNNEEDED, u32 blockheight UNNEEDED)
+{ fprintf(stderr, "gossip_notify_new_block called!\n"); abort(); }
 /* Generated stub for handle_early_opts */
 void handle_early_opts(struct lightningd *ld UNNEEDED, int argc UNNEEDED, char *argv[])
 { fprintf(stderr, "handle_early_opts called!\n"); abort(); }
@@ -96,6 +96,10 @@ void hsm_init(struct lightningd *ld UNNEEDED)
 /* Generated stub for htlcs_notify_new_block */
 void htlcs_notify_new_block(struct lightningd *ld UNNEEDED, u32 height UNNEEDED)
 { fprintf(stderr, "htlcs_notify_new_block called!\n"); abort(); }
+/* Generated stub for htlcs_resubmit */
+void htlcs_resubmit(struct lightningd *ld UNNEEDED,
+		    struct htlc_in_map *unconnected_htlcs_in UNNEEDED)
+{ fprintf(stderr, "htlcs_resubmit called!\n"); abort(); }
 /* Generated stub for jsonrpc_listen */
 void jsonrpc_listen(struct jsonrpc *rpc UNNEEDED, struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "jsonrpc_listen called!\n"); abort(); }
@@ -103,10 +107,13 @@ void jsonrpc_listen(struct jsonrpc *rpc UNNEEDED, struct lightningd *ld UNNEEDED
 void jsonrpc_setup(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "jsonrpc_setup called!\n"); abort(); }
 /* Generated stub for load_channels_from_wallet */
-void load_channels_from_wallet(struct lightningd *ld UNNEEDED)
+struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "load_channels_from_wallet called!\n"); abort(); }
 /* Generated stub for log_ */
-void log_(struct log *log UNNEEDED, enum log_level level UNNEEDED, bool call_notifier UNNEEDED, const char *fmt UNNEEDED, ...)
+void log_(struct log *log UNNEEDED, enum log_level level UNNEEDED,
+	  const struct node_id *node_id UNNEEDED,
+	  bool call_notifier UNNEEDED,
+	  const char *fmt UNNEEDED, ...)
 
 { fprintf(stderr, "log_ called!\n"); abort(); }
 /* Generated stub for log_backtrace_exit */
@@ -118,15 +125,21 @@ void log_backtrace_print(const char *fmt UNNEEDED, ...)
 /* Generated stub for log_prefix */
 const char *log_prefix(const struct log *log UNNEEDED)
 { fprintf(stderr, "log_prefix called!\n"); abort(); }
+/* Generated stub for log_print_level */
+enum log_level log_print_level(struct log *log UNNEEDED)
+{ fprintf(stderr, "log_print_level called!\n"); abort(); }
 /* Generated stub for log_status_msg */
-bool log_status_msg(struct log *log UNNEEDED, const u8 *msg UNNEEDED)
+bool log_status_msg(struct log *log UNNEEDED,
+ 		    const struct node_id *node_id UNNEEDED,
+		    const u8 *msg UNNEEDED)
 { fprintf(stderr, "log_status_msg called!\n"); abort(); }
 /* Generated stub for new_log */
-struct log *new_log(const tal_t *ctx UNNEEDED, struct log_book *record UNNEEDED, const char *fmt UNNEEDED, ...)
+struct log *new_log(const tal_t *ctx UNNEEDED, struct log_book *record UNNEEDED,
+		    const struct node_id *default_node_id UNNEEDED,
+		    const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "new_log called!\n"); abort(); }
 /* Generated stub for new_log_book */
-struct log_book *new_log_book(struct lightningd *ld UNNEEDED, size_t max_mem UNNEEDED,
-			      enum log_level printlevel UNNEEDED)
+struct log_book *new_log_book(struct lightningd *ld UNNEEDED, size_t max_mem UNNEEDED)
 { fprintf(stderr, "new_log_book called!\n"); abort(); }
 /* Generated stub for new_topology */
 struct chain_topology *new_topology(struct lightningd *ld UNNEEDED, struct log *log UNNEEDED)
@@ -147,9 +160,6 @@ void plugins_init(struct plugins *plugins UNNEEDED, const char *dev_plugin_debug
 struct plugins *plugins_new(const tal_t *ctx UNNEEDED, struct log_book *log_book UNNEEDED,
 			    struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "plugins_new called!\n"); abort(); }
-/* Generated stub for register_opts */
-void register_opts(struct lightningd *ld UNNEEDED)
-{ fprintf(stderr, "register_opts called!\n"); abort(); }
 /* Generated stub for setup_color_and_alias */
 void setup_color_and_alias(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "setup_color_and_alias called!\n"); abort(); }
@@ -177,12 +187,10 @@ void wallet_blocks_heights(struct wallet *w UNNEEDED, u32 def UNNEEDED, u32 *min
 void wallet_clean_utxos(struct wallet *w UNNEEDED, struct bitcoind *bitcoind UNNEEDED)
 { fprintf(stderr, "wallet_clean_utxos called!\n"); abort(); }
 /* Generated stub for wallet_network_check */
-bool wallet_network_check(struct wallet *w UNNEEDED,
-			  const struct chainparams *chainparams UNNEEDED)
+bool wallet_network_check(struct wallet *w UNNEEDED)
 { fprintf(stderr, "wallet_network_check called!\n"); abort(); }
 /* Generated stub for wallet_new */
-struct wallet *wallet_new(struct lightningd *ld UNNEEDED,
-			  struct log *log UNNEEDED, struct timers *timers UNNEEDED)
+struct wallet *wallet_new(struct lightningd *ld UNNEEDED, struct timers *timers UNNEEDED)
 { fprintf(stderr, "wallet_new called!\n"); abort(); }
 /* AUTOGENERATED MOCKS END */
 

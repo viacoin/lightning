@@ -45,7 +45,7 @@
 #include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <secp256k1_ecdh.h>
-#include <sodium/randombytes.h>
+#include <sodium.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -88,10 +88,10 @@ struct client {
 	 * it has the complete thing; this is it. */
 	u8 *msg_in;
 
-	/* ~Useful for logging, but also used to derive the per-channel seed. */
+	/*~ Useful for logging, but also used to derive the per-channel seed. */
 	struct node_id id;
 
-	/* ~This is a unique value handed to us from lightningd, used for
+	/*~ This is a unique value handed to us from lightningd, used for
 	 * per-channel seed generation (a single id may have multiple channels
 	 * over time).
 	 *
@@ -102,6 +102,9 @@ struct client {
 
 	/* What is this client allowed to ask for? */
 	u64 capabilities;
+
+	/* Params to apply to all transactions for this client */
+	const struct chainparams *chainparams;
 };
 
 /*~ We keep a map of nonzero dbid -> clients, mainly for leak detection.
@@ -125,7 +128,7 @@ static bool is_lightningd(const struct client *client)
 	return client == dbid_zero_clients[0];
 }
 
-/*~ FIXME: This is used by debug.c.  Doesn't apply to us, but lets us link. */
+/* FIXME: This is used by debug.c.  Doesn't apply to us, but lets us link. */
 extern void dev_disconnect_init(int fd);
 void dev_disconnect_init(int fd UNUSED) { }
 
@@ -139,11 +142,16 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c);
  * and closes the client connection.  This should never happen, of course, but
  * we definitely want to log if it does.
  */
-static PRINTF_FMT(4,5)
-	struct io_plan *bad_req_fmt(struct io_conn *conn,
-				    struct client *c,
-				    const u8 *msg_in,
-				    const char *fmt, ...)
+static struct io_plan *bad_req_fmt(struct io_conn *conn,
+				   struct client *c,
+				   const u8 *msg_in,
+				   const char *fmt, ...)
+	PRINTF_FMT(4,5);
+
+static struct io_plan *bad_req_fmt(struct io_conn *conn,
+				   struct client *c,
+				   const u8 *msg_in,
+				   const char *fmt, ...)
 {
 	va_list ap;
 	char *str;
@@ -206,6 +214,7 @@ static void destroy_client(struct client *c)
 }
 
 static struct client *new_client(const tal_t *ctx,
+				 const struct chainparams *chainparams,
 				 const struct node_id *id,
 				 u64 dbid,
 				 const u64 capabilities,
@@ -227,6 +236,8 @@ static struct client *new_client(const tal_t *ctx,
 	c->dbid = dbid;
 
 	c->capabilities = capabilities;
+	c->chainparams = chainparams;
+
 	/*~ This is the core of ccan/io: the connection creation calls a
 	 * callback which returns the initial plan to execute: in our case,
 	 * read a message.*/
@@ -277,7 +288,7 @@ static struct io_plan *req_reply(struct io_conn *conn,
 	 * Internally, the ccan/io subsystem gathers all the file descriptors,
 	 * figures out which want to write and read, asks the OS which ones
 	 * are available, and for those file descriptors, tries to do the
-	 * reads/writes we've asked it.	 It handles retry in the case where a
+	 * reads/writes we've asked it.  It handles retry in the case where a
 	 * read or write is done partially.
 	 *
 	 * Since the OS does buffering internally (on my system, over 100k
@@ -392,7 +403,7 @@ static void populate_secretstuff(void)
 
 	/* Fill in the BIP32 tree for bitcoin addresses. */
 	/* In libwally-core, the version BIP32_VER_TEST_PRIVATE is for testnet/regtest,
-	 * and BIP32_VER_MAIN_PRIVATE is for mainnet. For litecoin, we also set it like
+	 * and BIP32_VER_MAIN_PRIVATE is for mainnet. For viacoin, we also set it like
 	 * bitcoin else.*/
 	do {
 		hkdf_sha256(bip32_seed, sizeof(bip32_seed),
@@ -483,9 +494,55 @@ static void bitcoin_key(struct privkey *privkey, struct pubkey *pubkey,
 			      "BIP32 pubkey %u create failed", index);
 }
 
+/*~ This encrypts the content of the secretstuff and stores it in hsm_secret,
+ * this is called instead of create_hsm() if `lightningd` is started with
+ * --encrypted-hsm.
+ */
+static void create_encrypted_hsm(int fd, const struct secret *encryption_key)
+{
+	crypto_secretstream_xchacha20poly1305_state crypto_state;
+	u8 header[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
+	/* The cipher size is static with xchacha20poly1305 */
+	u8 cipher[sizeof(struct secret) + crypto_secretstream_xchacha20poly1305_ABYTES];
+
+	crypto_secretstream_xchacha20poly1305_init_push(&crypto_state, header,
+	                                                encryption_key->data);
+	crypto_secretstream_xchacha20poly1305_push(&crypto_state, cipher,
+	                                           NULL,
+	                                           secretstuff.hsm_secret.data,
+	                                           sizeof(secretstuff.hsm_secret.data),
+	                                           /* Additional data and tag */
+	                                           NULL, 0, 0);
+	if (!write_all(fd, header, sizeof(header))) {
+		unlink_noerr("hsm_secret");
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+		              "Writing header of encrypted secret: %s", strerror(errno));
+	}
+	if (!write_all(fd, cipher, sizeof(cipher))) {
+		unlink_noerr("hsm_secret");
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+		              "Writing encrypted secret: %s", strerror(errno));
+	}
+}
+
+static void create_hsm(int fd)
+{
+	/*~ ccan/read_write_all has a more convenient return than write() where
+	 * we'd have to check the return value == the length we gave: write()
+	 * can return short on normal files if we run out of disk space. */
+	if (!write_all(fd, &secretstuff.hsm_secret, sizeof(secretstuff.hsm_secret))) {
+		/* ccan/noerr contains useful routines like this, which don't
+		 * clobber errno, so we can use it in our error report. */
+		unlink_noerr("hsm_secret");
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+		              "writing: %s", strerror(errno));
+	}
+}
+
 /*~ We store our root secret in a "hsm_secret" file (like all of c-lightning,
- * we run in the user's .lightningd directory). */
-static void maybe_create_new_hsm(void)
+ * we run in the user's .lightning directory). */
+static void maybe_create_new_hsm(const struct secret *encryption_key,
+                                 bool random_hsm)
 {
 	/*~ Note that this is opened for write-only, even though the permissions
 	 * are set to read-only.  That's perfectly valid! */
@@ -495,22 +552,20 @@ static void maybe_create_new_hsm(void)
 		if (errno == EEXIST)
 			return;
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "creating: %s", strerror(errno));
+		              "creating: %s", strerror(errno));
 	}
 
 	/*~ This is libsodium's cryptographic randomness routine: we assume
 	 * it's doing a good job. */
-	randombytes_buf(&secretstuff.hsm_secret, sizeof(secretstuff.hsm_secret));
-	/*~ ccan/read_write_all has a more convenient return than write() where
-	 * we'd have to check the return value == the length we gave: write()
-	 * can return short on normal files if we run out of disk space. */
-	if (!write_all(fd, &secretstuff.hsm_secret, sizeof(secretstuff.hsm_secret))) {
-		/* ccan/noerr contains useful routines like this, which don't
-		 * clobber errno, so we can use it in our error report. */
-		unlink_noerr("hsm_secret");
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "writing: %s", strerror(errno));
-	}
+	if (random_hsm)
+		randombytes_buf(&secretstuff.hsm_secret, sizeof(secretstuff.hsm_secret));
+
+	/*~ If an encryption_key was provided, store an encrypted seed. */
+	if (encryption_key)
+		create_encrypted_hsm(fd, encryption_key);
+	/*~ Otherwise store the seed in clear.. */
+	else
+		create_hsm(fd);
 	/*~ fsync (mostly!) ensures that the file has reached the disk. */
 	if (fsync(fd) != 0) {
 		unlink_noerr("hsm_secret");
@@ -548,15 +603,67 @@ static void maybe_create_new_hsm(void)
 /*~ We always load the HSM file, even if we just created it above.  This
  * both unifies the code paths, and provides a nice sanity check that the
  * file contents are as they will be for future invocations. */
-static void load_hsm(void)
+static void load_hsm(const struct secret *encryption_key)
 {
+	struct stat st;
 	int fd = open("hsm_secret", O_RDONLY);
 	if (fd < 0)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "opening: %s", strerror(errno));
-	if (!read_all(fd, &secretstuff.hsm_secret, sizeof(secretstuff.hsm_secret)))
+	if (stat("hsm_secret", &st) != 0)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "reading: %s", strerror(errno));
+		              "stating: %s", strerror(errno));
+
+	/* If the seed is stored in clear. */
+	if (st.st_size <= 32) {
+		if (!read_all(fd, &secretstuff.hsm_secret, sizeof(secretstuff.hsm_secret)))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			              "reading: %s", strerror(errno));
+		/* If an encryption key was passed with a not yet encrypted hsm_secret,
+		 * remove the old one and create an encrypted one. */
+		if (encryption_key) {
+			if (close(fd) != 0)
+				status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				              "closing: %s", strerror(errno));
+			if (remove("hsm_secret") != 0)
+				status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				              "removing clear hsm_secret: %s", strerror(errno));
+			maybe_create_new_hsm(encryption_key, false);
+			fd = open("hsm_secret", O_RDONLY);
+			if (fd < 0)
+				status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				              "opening: %s", strerror(errno));
+		}
+	}
+	/*~ If an encryption key was passed and the `hsm_secret` is stored
+	 * encrypted, recover the seed from the cipher. */
+	if (encryption_key && st.st_size > 32) {
+		crypto_secretstream_xchacha20poly1305_state crypto_state;
+		u8 header[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
+		/* The cipher size is static with xchacha20poly1305 */
+		u8 cipher[sizeof(struct secret) + crypto_secretstream_xchacha20poly1305_ABYTES];
+
+		if (!read_all(fd, &header, crypto_secretstream_xchacha20poly1305_HEADERBYTES))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			              "Reading xchacha20 header: %s", strerror(errno));
+		if (!read_all(fd, cipher, sizeof(cipher)))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			              "Reading encrypted secret: %s", strerror(errno));
+		if (crypto_secretstream_xchacha20poly1305_init_pull(&crypto_state, header,
+		                                                    encryption_key->data) != 0)
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			              "Initializing the crypto state: %s", strerror(errno));
+		if (crypto_secretstream_xchacha20poly1305_pull(&crypto_state,
+		                                               secretstuff.hsm_secret.data,
+		                                               NULL, 0, cipher, sizeof(cipher),
+		                                               NULL, 0) != 0) {
+			/* Exit but don't throw a backtrace when the user made a mistake in typing
+			 * its password. Instead exit and `lightningd` will be able to give
+			 * an error message. */
+			exit(1);
+		}
+	}
+	/* else { handled in hsm_control } */
 	close(fd);
 
 	populate_secretstuff();
@@ -574,6 +681,7 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 	struct secret *seed;
 	struct secrets *secrets;
 	struct sha256 *shaseed;
+	struct secret *hsm_encryption_key;
 
 	/* This must be lightningd. */
 	assert(is_lightningd(c));
@@ -582,9 +690,18 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 	 * definitions in hsm_client_wire.csv.  The format of those files is
 	 * an extension of the simple comma-separated format output by the
 	 * BOLT tools/extract-formats.py tool. */
-	if (!fromwire_hsm_init(NULL, msg_in, &bip32_key_version,
-			       &privkey, &seed, &secrets, &shaseed))
+	if (!fromwire_hsm_init(NULL, msg_in, &bip32_key_version, &chainparams,
+	                       &hsm_encryption_key, &privkey, &seed, &secrets, &shaseed))
 		return bad_req(conn, c, msg_in);
+
+	/*~ The memory is actually copied in towire(), so lock the `hsm_secret`
+	 * encryption key (new) memory again here. */
+	if (hsm_encryption_key && sodium_mlock(hsm_encryption_key,
+	                                       sizeof(hsm_encryption_key)) != 0)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+		              "Could not lock memory for hsm_secret encryption key.");
+	/*~ Don't swap this. */
+	sodium_mlock(secretstuff.hsm_secret.data, sizeof(secretstuff.hsm_secret.data));
 
 #if DEVELOPER
 	dev_force_privkey = privkey;
@@ -592,8 +709,19 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 	dev_force_channel_secrets = secrets;
 	dev_force_channel_secrets_shaseed = shaseed;
 #endif
-	maybe_create_new_hsm();
-	load_hsm();
+
+	/* Once we have read the init message we know which params the master
+	 * will use */
+	c->chainparams = chainparams;
+	maybe_create_new_hsm(hsm_encryption_key, true);
+	load_hsm(hsm_encryption_key);
+
+	/*~ We don't need the hsm_secret encryption key anymore.
+	 * Note that sodium_munlock() also zeroes the memory. */
+	if (hsm_encryption_key) {
+		sodium_munlock(hsm_encryption_key, sizeof(*hsm_encryption_key));
+		tal_free(hsm_encryption_key);
+	}
 
 	/*~ We tell lightning our node id and (public) bip32 seed. */
 	node_key(NULL, &key);
@@ -648,7 +776,7 @@ static struct io_plan *handle_cannouncement_sig(struct io_conn *conn,
 	 *
 	 * Note that 'check-source' will actually find and check this quote
 	 * against the spec (if available); whitespace is ignored and
-	 * ... means some content is skipped, but it works remarkably well to
+	 * "..." means some content is skipped, but it works remarkably well to
 	 * track spec changes. */
 
 	/* BOLT #7:
@@ -758,7 +886,7 @@ static struct io_plan *handle_channel_update_sig(struct io_conn *conn,
 	return req_reply(conn, c, take(towire_hsm_cupdate_sig_reply(NULL, cu)));
 }
 
-/*~ This gets the basepoints for a channel; it's not privite information really
+/*~ This gets the basepoints for a channel; it's not private information really
  * (we tell the peer this to establish a channel, as it sets up the keys used
  * for each transaction).
  *
@@ -814,6 +942,8 @@ static struct io_plan *handle_sign_commitment_tx(struct io_conn *conn,
 					     &funding))
 		return bad_req(conn, c, msg_in);
 
+	tx->chainparams = c->chainparams;
+
 	/* Basic sanity checks. */
 	if (tx->wtx->num_inputs != 1)
 		return bad_req_fmt(conn, c, msg_in, "tx must have 1 input");
@@ -835,7 +965,7 @@ static struct io_plan *handle_sign_commitment_tx(struct io_conn *conn,
 	 * output it's spending), so in our 'bitcoin_tx' structure it's a
 	 * pointer, as we don't always know it (and zero is a valid amount, so
 	 * NULL is better to mean 'unknown' and has the nice property that
-	 * you'll crash if you assume it's there and you're wrong. */
+	 * you'll crash if you assume it's there and you're wrong.) */
 	tx->input_amounts[0] = tal_dup(tx, struct amount_sat, &funding);
 	sign_tx_input(tx, 0, NULL, funding_wscript,
 		      &secrets.funding_privkey,
@@ -872,6 +1002,7 @@ static struct io_plan *handle_sign_remote_commitment_tx(struct io_conn *conn,
 						    &remote_funding_pubkey,
 						    &funding))
 		bad_req(conn, c, msg_in);
+	tx->chainparams = c->chainparams;
 
 	/* Basic sanity checks. */
 	if (tx->wtx->num_inputs != 1)
@@ -918,7 +1049,7 @@ static struct io_plan *handle_sign_remote_htlc_tx(struct io_conn *conn,
 					      &tx, &wscript, &amount,
 					      &remote_per_commit_point))
 		return bad_req(conn, c, msg_in);
-
+	tx->chainparams = c->chainparams;
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
 	derive_basepoints(&channel_seed, NULL, &basepoints, &secrets, NULL);
 
@@ -993,7 +1124,7 @@ static struct io_plan *handle_sign_delayed_payment_to_us(struct io_conn *conn,
 						     &tx, &wscript,
 						     &input_sat))
 		return bad_req(conn, c, msg_in);
-
+	tx->chainparams = c->chainparams;
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
 
 	/*~ ccan/crypto/shachain how we efficiently derive 2^48 ordered
@@ -1027,7 +1158,7 @@ static struct io_plan *handle_sign_delayed_payment_to_us(struct io_conn *conn,
 				    tx, &privkey, wscript, input_sat);
 }
 
-/*~ This is used when the a commitment transaction is onchain, and has an HTLC
+/*~ This is used when a commitment transaction is onchain, and has an HTLC
  * output paying to us (because we have the preimage); this signs that
  * transaction, which lightningd will broadcast to collect the funds. */
 static struct io_plan *handle_sign_remote_htlc_to_us(struct io_conn *conn,
@@ -1048,6 +1179,7 @@ static struct io_plan *handle_sign_remote_htlc_to_us(struct io_conn *conn,
 						 &input_sat))
 		return bad_req(conn, c, msg_in);
 
+	tx->chainparams = c->chainparams;
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
 
 	if (!derive_htlc_basepoint(&channel_seed, &htlc_basepoint,
@@ -1086,6 +1218,7 @@ static struct io_plan *handle_sign_penalty_to_us(struct io_conn *conn,
 					     &tx, &wscript,
 					     &input_sat))
 		return bad_req(conn, c, msg_in);
+	tx->chainparams = c->chainparams;
 
 	if (!pubkey_from_secret(&revocation_secret, &point))
 		return bad_req_fmt(conn, c, msg_in, "Failed deriving pubkey");
@@ -1109,7 +1242,7 @@ static struct io_plan *handle_sign_penalty_to_us(struct io_conn *conn,
 				    tx, &privkey, wscript, input_sat);
 }
 
-/*~ This is used when the a commitment transaction is onchain, and has an HTLC
+/*~ This is used when a commitment transaction is onchain, and has an HTLC
  * output paying to them, which has timed out; this signs that transaction,
  * which lightningd will broadcast to collect the funds. */
 static struct io_plan *handle_sign_local_htlc_tx(struct io_conn *conn,
@@ -1132,6 +1265,7 @@ static struct io_plan *handle_sign_local_htlc_tx(struct io_conn *conn,
 					     &input_sat))
 		return bad_req(conn, c, msg_in);
 
+	tx->chainparams = c->chainparams;
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
 
 	if (!derive_shaseed(&channel_seed, &shaseed))
@@ -1266,6 +1400,7 @@ static struct io_plan *handle_sign_mutual_close_tx(struct io_conn *conn,
 					       &funding))
 		return bad_req(conn, c, msg_in);
 
+	tx->chainparams = c->chainparams;
 	/* FIXME: We should know dust level, decent fee range and
 	 * balances, and final_keyindex, and thus be able to check tx
 	 * outputs! */
@@ -1316,7 +1451,7 @@ static struct io_plan *send_pending_client_fd(struct io_conn *conn,
 	return io_send_fd(conn, fd, true, client_read_next, master);
 }
 
-/*~ This is used by by the master to create a new client connection (which
+/*~ This is used by the master to create a new client connection (which
  * becomes the HSM_FD for the subdaemon after forking). */
 static struct io_plan *pass_client_hsmfd(struct io_conn *conn,
 					 struct client *c,
@@ -1337,8 +1472,8 @@ static struct io_plan *pass_client_hsmfd(struct io_conn *conn,
 		status_failed(STATUS_FAIL_INTERNAL_ERROR, "creating fds: %s",
 			      strerror(errno));
 
-	status_trace("new_client: %"PRIu64, dbid);
-	new_client(c, &id, dbid, capabilities, fds[0]);
+	status_debug("new_client: %"PRIu64, dbid);
+	new_client(c, c->chainparams, &id, dbid, capabilities, fds[0]);
 
 	/*~ We stash this in a global, because we need to get both the fd and
 	 * the client pointer to the callback.  The other way would be to
@@ -1367,9 +1502,20 @@ static void hsm_unilateral_close_privkey(struct privkey *dst,
 	get_channel_seed(&info->peer_id, info->channel_id, &channel_seed);
 	derive_basepoints(&channel_seed, NULL, &basepoints, &secrets, NULL);
 
-	if (!derive_simple_privkey(&secrets.payment_basepoint_secret,
-				   &basepoints.payment, &info->commitment_point,
-				   dst)) {
+	/* BOLT #3:
+	 *
+	 * If `option_static_remotekey` is negotiated the `remotepubkey`
+	 * is simply the remote node's `payment_basepoint`, otherwise it is
+	 * calculated as above using the remote node's `payment_basepoint`.
+	 */
+	/* In our UTXO representation, this is indicated by a NULL
+	 * commitment_point. */
+	if (!info->commitment_point)
+		dst->secret = secrets.payment_basepoint_secret;
+	else if (!derive_simple_privkey(&secrets.payment_basepoint_secret,
+					&basepoints.payment,
+					info->commitment_point,
+					dst)) {
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Deriving unilateral_close_privkey");
 	}
@@ -1439,7 +1585,7 @@ static void sign_all_inputs(struct bitcoin_tx *tx, struct utxo **utxos)
 
 		/* The witness is [sig] [key] */
 		bitcoin_tx_input_set_witness(
-		    tx, i, bitcoin_witness_p2wpkh(tx, &sig, &inkey));
+			tx, i, take(bitcoin_witness_p2wpkh(tx, &sig, &inkey)));
 	}
 }
 
@@ -1470,7 +1616,7 @@ static struct io_plan *handle_sign_funding_tx(struct io_conn *conn,
 	} else
 		changekey = NULL;
 
-	tx = funding_tx(tmpctx, &outnum,
+	tx = funding_tx(tmpctx, c->chainparams, &outnum,
 			/*~ For simplicity, our generated code is not const
 			 * correct.  The C rules around const and
 			 * pointer-to-pointer are a bit weird, so we use
@@ -1485,7 +1631,7 @@ static struct io_plan *handle_sign_funding_tx(struct io_conn *conn,
 	return req_reply(conn, c, take(towire_hsm_sign_funding_reply(NULL, tx)));
 }
 
-/*~ lightningd asks us to sign a withdrawal; same as above but we in theory
+/*~ lightningd asks us to sign a withdrawal; same as above but in theory
  * we can do more to check the previous case is valid. */
 static struct io_plan *handle_sign_withdrawal_tx(struct io_conn *conn,
 						 struct client *c,
@@ -1496,19 +1642,19 @@ static struct io_plan *handle_sign_withdrawal_tx(struct io_conn *conn,
 	struct utxo **utxos;
 	struct bitcoin_tx *tx;
 	struct pubkey changekey;
-	u8 *scriptpubkey;
+	struct bitcoin_tx_output **outputs;
 
 	if (!fromwire_hsm_sign_withdrawal(tmpctx, msg_in, &satoshi_out,
 					  &change_out, &change_keyindex,
-					  &scriptpubkey, &utxos))
+					  &outputs, &utxos))
 		return bad_req(conn, c, msg_in);
 
 	if (!bip32_pubkey(&secretstuff.bip32, &changekey, change_keyindex))
 		return bad_req_fmt(conn, c, msg_in,
 				   "Failed to get key %u", change_keyindex);
 
-	tx = withdraw_tx(tmpctx, cast_const2(const struct utxo **, utxos),
-			 scriptpubkey, satoshi_out,
+	tx = withdraw_tx(tmpctx, c->chainparams,
+			 cast_const2(const struct utxo **, utxos), outputs,
 			 &changekey, change_out, NULL, NULL);
 
 	sign_all_inputs(tx, utxos);
@@ -1553,7 +1699,7 @@ static struct io_plan *handle_sign_invoice(struct io_conn *conn,
 
 	/* FIXME: Check invoice! */
 
-	/* tal_dup_arr() does what you'd expect: allocate an array by copying
+	/*~ tal_dup_arr() does what you'd expect: allocate an array by copying
 	 * another; the cast is needed because the hrp is a 'char' array, not
 	 * a 'u8' (unsigned char) as it's the "human readable" part.
 	 *
@@ -1570,7 +1716,7 @@ static struct io_plan *handle_sign_invoice(struct io_conn *conn,
 	node_key(&node_pkey, NULL);
 	/*~ By no small coincidence, this libsecp routine uses the exact
 	 * recovery signature format mandated by BOLT 11. */
-        if (!secp256k1_ecdsa_sign_recoverable(secp256k1_ctx, &rsig,
+	if (!secp256k1_ecdsa_sign_recoverable(secp256k1_ctx, &rsig,
                                               (const u8 *)&sha,
                                               node_pkey.secret.data,
                                               NULL, NULL)) {
@@ -1622,6 +1768,48 @@ static struct io_plan *handle_sign_node_announcement(struct io_conn *conn,
 
 	reply = towire_hsm_node_announcement_sig_reply(NULL, &sig);
 	return req_reply(conn, c, take(reply));
+}
+
+/*~ lightningd asks us to sign a message.  I tweeted the spec
+ * in https://twitter.com/rusty_twit/status/1182102005914800128:
+ *
+ * @roasbeef & @bitconner point out that #lnd algo is:
+ *    zbase32(SigRec(SHA256(SHA256("Lightning Signed Message:" + msg)))).
+ * zbase32 from https://philzimmermann.com/docs/human-oriented-base-32-encoding.txt
+ * and SigRec has first byte 31 + recovery id, followed by 64 byte sig.  #specinatweet
+ */
+static struct io_plan *handle_sign_message(struct io_conn *conn,
+					   struct client *c,
+					   const u8 *msg_in)
+{
+	u8 *msg;
+	struct sha256_ctx sctx = SHA256_INIT;
+	struct sha256_double shad;
+	secp256k1_ecdsa_recoverable_signature rsig;
+	struct privkey node_pkey;
+
+	if (!fromwire_hsm_sign_message(tmpctx, msg_in, &msg))
+		return bad_req(conn, c, msg_in);
+
+	/* Prefixing by a known string means we'll never be convinced
+	 * to sign some gossip message, etc. */
+	sha256_update(&sctx, "Lightning Signed Message:",
+		      strlen("Lightning Signed Message:"));
+	sha256_update(&sctx, msg, tal_count(msg));
+	sha256_double_done(&sctx, &shad);
+
+	node_key(&node_pkey, NULL);
+	/*~ By no small coincidence, this libsecp routine uses the exact
+	 * recovery signature format mandated by BOLT 11. */
+	if (!secp256k1_ecdsa_sign_recoverable(secp256k1_ctx, &rsig,
+                                              shad.sha.u.u8,
+                                              node_pkey.secret.data,
+                                              NULL, NULL)) {
+		return bad_req_fmt(conn, c, msg_in, "Failed to sign message");
+	}
+
+	return req_reply(conn, c,
+			 take(towire_hsm_sign_message_reply(NULL, &rsig)));
 }
 
 #if DEVELOPER
@@ -1703,10 +1891,11 @@ static bool check_client_capabilities(struct client *client,
 	case WIRE_HSM_SIGN_COMMITMENT_TX:
 	case WIRE_HSM_GET_CHANNEL_BASEPOINTS:
 	case WIRE_HSM_DEV_MEMLEAK:
+	case WIRE_HSM_SIGN_MESSAGE:
 		return (client->capabilities & HSM_CAP_MASTER) != 0;
 
-	/*~ These are messages sent by the HSM so we should never receive them.
-	 * FIXME: Since we autogenerate these, we should really generate separate
+	/*~ These are messages sent by the HSM so we should never receive them. */
+	/* FIXME: Since we autogenerate these, we should really generate separate
 	 * enums for replies to avoid this kind of clutter! */
 	case WIRE_HSM_ECDH_RESP:
 	case WIRE_HSM_CANNOUNCEMENT_SIG_REPLY:
@@ -1724,6 +1913,7 @@ static bool check_client_capabilities(struct client *client,
 	case WIRE_HSM_CHECK_FUTURE_SECRET_REPLY:
 	case WIRE_HSM_GET_CHANNEL_BASEPOINTS_REPLY:
 	case WIRE_HSM_DEV_MEMLEAK_REPLY:
+	case WIRE_HSM_SIGN_MESSAGE_REPLY:
 		break;
 	}
 	return false;
@@ -1804,6 +1994,8 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSM_SIGN_MUTUAL_CLOSE_TX:
 		return handle_sign_mutual_close_tx(conn, c, c->msg_in);
 
+	case WIRE_HSM_SIGN_MESSAGE:
+		return handle_sign_message(conn, c, c->msg_in);
 #if DEVELOPER
 	case WIRE_HSM_DEV_MEMLEAK:
 		return handle_memleak(conn, c, c->msg_in);
@@ -1826,6 +2018,7 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSM_CHECK_FUTURE_SECRET_REPLY:
 	case WIRE_HSM_GET_CHANNEL_BASEPOINTS_REPLY:
 	case WIRE_HSM_DEV_MEMLEAK_REPLY:
+	case WIRE_HSM_SIGN_MESSAGE_REPLY:
 		break;
 	}
 
@@ -1853,7 +2046,7 @@ int main(int argc, char *argv[])
 	status_setup_async(status_conn);
 	uintmap_init(&clients);
 
-	master = new_client(NULL, NULL, 0, HSM_CAP_MASTER | HSM_CAP_SIGN_GOSSIP,
+	master = new_client(NULL, NULL, NULL, 0, HSM_CAP_MASTER | HSM_CAP_SIGN_GOSSIP,
 			    REQ_FD);
 
 	/* First client == lightningd. */
@@ -1862,7 +2055,7 @@ int main(int argc, char *argv[])
 	/* When conn closes, everything is freed. */
 	io_set_finish(master->conn, master_gone, master);
 
-	/*~ The two NULL args a list of timers, and the timer which expired:
+	/*~ The two NULL args are a list of timers, and the timer which expired:
 	 * we don't have any timers. */
 	io_loop(NULL, NULL);
 

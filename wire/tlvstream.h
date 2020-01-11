@@ -15,12 +15,18 @@ struct tlv_record_type {
 	void (*fromwire)(const u8 **cursor, size_t *max, void *record);
 };
 
-/* Pull all tlvs from a stream.  Return false and calls fromwire_fail() on
- * error. */
-bool fromwire_tlvs(const u8 **cursor, size_t *max,
-		   const struct tlv_record_type types[],
-		   size_t num_types,
-		   void *record);
+/* A single TLV field, consisting of the data and its associated metadata. */
+struct tlv_field {
+	/* If this is a type that is known to c-lightning we have a pointer to
+	 * the metadata. */
+	const struct tlv_record_type *meta;
+
+	/* In any case we'll have the numeric type, even if we don't have a
+	 * name that we can call it. */
+	u64 numtype;
+	size_t length;
+	u8 *value;
+};
 
 /* Append a stream of tlvs: types[] must be in increasing type order! */
 void towire_tlvs(u8 **pptr,

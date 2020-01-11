@@ -7,7 +7,7 @@ gossipd-wrongdir:
 default: gossipd-all
 
 # lightningd uses this:
-LIGHTNINGD_GOSSIP_CONTROL_HEADERS := gossipd/gen_gossip_wire.h gossipd/gossip_constants.h
+LIGHTNINGD_GOSSIP_CONTROL_HEADERS := gossipd/gen_gossip_wire.h
 LIGHTNINGD_GOSSIP_CONTROL_SRC := gossipd/gen_gossip_wire.c
 LIGHTNINGD_GOSSIP_CONTROL_OBJS := $(LIGHTNINGD_GOSSIP_CONTROL_SRC:.c=.o)
 
@@ -15,10 +15,14 @@ LIGHTNINGD_GOSSIP_CONTROL_OBJS := $(LIGHTNINGD_GOSSIP_CONTROL_SRC:.c=.o)
 LIGHTNINGD_GOSSIP_HEADERS_WSRC := gossipd/gen_gossip_wire.h \
 	gossipd/gen_gossip_peerd_wire.h \
 	gossipd/gen_gossip_store.h			\
+	gossipd/gossipd.h				\
 	gossipd/gossip_store.h				\
-	gossipd/routing.h
+	gossipd/queries.h				\
+	gossipd/gossip_generation.h			\
+	gossipd/routing.h				\
+	gossipd/seeker.h
 LIGHTNINGD_GOSSIP_HEADERS := $(LIGHTNINGD_GOSSIP_HEADERS_WSRC) gossipd/broadcast.h
-LIGHTNINGD_GOSSIP_SRC := $(LIGHTNINGD_GOSSIP_HEADERS_WSRC:.h=.c) gossipd/gossipd.c
+LIGHTNINGD_GOSSIP_SRC := $(LIGHTNINGD_GOSSIP_HEADERS_WSRC:.h=.c)
 LIGHTNINGD_GOSSIP_OBJS := $(LIGHTNINGD_GOSSIP_SRC:.c=.o)
 
 # Make sure these depend on everything.
@@ -40,16 +44,18 @@ GOSSIPD_COMMON_OBJS :=				\
 	common/base32.o				\
 	common/bech32.o				\
 	common/bech32_util.o			\
+	common/bigsize.o			\
 	common/bip32.o				\
 	common/crypto_state.o			\
 	common/cryptomsg.o			\
 	common/daemon.o				\
 	common/daemon_conn.o			\
-	common/decode_short_channel_ids.o	\
+	common/decode_array.o			\
 	common/derive_basepoints.o		\
 	common/dev_disconnect.o			\
 	common/features.o			\
 	common/gen_status_wire.o		\
+	common/gossip_rcvd_filter.o		\
 	common/key_derive.o			\
 	common/memleak.o			\
 	common/msg_queue.o			\

@@ -18,12 +18,6 @@ struct ripemd160;
 struct bitcoin_tx;
 struct bitcoin_block;
 
-enum bitcoind_mode {
-	BITCOIND_MAINNET = 1,
-	BITCOIND_TESTNET,
-	BITCOIND_REGTEST
-};
-
 enum bitcoind_prio {
 	BITCOIND_LOW_PRIO,
 	BITCOIND_HIGH_PRIO
@@ -43,14 +37,14 @@ struct bitcoind {
 	/* Main lightningd structure */
 	struct lightningd *ld;
 
+	/* Is bitcoind synced?  If not, we retry. */
+	bool synced;
+
 	/* How many high/low prio requests are we running (it's ratelimited) */
 	size_t num_requests[BITCOIND_NUM_PRIO];
 
 	/* Pending requests (high and low prio). */
 	struct list_head pending[BITCOIND_NUM_PRIO];
-
-	/* What network are we on? */
-	const struct chainparams *chainparams;
 
 	/* If non-zero, time we first hit a bitcoind error. */
 	unsigned int error_count;
@@ -65,6 +59,25 @@ struct bitcoind {
 
 	/* Passthrough parameters for bitcoin-cli */
 	char *rpcuser, *rpcpass, *rpcconnect, *rpcport;
+
+	struct list_head pending_getfilteredblock;
+};
+
+/* A single outpoint in a filtered block */
+struct filteredblock_outpoint {
+	struct bitcoin_txid txid;
+	u32 outnum;
+	u32 txindex;
+	const u8 *scriptPubKey;
+	struct amount_sat amount;
+};
+
+/* A struct representing a block with most of the parts filtered out. */
+struct filteredblock {
+	struct bitcoin_blkid id;
+	u32 height;
+	struct bitcoin_blkid prev_hash;
+	struct filteredblock_outpoint **outpoints;
 };
 
 struct bitcoind *new_bitcoind(const tal_t *ctx,
@@ -132,6 +145,20 @@ void bitcoind_getblockhash_(struct bitcoind *bitcoind,
 						   const struct bitcoin_blkid *), \
 			       (arg))
 
+void bitcoind_getfilteredblock_(struct bitcoind *bitcoind, u32 height,
+				void (*cb)(struct bitcoind *bitcoind,
+					   const struct filteredblock *fb,
+					   void *arg),
+				void *arg);
+#define bitcoind_getfilteredblock(bitcoind_, height, cb, arg)		\
+	bitcoind_getfilteredblock_((bitcoind_),				\
+				   (height),				\
+				   typesafe_cb_preargs(void, void *,	\
+						       (cb), (arg),	\
+						       struct bitcoind *, \
+						       const struct filteredblock *), \
+				   (arg))
+
 void bitcoind_getrawblock_(struct bitcoind *bitcoind,
 			   const struct bitcoin_blkid *blockid,
 			   void (*cb)(struct bitcoind *bitcoind,
@@ -146,26 +173,13 @@ void bitcoind_getrawblock_(struct bitcoind *bitcoind,
 						  struct bitcoin_block *), \
 			      (arg))
 
-void bitcoind_getoutput_(struct bitcoind *bitcoind,
-			 unsigned int blocknum, unsigned int txnum,
-			 unsigned int outnum,
-			 void (*cb)(struct bitcoind *bitcoind,
-				    const struct bitcoin_tx_output *output,
-				    void *arg),
-			 void *arg);
-#define bitcoind_getoutput(bitcoind_, blocknum, txnum, outnum, cb, arg)	\
-	bitcoind_getoutput_((bitcoind_), (blocknum), (txnum), (outnum),	\
-			    typesafe_cb_preargs(void, void *,		\
-						(cb), (arg),		\
-						struct bitcoind *,	\
-						const struct bitcoin_tx_output*), \
-			    (arg))
-
 void bitcoind_gettxout(struct bitcoind *bitcoind,
 		       const struct bitcoin_txid *txid, const u32 outnum,
 		       void (*cb)(struct bitcoind *bitcoind,
 				  const struct bitcoin_tx_output *txout,
 				  void *arg),
 		       void *arg);
+
+void bitcoind_getclientversion(struct bitcoind *bitcoind);
 
 #endif /* LIGHTNING_LIGHTNINGD_BITCOIND_H */

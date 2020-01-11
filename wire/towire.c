@@ -87,20 +87,13 @@ void towire_bool(u8 **pptr, bool v)
 	towire(pptr, &val, sizeof(val));
 }
 
-void towire_bigsize(u8 **pptr, const u64 val)
+void towire_bigsize(u8 **pptr, const bigsize_t val)
 {
-	if (val < 0xfd) {
-		towire_u8(pptr, val);
-	} else if (val <= 0xffff) {
-		towire_u8(pptr, 0xfd);
-		towire_u16(pptr, val);
-	} else if (val <= 0xffffffff) {
-		towire_u8(pptr, 0xfe);
-		towire_u32(pptr, val);
-	} else {
-		towire_u8(pptr, 0xff);
-		towire_u64(pptr, val);
-	}
+	u8 buf[BIGSIZE_MAX_LEN];
+	size_t len;
+
+	len = bigsize_put(buf, val);
+	towire(pptr, buf, len);
 }
 
 void towire_pubkey(u8 **pptr, const struct pubkey *pubkey)
@@ -255,4 +248,16 @@ void towire_bip32_key_version(u8 **pptr, const struct bip32_key_version *version
 {
 	towire_u32(pptr, version->bip32_pubkey_version);
 	towire_u32(pptr, version->bip32_privkey_version);
+}
+
+void towire_bitcoin_tx_output(u8 **pptr, const struct bitcoin_tx_output *output)
+{
+	towire_amount_sat(pptr, output->amount);
+	towire_u16(pptr, tal_count(output->script));
+	towire_u8_array(pptr, output->script, tal_count(output->script));
+}
+
+void towire_chainparams(u8 **cursor, const struct chainparams *chainparams)
+{
+	towire_bitcoin_blkid(cursor, &chainparams->genesis_blockhash);
 }

@@ -15,10 +15,6 @@
 /* eg: { "jsonrpc":"2.0", "method" : "dev-echo", "params" : [ "hello", "Arabella!" ], "id" : "1" } */
 #include "ccan/config.h"
 #include <arpa/inet.h>
-#include <bitcoin/address.h>
-#include <bitcoin/base58.h>
-#include <bitcoin/script.h>
-#include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
 #include <ccan/err/err.h>
 #include <ccan/io/io.h>
@@ -27,7 +23,7 @@
 #include <ccan/str/hex/hex.h>
 #include <ccan/strmap/strmap.h>
 #include <ccan/tal/str/str.h>
-#include <common/bech32.h>
+#include <common/configdir.h>
 #include <common/json_command.h>
 #include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
@@ -43,11 +39,14 @@
 #include <lightningd/log.h>
 #include <lightningd/memdump.h>
 #include <lightningd/options.h>
+#include <lightningd/plugin_hook.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <wallet/db.h>
+
 
 /* Dummy structure. */
 struct command_result {
@@ -106,7 +105,6 @@ struct json_connection {
 struct jsonrpc {
 	struct io_listener *rpc_listener;
 	struct json_command **commands;
-	struct log *log;
 
 	/* Map from json command names to usage strings: we don't put this inside
 	 * struct json_command as it's good practice to have those const. */
@@ -222,34 +220,6 @@ static const struct json_command stop_command = {
 AUTODATA(json_command, &stop_command);
 
 #if DEVELOPER
-static struct command_result *json_rhash(struct command *cmd,
-					 const char *buffer,
-					 const jsmntok_t *obj UNUSED,
-					 const jsmntok_t *params)
-{
-	struct json_stream *response;
-	struct sha256 *secret;
-
-	if (!param(cmd, buffer, params,
-		   p_req("secret", param_sha256, &secret),
-		   NULL))
-		return command_param_failed();
-
-	/* Hash in place. */
-	sha256(secret, secret, sizeof(*secret));
-	response = json_stream_success(cmd);
-	json_add_hex(response, "rhash", secret, sizeof(*secret));
-	return command_success(cmd, response);
-}
-
-static const struct json_command dev_rhash_command = {
-	"dev-rhash",
-	"developer",
-	json_rhash,
-	"Show SHA256 of {secret}"
-};
-AUTODATA(json_command, &dev_rhash_command);
-
 struct slowcmd {
 	struct command *cmd;
 	unsigned *msec;
@@ -314,7 +284,7 @@ static struct command_result *json_dev(struct command *cmd UNUSED,
 		/* Hash in place. */
 		sha256(secret, secret, sizeof(*secret));
 		response = json_stream_success(cmd);
-		json_add_hex(response, "rhash", secret, sizeof(*secret));
+		json_add_sha256(response, "rhash", secret);
 		return command_success(cmd, response);
 	}
 }
@@ -323,7 +293,13 @@ static const struct json_command dev_command = {
 	"dev",
 	"developer",
 	json_dev,
-	"Developer command test multiplexer"
+	"Developer command test multiplexer",
+	.verbose = "dev rhash {secret}\n"
+	"	Show SHA256 of {secret}\n"
+	"dev crash\n"
+	"	Crash lightningd by calling fatal()\n"
+	"dev slowcmd {msec}\n"
+	"	Torture test for slow commands, optional {msec}\n"
 };
 AUTODATA(json_command, &dev_command);
 #endif /* DEVELOPER */
@@ -423,6 +399,9 @@ static struct command_result *json_help(struct command *cmd,
 			json_add_help_command(cmd, response, commands[i]);
 	}
 	json_array_end(response);
+
+	/* Tell cli this is simple enough to be formatted flat for humans */
+	json_add_string(response, "format-hint", "simple");
 
 	return command_success(cmd, response);
 }
@@ -551,7 +530,7 @@ void json_stream_log_suppress_for_cmd(struct json_stream *js,
 {
 	const char *nm = cmd->json_cmd->name;
 	const char *s = tal_fmt(tmpctx, "Suppressing logging of %s command", nm);
-	log_io(cmd->jcon->log, LOG_IO_OUT, s, NULL, 0);
+	log_io(cmd->jcon->log, LOG_IO_OUT, NULL, s, NULL, 0);
 	json_stream_log_suppress(js, strdup(nm));
 
 }
@@ -598,6 +577,165 @@ struct json_stream *json_stream_fail(struct command *cmd,
 	return r;
 }
 
+static struct command_result *command_exec(struct json_connection *jcon,
+                                           struct command *cmd,
+                                           const char *buffer,
+                                           const jsmntok_t *request,
+                                           const jsmntok_t *params)
+{
+	struct command_result *res;
+
+	res = cmd->json_cmd->dispatch(cmd, buffer, request, params);
+
+	assert(res == &param_failed
+	       || res == &complete
+	       || res == &pending
+	       || res == &unknown);
+
+	/* If they didn't complete it, they must call command_still_pending.
+	 * If they completed it, it's freed already. */
+	if (res == &pending)
+		assert(cmd->pending);
+
+	list_for_each(&jcon->commands, cmd, list)
+		assert(cmd->pending);
+
+	return res;
+}
+
+/* A plugin hook to take over (fail/alter) RPC commands */
+struct rpc_command_hook_payload {
+	struct command *cmd;
+	const char *buffer;
+	const jsmntok_t *request;
+};
+
+static void rpc_command_hook_serialize(struct rpc_command_hook_payload *p,
+                                       struct json_stream *s)
+{
+	json_object_start(s, "rpc_command");
+	json_add_tok(s, "rpc_command", p->request, p->buffer);
+	json_object_end(s);
+}
+
+static void replace_command(struct rpc_command_hook_payload *p,
+			    const char *buffer,
+			    const jsmntok_t *replacetok)
+{
+	const jsmntok_t *method = NULL, *params = NULL;
+	const char *bad;
+
+	/* Must contain "method", "params" and "id" */
+	if (replacetok->type != JSMN_OBJECT) {
+		bad = "'replace' must be an object";
+		goto fail;
+	}
+
+	method = json_get_member(buffer, replacetok, "method");
+	if (!method) {
+		bad = "missing 'method'";
+		goto fail;
+	}
+	params = json_get_member(buffer, replacetok, "params");
+	if (!params) {
+		bad = "missing 'params'";
+		goto fail;
+	}
+	if (!json_get_member(buffer, replacetok, "id")) {
+		bad = "missing 'id'";
+		goto fail;
+	}
+
+	p->cmd->json_cmd = find_cmd(p->cmd->ld->jsonrpc, buffer, method);
+	if (!p->cmd->json_cmd) {
+		bad = tal_fmt(tmpctx, "redirected to unknown method '%.*s'",
+			      method->end - method->start,
+			      buffer + method->start);
+		goto fail;
+	}
+
+	was_pending(command_exec(p->cmd->jcon, p->cmd, buffer, replacetok,
+				 params));
+	return;
+
+fail:
+	was_pending(command_fail(p->cmd, JSONRPC2_INVALID_REQUEST,
+				 "Bad response to 'rpc_command' hook: %s", bad));
+}
+
+static void
+rpc_command_hook_callback(struct rpc_command_hook_payload *p,
+                          const char *buffer, const jsmntok_t *resulttok)
+{
+	const jsmntok_t *tok, *params, *custom_return, *tok_continue;
+	struct json_stream *response;
+	bool exec;
+
+	params = json_get_member(p->buffer, p->request, "params");
+
+	/* If no plugin registered, just continue command execution. Same if
+	 * the registered plugin tells us to do so. */
+	if (buffer == NULL)
+	    return was_pending(command_exec(p->cmd->jcon, p->cmd, p->buffer,
+		                                p->request, params));
+	else {
+		tok_continue = json_get_member(buffer, resulttok, "continue");
+		if (tok_continue && json_to_bool(buffer, tok_continue, &exec) && exec)
+			return was_pending(command_exec(p->cmd->jcon, p->cmd, p->buffer,
+			                                p->request, params));
+	}
+
+	/* If the registered plugin did not respond with continue,
+	 * it wants either to replace the request... */
+	tok = json_get_member(buffer, resulttok, "replace");
+	if (tok)
+		return replace_command(p, buffer, tok);
+
+	/* ...or return a custom JSONRPC response. */
+	tok = json_get_member(buffer, resulttok, "return");
+	if (tok) {
+		custom_return = json_get_member(buffer, tok, "result");
+		if (custom_return) {
+			response = json_start(p->cmd);
+			json_add_tok(response, "result", custom_return, buffer);
+			json_object_compat_end(response);
+			return was_pending(command_raw_complete(p->cmd, response));
+		}
+
+		custom_return = json_get_member(buffer, tok, "error");
+		if (custom_return) {
+			int code;
+			const char *errmsg;
+			if (!json_to_int(buffer, json_get_member(buffer, custom_return, "code"),
+			                 &code))
+				return was_pending(command_fail(p->cmd, JSONRPC2_INVALID_REQUEST,
+				                                "Bad response to 'rpc_command' hook: "
+				                                "'error' object does not contain a code."));
+			errmsg = json_strdup(tmpctx, buffer,
+			                     json_get_member(buffer, custom_return, "message"));
+			if (!errmsg)
+				return was_pending(command_fail(p->cmd, JSONRPC2_INVALID_REQUEST,
+				                                "Bad response to 'rpc_command' hook: "
+				                                "'error' object does not contain a message."));
+			response = json_stream_fail_nodata(p->cmd, code, errmsg);
+			return was_pending(command_failed(p->cmd, response));
+		}
+	}
+
+	was_pending(command_fail(p->cmd, JSONRPC2_INVALID_REQUEST,
+	                         "Bad response to 'rpc_command' hook."));
+}
+
+REGISTER_PLUGIN_HOOK(rpc_command, rpc_command_hook_callback,
+                     struct rpc_command_hook_payload *,
+                     rpc_command_hook_serialize,
+                     struct rpc_command_hook_payload *);
+
+static void call_rpc_command_hook(struct rpc_command_hook_payload *p)
+{
+	plugin_hook_call_rpc_command(p->cmd->ld, p, p);
+}
+
 /* We return struct command_result so command_fail return value has a natural
  * sink; we don't actually use the result. */
 static struct command_result *
@@ -605,7 +743,7 @@ parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 {
 	const jsmntok_t *method, *id, *params;
 	struct command *c;
-	struct command_result *res;
+	struct rpc_command_hook_payload *rpc_hook;
 
 	if (tok[0].type != JSMN_OBJECT) {
 		json_command_malformed(jcon, "null",
@@ -664,22 +802,18 @@ parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 				    jcon->buffer + method->start);
 	}
 
-	db_begin_transaction(jcon->ld->wallet->db);
-	res = c->json_cmd->dispatch(c, jcon->buffer, tok, params);
-	db_commit_transaction(jcon->ld->wallet->db);
+	rpc_hook = tal(c, struct rpc_command_hook_payload);
+	rpc_hook->cmd = c;
+	/* Duplicate since we might outlive the connection */
+	rpc_hook->buffer = tal_dup_arr(rpc_hook, char, jcon->buffer,
+	                               tal_count(jcon->buffer), 0);
+	rpc_hook->request = tal_dup_arr(rpc_hook, const jsmntok_t, tok,
+	                                tal_count(tok), 0);
+	/* Prevent a race between was_pending and still_pending */
+	new_reltimer(c->ld->timers, rpc_hook, time_from_msec(1),
+	             call_rpc_command_hook, rpc_hook);
 
-	assert(res == &param_failed
-	       || res == &complete
-	       || res == &pending
-	       || res == &unknown);
-
-	/* If they didn't complete it, they must call command_still_pending.
-	 * If they completed it, it's freed already. */
-	if (res == &pending)
-		assert(c->pending);
-	list_for_each(&jcon->commands, c, list)
-		assert(c->pending);
-	return res;
+	return command_still_pending(c);
 }
 
 /* Mutual recursion */
@@ -728,7 +862,7 @@ static struct io_plan *read_json(struct io_conn *conn,
 	bool valid;
 
 	if (jcon->len_read)
-		log_io(jcon->log, LOG_IO_IN, "",
+		log_io(jcon->log, LOG_IO_IN, NULL, "",
 		       jcon->buffer + jcon->used, jcon->len_read);
 
 	/* Resize larger if we're full. */
@@ -803,8 +937,8 @@ static struct io_plan *jcon_connected(struct io_conn *conn,
 	list_head_init(&jcon->commands);
 
 	/* We want to log on destruction, so we free this in destructor. */
-	jcon->log = new_log(ld->log_book, ld->log_book, "%sjcon fd %i:",
-			    log_prefix(ld->log), io_conn_fd(conn));
+	jcon->log = new_log(ld->log_book, ld->log_book, NULL, "jsonrpc#%i",
+			    io_conn_fd(conn));
 
 	tal_add_destructor(jcon, destroy_jcon);
 
@@ -895,6 +1029,14 @@ static void destroy_jsonrpc(struct jsonrpc *jsonrpc)
 	strmap_clear(&jsonrpc->usagemap);
 }
 
+#if DEVELOPER
+static void memleak_help_jsonrpc(struct htable *memtable,
+				 struct jsonrpc *jsonrpc)
+{
+	memleak_remove_strmap(memtable, &jsonrpc->usagemap);
+}
+#endif /* DEVELOPER */
+
 void jsonrpc_setup(struct lightningd *ld)
 {
 	struct json_command **commands = get_cmdlist();
@@ -902,7 +1044,6 @@ void jsonrpc_setup(struct lightningd *ld)
 	ld->jsonrpc = tal(ld, struct jsonrpc);
 	strmap_init(&ld->jsonrpc->usagemap);
 	ld->jsonrpc->commands = tal_arr(ld->jsonrpc, struct json_command *, 0);
-	ld->jsonrpc->log = new_log(ld->jsonrpc, ld->log_book, "jsonrpc");
 	for (size_t i=0; i<num_cmdlist; i++) {
 		if (!jsonrpc_command_add_perm(ld, ld->jsonrpc, commands[i]))
 			fatal("Cannot add duplicate command %s",
@@ -910,6 +1051,7 @@ void jsonrpc_setup(struct lightningd *ld)
 	}
 	ld->jsonrpc->rpc_listener = NULL;
 	tal_add_destructor(ld->jsonrpc, destroy_jsonrpc);
+	memleak_add_helper(ld->jsonrpc, memleak_help_jsonrpc);
 }
 
 bool command_usage_only(const struct command *cmd)
@@ -967,118 +1109,10 @@ void jsonrpc_listen(struct jsonrpc *jsonrpc, struct lightningd *ld)
 		err(1, "Binding rpc socket to '%s'", rpc_filename);
 	umask(old_umask);
 
-	if (listen(fd, 1) != 0)
+	if (listen(fd, 128) != 0)
 		err(1, "Listening on '%s'", rpc_filename);
 	jsonrpc->rpc_listener = io_new_listener(
 		ld->rpc_filename, fd, incoming_jcon_connected, ld);
-	log_debug(jsonrpc->log, "Listening on '%s'", ld->rpc_filename);
-}
-
-/**
- * segwit_addr_net_decode - Try to decode a Bech32 address and detect
- * testnet/mainnet/regtest/signet
- *
- * This processes the address and returns a string if it is a Bech32
- * address specified by BIP173. The string is set whether it is
- * testnet ("tb"),  mainnet ("bc"), regtest ("bcrt"), or signet ("sb")
- * It does not check, witness version and program size restrictions.
- *
- *  Out: witness_version: Pointer to an int that will be updated to contain
- *                 the witness program version (between 0 and 16 inclusive).
- *       witness_program: Pointer to a buffer of size 40 that will be updated
- *                 to contain the witness program bytes.
- *       witness_program_len: Pointer to a size_t that will be updated to
- *                 contain the length of bytes in witness_program.
- *  In:  addrz:    Pointer to the null-terminated address.
- *  Returns string containing the human readable segment of bech32 address
- */
-static const char *segwit_addr_net_decode(int *witness_version,
-					  uint8_t *witness_program,
-					  size_t *witness_program_len,
-					  const char *addrz,
-					  const struct chainparams *chainparams)
-{
-	if (segwit_addr_decode(witness_version, witness_program,
-			       witness_program_len, chainparams->bip173_name,
-			       addrz))
-		return chainparams->bip173_name;
-	else
-		return NULL;
-}
-
-enum address_parse_result
-json_tok_address_scriptpubkey(const tal_t *cxt,
-			      const struct chainparams *chainparams,
-			      const char *buffer,
-			      const jsmntok_t *tok, const u8 **scriptpubkey)
-{
-	struct bitcoin_address destination;
-	int witness_version;
-	/* segwit_addr_net_decode requires a buffer of size 40, and will
-	 * not write to the buffer if the address is too long, so a buffer
-	 * of fixed size 40 will not overflow. */
-	uint8_t witness_program[40];
-	size_t witness_program_len;
-
-	char *addrz;
-	const char *bip173;
-
-	bool parsed;
-	bool right_network;
-	u8 addr_version;
-
-	parsed =
-	    ripemd160_from_base58(&addr_version, &destination.addr,
-				  buffer + tok->start, tok->end - tok->start);
-
-	if (parsed) {
-		if (addr_version == chainparams->p2pkh_version) {
-			*scriptpubkey = scriptpubkey_p2pkh(cxt, &destination);
-			return ADDRESS_PARSE_SUCCESS;
-		} else if (addr_version == chainparams->p2sh_version) {
-			*scriptpubkey =
-			    scriptpubkey_p2sh_hash(cxt, &destination.addr);
-			return ADDRESS_PARSE_SUCCESS;
-		} else {
-			return ADDRESS_PARSE_WRONG_NETWORK;
-		}
-		/* Insert other parsers that accept pointer+len here. */
-	}
-
-	/* Generate null-terminated address. */
-	addrz = tal_dup_arr(cxt, char, buffer + tok->start, tok->end - tok->start, 1);
-	addrz[tok->end - tok->start] = '\0';
-
-	bip173 = segwit_addr_net_decode(&witness_version, witness_program,
-					&witness_program_len, addrz, chainparams);
-
-	if (bip173) {
-		bool witness_ok = false;
-		if (witness_version == 0 && (witness_program_len == 20 ||
-					     witness_program_len == 32)) {
-			witness_ok = true;
-		}
-		/* Insert other witness versions here. */
-
-		if (witness_ok) {
-			*scriptpubkey = scriptpubkey_witness_raw(cxt, witness_version,
-								 witness_program, witness_program_len);
-			parsed = true;
-			right_network = streq(bip173, chainparams->bip173_name);
-		}
-	}
-	/* Insert other parsers that accept null-terminated string here. */
-
-	tal_free(addrz);
-
-	if (parsed) {
-		if (right_network)
-			return ADDRESS_PARSE_SUCCESS;
-		else
-			return ADDRESS_PARSE_WRONG_NETWORK;
-	}
-
-	return ADDRESS_PARSE_UNRECOGNIZED;
 }
 
 static struct command_result *param_command(struct command *cmd,
@@ -1191,7 +1225,7 @@ static struct command_result *json_check(struct command *cmd,
 	if (params->type == JSMN_OBJECT)
 		name_tok--;
 
-	json_tok_remove(&mod_params, (jsmntok_t *)name_tok, 1);
+	json_tok_remove(&mod_params, mod_params, name_tok, 1);
 
 	cmd->mode = CMD_CHECK;
 	failed = false;
@@ -1218,11 +1252,3 @@ static const struct json_command check_command = {
 };
 
 AUTODATA(json_command, &check_command);
-
-#if DEVELOPER
-void jsonrpc_remove_memleak(struct htable *memtable,
-			    const struct jsonrpc *jsonrpc)
-{
-	memleak_remove_strmap(memtable, &jsonrpc->usagemap);
-}
-#endif /* DEVELOPER */

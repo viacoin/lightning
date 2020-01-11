@@ -89,8 +89,8 @@ struct channel {
 	/* Our funding tx pubkey. */
 	struct pubkey local_funding_pubkey;
 
-	/* Their scriptpubkey if they sent shutdown. */
-	u8 *remote_shutdown_scriptpubkey;
+	/* scriptpubkey for shutdown, if applicable. */
+	const u8 *shutdown_scriptpubkey[NUM_SIDES];
 	/* Address for any final outputs */
 	u64 final_key_idx;
 
@@ -117,6 +117,12 @@ struct channel {
 
 	/* If they used option_upfront_shutdown_script. */
 	const u8 *remote_upfront_shutdown_script;
+
+	/* Was this negotiated with `option_static_remotekey? */
+	bool option_static_remotekey;
+
+	/* Any commands trying to forget us. */
+	struct command **forgets;
 };
 
 struct channel *new_channel(struct peer *peer, u64 dbid,
@@ -151,6 +157,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const struct channel_info *channel_info,
 			    /* NULL or stolen */
 			    u8 *remote_shutdown_scriptpubkey,
+			    const u8 *local_shutdown_scriptpubkey,
 			    u64 final_key_idx,
 			    bool last_was_revoke,
 			    /* NULL or stolen */
@@ -165,7 +172,8 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    u32 feerate_base,
 			    u32 feerate_ppm,
 			    /* NULL or stolen */
-			    const u8 *remote_upfront_shutdown_script);
+			    const u8 *remote_upfront_shutdown_script,
+			    bool option_static_remotekey);
 
 void delete_channel(struct channel *channel);
 
@@ -175,14 +183,17 @@ const char *channel_state_str(enum channel_state state);
 void channel_set_owner(struct channel *channel, struct subd *owner);
 
 /* Channel has failed, but can try again. */
-PRINTF_FMT(2,3) void channel_fail_reconnect(struct channel *channel,
-					      const char *fmt, ...);
+void channel_fail_reconnect(struct channel *channel,
+			    const char *fmt, ...) PRINTF_FMT(2,3);
 /* Channel has failed, but can try again after a minute. */
-PRINTF_FMT(2,3) void channel_fail_reconnect_later(struct channel *channel,
-						  const char *fmt,...);
+void channel_fail_reconnect_later(struct channel *channel,
+				  const char *fmt,...) PRINTF_FMT(2,3);
 
 /* Channel has failed, give up on it. */
 void channel_fail_permanent(struct channel *channel, const char *fmt, ...);
+/* Forget the channel. This is only used for the case when we "receive" error
+ * during CHANNELD_AWAITING_LOCKIN if we are "fundee". */
+void channel_fail_forget(struct channel *channel, const char *fmt, ...);
 /* Permanent error, but due to internal problems, not peer. */
 void channel_internal_error(struct channel *channel, const char *fmt, ...);
 

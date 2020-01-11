@@ -9,12 +9,14 @@
 #include <channeld/commit_tx.h>
 #include <channeld/full_channel.h>
 #include <common/channel_config.h>
+#include <common/fee_states.h>
 #include <common/htlc.h>
 #include <common/htlc_trim.h>
 #include <common/htlc_tx.h>
 #include <common/htlc_wire.h>
 #include <common/key_derive.h>
 #include <common/keyset.h>
+#include <common/memleak.h>
 #include <common/status.h>
 #include <common/type_to_string.h>
 #include <inttypes.h>
@@ -23,42 +25,102 @@
   /* Needs to be at end, since it doesn't include its own hdrs */
   #include "gen_full_channel_error_names.h"
 
+#if DEVELOPER
+static void memleak_help_htlcmap(struct htable *memtable,
+				 struct htlc_map *htlcs)
+{
+	memleak_remove_htable(memtable, &htlcs->raw);
+}
+#endif /* DEVELOPER */
+
+/* This is a dangerous thing!  Because we apply HTLCs in many places
+ * in bulk, we can temporarily go negative.  You must check balance_ok()
+ * at the end! */
+struct balance {
+	s64 msat;
+};
+
+static void to_balance(struct balance *balance,
+		       const struct amount_msat msat)
+{
+	balance->msat = msat.millisatoshis; /* Raw: balance */
+	assert(balance->msat >= 0);
+}
+
+/* What does adding the HTLC do to the balance for this side (subtracts) */
+static void balance_add_htlc(struct balance *balance,
+			     const struct htlc *htlc,
+			     enum side side)
+{
+	if (htlc_owner(htlc) == side)
+		balance->msat -= htlc->amount.millisatoshis; /* Raw: balance */
+}
+
+/* What does removing the HTLC do to the balance for this side (adds) */
+static void balance_remove_htlc(struct balance *balance,
+				const struct htlc *htlc,
+				enum side side)
+{
+	enum side paid_to;
+
+	/* Fulfilled HTLCs are paid to recipient, otherwise returns to owner */
+	if (htlc->r)
+		paid_to = !htlc_owner(htlc);
+	else
+		paid_to = htlc_owner(htlc);
+
+	if (side == paid_to)
+		balance->msat += htlc->amount.millisatoshis; /* Raw: balance */
+}
+
+static bool balance_ok(const struct balance *balance,
+		       struct amount_msat *msat)
+	WARN_UNUSED_RESULT;
+
+static bool balance_ok(const struct balance *balance,
+		       struct amount_msat *msat)
+{
+	if (balance->msat < 0)
+		return false;
+	msat->millisatoshis = balance->msat; /* Raw: balance */
+	return true;
+}
+
 struct channel *new_full_channel(const tal_t *ctx,
-				 const struct bitcoin_blkid *chain_hash,
 				 const struct bitcoin_txid *funding_txid,
 				 unsigned int funding_txout,
 				 u32 minimum_depth,
 				 struct amount_sat funding,
 				 struct amount_msat local_msat,
-				 const u32 feerate_per_kw[NUM_SIDES],
+				 const struct fee_states *fee_states,
 				 const struct channel_config *local,
 				 const struct channel_config *remote,
 				 const struct basepoints *local_basepoints,
 				 const struct basepoints *remote_basepoints,
 				 const struct pubkey *local_funding_pubkey,
 				 const struct pubkey *remote_funding_pubkey,
+				 bool option_static_remotekey,
 				 enum side funder)
 {
 	struct channel *channel = new_initial_channel(ctx,
-						      chain_hash,
 						      funding_txid,
 						      funding_txout,
 						      minimum_depth,
 						      funding,
 						      local_msat,
-						      feerate_per_kw[LOCAL],
+						      fee_states,
 						      local, remote,
 						      local_basepoints,
 						      remote_basepoints,
 						      local_funding_pubkey,
 						      remote_funding_pubkey,
+						      option_static_remotekey,
 						      funder);
 
 	if (channel) {
-		/* Feerates can be different. */
-		channel->view[REMOTE].feerate_per_kw = feerate_per_kw[REMOTE];
 		channel->htlcs = tal(channel, struct htlc_map);
 		htlc_map_init(channel->htlcs);
+		memleak_add_helper(channel->htlcs, memleak_help_htlcmap);
 		tal_add_destructor(channel->htlcs, htlc_map_clear);
 	}
 	return channel;
@@ -71,34 +133,6 @@ static void htlc_arr_append(const struct htlc ***arr, const struct htlc *htlc)
 	tal_arr_expand(arr, htlc);
 }
 
-/* What does adding the HTLC do to the balance for this side (subtracts) */
-static bool WARN_UNUSED_RESULT balance_add_htlc(struct amount_msat *msat,
-						const struct htlc *htlc,
-						enum side side)
-{
-	if (htlc_owner(htlc) == side)
-		return amount_msat_sub(msat, *msat, htlc->amount);
-	return true;
-}
-
-/* What does removing the HTLC do to the balance for this side (adds) */
-static bool WARN_UNUSED_RESULT balance_remove_htlc(struct amount_msat *msat,
-						   const struct htlc *htlc,
-						   enum side side)
-{
-	enum side paid_to;
-
-	/* Fulfilled HTLCs are paid to recipient, otherwise returns to owner */
-	if (htlc->r)
-		paid_to = !htlc_owner(htlc);
-	else
-		paid_to = htlc_owner(htlc);
-
-	if (side == paid_to)
-		return amount_msat_add(msat, *msat, htlc->amount);
-	return true;
-}
-
 static void dump_htlc(const struct htlc *htlc, const char *prefix)
 {
 	enum htlc_state remote_state;
@@ -108,7 +142,7 @@ static void dump_htlc(const struct htlc *htlc, const char *prefix)
 	else
 		remote_state = htlc->state - 10;
 
-	status_trace("%s: HTLC %s %"PRIu64" = %s/%s %s",
+	status_debug("%s: HTLC %s %"PRIu64" = %s/%s %s",
 		     prefix,
 		     htlc_owner(htlc) == LOCAL ? "LOCAL" : "REMOTE",
 		     htlc->id,
@@ -196,7 +230,7 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 {
 	size_t i;
 	struct bitcoin_txid txid;
-	u32 feerate_per_kw = channel->view[side].feerate_per_kw;
+	u32 feerate_per_kw = channel_feerate(channel, side);
 
 	/* Get txid of commitment transaction */
 	bitcoin_txid((*txs)[0], &txid);
@@ -210,7 +244,7 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 			continue;
 
 		if (htlc_owner(htlc) == side) {
-			tx = htlc_timeout_tx(*txs, &txid, i,
+			tx = htlc_timeout_tx(*txs, chainparams, &txid, i,
 					     htlc->amount,
 					     htlc->expiry.locktime,
 					     channel->config[!side].to_self_delay,
@@ -222,7 +256,7 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 						     &htlc->rhash,
 						     &keyset->self_revocation_key);
 		} else {
-			tx = htlc_success_tx(*txs, &txid, i,
+			tx = htlc_success_tx(*txs, chainparams, &txid, i,
 					     htlc->amount,
 					     channel->config[!side].to_self_delay,
 					     feerate_per_kw,
@@ -259,6 +293,7 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	if (!derive_keyset(per_commitment_point,
 			   &channel->basepoints[side],
 			   &channel->basepoints[!side],
+			   channel->option_static_remotekey,
 			   &keyset))
 		return NULL;
 
@@ -266,20 +301,14 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	gather_htlcs(ctx, channel, side, &committed, NULL, NULL);
 
 	txs = tal_arr(ctx, struct bitcoin_tx *, 1);
-	txs[0] = commit_tx(ctx, &channel->funding_txid,
-		       channel->funding_txout,
-		       channel->funding,
-		       channel->funder,
-		       channel->config[!side].to_self_delay,
-		       &keyset,
-		       channel->view[side].feerate_per_kw,
-		       channel->config[side].dust_limit,
-		       channel->view[side].owed[side],
-		       channel->view[side].owed[!side],
-		       committed,
-		       htlcmap,
-		       commitment_number ^ channel->commitment_number_obscurer,
-		       side);
+	txs[0] = commit_tx(
+	    ctx, &channel->funding_txid, channel->funding_txout,
+	    channel->funding, channel->funder,
+	    channel->config[!side].to_self_delay, &keyset,
+	    channel_feerate(channel, side),
+	    channel->config[side].dust_limit, channel->view[side].owed[side],
+	    channel->view[side].owed[!side], committed, htlcmap,
+	    commitment_number ^ channel->commitment_number_obscurer, side);
 
 	*wscripts = tal_arr(ctx, const u8 *, 1);
 	(*wscripts)[0] = bitcoin_redeem_2of2(*wscripts,
@@ -299,34 +328,33 @@ static bool get_room_above_reserve(const struct channel *channel,
 				   const struct htlc **adding,
 				   const struct htlc **removing,
 				   enum side side,
-				   struct amount_msat *balance)
+				   struct amount_msat *remainder)
 {
-	bool ok;
 	/* Reserve is set by the *other* side */
 	struct amount_sat reserve = channel->config[!side].channel_reserve;
+	struct balance balance;
 
-	*balance = view->owed[side];
+	to_balance(&balance, view->owed[side]);
 
-	ok = true;
 	for (size_t i = 0; i < tal_count(removing); i++)
-		ok &= balance_remove_htlc(balance, removing[i], side);
+		balance_remove_htlc(&balance, removing[i], side);
 
 	for (size_t i = 0; i < tal_count(adding); i++)
-		ok &= balance_add_htlc(balance, adding[i], side);
+		balance_add_htlc(&balance, adding[i], side);
 
 	/* Can happen if amount completely exceeds capacity */
-	if (!ok) {
-		status_trace("Failed to add %zu remove %zu htlcs",
+	if (!balance_ok(&balance, remainder)) {
+		status_debug("Failed to add %zu remove %zu htlcs",
 			     tal_count(adding), tal_count(removing));
 		return false;
 	}
 
-	if (!amount_msat_sub_sat(balance, *balance, reserve)) {
-		status_trace("%s cannot afford htlc: would make balance %s"
+	if (!amount_msat_sub_sat(remainder, *remainder, reserve)) {
+		status_debug("%s cannot afford htlc: would make balance %s"
 			     " below reserve %s",
 			     side_to_str(side),
 			     type_to_string(tmpctx, struct amount_msat,
-					    balance),
+					    remainder),
 			     type_to_string(tmpctx, struct amount_sat,
 					    &reserve));
 		return false;
@@ -341,7 +369,7 @@ static struct amount_sat fee_for_htlcs(const struct channel *channel,
 				       const struct htlc **removing,
 				       enum side side)
 {
-	u32 feerate = view->feerate_per_kw;
+	u32 feerate = channel_feerate(channel, side);
 	struct amount_sat dust_limit = channel->config[side].dust_limit;
 	size_t untrimmed;
 
@@ -371,6 +399,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	enum side sender = htlc_state_owner(state), recipient = !sender;
 	const struct htlc **committed, **adding, **removing;
 	const struct channel_view *view;
+	u32 min_concurrent_htlcs;
 
 	htlc = tal(tmpctx, struct htlc);
 
@@ -430,10 +459,13 @@ static enum channel_add_err add_htlc(struct channel *channel,
 
 	/* BOLT #2:
 	 *
+	 * A sending node:
+	 *...
 	 * - for channels with `chain_hash` identifying the Bitcoin blockchain:
 	 *    - MUST set the four most significant bytes of `amount_msat` to 0.
 	 */
-	if (amount_msat_greater(htlc->amount, channel->chainparams->max_payment)) {
+	if (sender == LOCAL
+	    && amount_msat_greater(htlc->amount, chainparams->max_payment)) {
 		return CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
 	}
 
@@ -447,8 +479,16 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	 *     HTLCs to its local commitment transaction...
 	 *     - SHOULD fail the channel.
 	 */
+	/* Also we should not add more htlc's than sender or recipient
+	 * configured.  This mitigates attacks in which a peer can force the
+	 * funder of the channel to pay unnecessary onchain fees during a fee
+	 * spike with large commitment transactions.
+	 */
+	min_concurrent_htlcs = channel->config[recipient].max_accepted_htlcs;
+	if (min_concurrent_htlcs > channel->config[sender].max_accepted_htlcs)
+		min_concurrent_htlcs = channel->config[sender].max_accepted_htlcs;
 	if (tal_count(committed) - tal_count(removing) + tal_count(adding)
-	    > channel->config[recipient].max_accepted_htlcs) {
+	    > min_concurrent_htlcs) {
 		return CHANNEL_ERR_TOO_MANY_HTLCS;
 	}
 
@@ -494,7 +534,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	 *    - SHOULD fail the channel.
 	 */
 	if (enforce_aggregate_limits) {
-		struct amount_msat balance;
+		struct amount_msat remainder;
 		struct amount_sat fee = fee_for_htlcs(channel, view,
 						      committed,
 						      adding,
@@ -508,20 +548,20 @@ static enum channel_add_err add_htlc(struct channel *channel,
 		 *
 		 * The change is being applied to the receiver but it will
 		 * come back to the sender after revoke_and_ack.  So the check
-		 * here is that the balance to the sender doesn't go below the
+		 * here is that the remainder to the sender doesn't go below the
 		 * sender's reserve. */
 		if (!get_room_above_reserve(channel, view,
 					    adding, removing, sender,
-					    &balance))
+					    &remainder))
 			return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
 
 		if (channel->funder == sender) {
-			if (amount_msat_less_sat(balance, fee)) {
-				status_trace("Cannot afford fee %s with %s above reserve",
+			if (amount_msat_less_sat(remainder, fee)) {
+				status_debug("Cannot afford fee %s with %s above reserve",
 					     type_to_string(tmpctx, struct amount_sat,
 							    &fee),
 					     type_to_string(tmpctx, struct amount_msat,
-							    &balance));
+							    &remainder));
 				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
 			}
 		}
@@ -532,7 +572,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 			if (!get_room_above_reserve(channel, view,
 						    adding, removing,
 						    channel->funder,
-						    &balance))
+						    &remainder))
 				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
 			/* Should be able to afford both their own commit tx
 			 * fee, and other's commit tx fee, which are subtly
@@ -545,14 +585,14 @@ static enum channel_add_err add_htlc(struct channel *channel,
 			/* set fee output pointer if given */
 			if (htlc_fee && amount_sat_greater(fee, *htlc_fee))
 				*htlc_fee = fee;
-			if (amount_msat_less_sat(balance, fee)) {
-				status_trace("Funder could not afford own fee %s with %s above reserve",
+			if (amount_msat_less_sat(remainder, fee)) {
+				status_debug("Funder could not afford own fee %s with %s above reserve",
 					     type_to_string(tmpctx,
 							    struct amount_sat,
 							    &fee),
 					     type_to_string(tmpctx,
 							    struct amount_msat,
-							    &balance));
+							    &remainder));
 				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
 			}
 			fee = fee_for_htlcs(channel, view,
@@ -563,14 +603,14 @@ static enum channel_add_err add_htlc(struct channel *channel,
 			/* set fee output pointer if given */
 			if (htlc_fee && amount_sat_greater(fee, *htlc_fee))
 				*htlc_fee = fee;
-			if (amount_msat_less_sat(balance, fee)) {
-				status_trace("Funder could not afford peer's fee %s with %s above reserve",
+			if (amount_msat_less_sat(remainder, fee)) {
+				status_debug("Funder could not afford peer's fee %s with %s above reserve",
 					     type_to_string(tmpctx,
 							    struct amount_sat,
 							    &fee),
 					     type_to_string(tmpctx,
 							    struct amount_msat,
-							    &balance));
+							    &remainder));
 				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
 			}
 		}
@@ -580,13 +620,6 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	htlc_map_add(channel->htlcs, tal_steal(channel, htlc));
 	if (htlcp)
 		*htlcp = htlc;
-
-	/* This is simply setting changes_pending[receiver] unless it's
-	 * an exotic state (i.e. channel_force_htlcs) */
-	if (htlc_state_flags(htlc->state) & HTLC_LOCAL_F_PENDING)
-		channel->changes_pending[LOCAL] = true;
-	if (htlc_state_flags(htlc->state) & HTLC_REMOTE_F_PENDING)
-		channel->changes_pending[REMOTE] = true;
 
 	return CHANNEL_ERR_ADD_OK;
 }
@@ -652,7 +685,7 @@ enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
 	 *    - MUST fail the channel.
 	 */
 	if (!htlc_has(htlc, HTLC_FLAG(!htlc_owner(htlc), HTLC_F_COMMITTED))) {
-		status_trace("channel_fulfill_htlc: %"PRIu64" in state %s",
+		status_unusual("channel_fulfill_htlc: %"PRIu64" in state %s",
 			     htlc->id, htlc_state_name(htlc->state));
 		return CHANNEL_ERR_HTLC_UNCOMMITTED;
 	}
@@ -673,12 +706,10 @@ enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
 	else if (htlc->state == RCVD_ADD_ACK_REVOCATION)
 		htlc->state = SENT_REMOVE_HTLC;
 	else {
-		status_trace("channel_fulfill_htlc: %"PRIu64" in state %s",
+		status_unusual("channel_fulfill_htlc: %"PRIu64" in state %s",
 			     htlc->id, htlc_state_name(htlc->state));
 		return CHANNEL_ERR_HTLC_NOT_IRREVOCABLE;
 	}
-	/* The HTLC owner is the recipient of the fulfillment. */
-	channel->changes_pending[owner] = true;
 
 	dump_htlc(htlc, "FULFILL:");
 
@@ -706,7 +737,7 @@ enum channel_remove_err channel_fail_htlc(struct channel *channel,
 	 *     - MUST fail the channel.
 	 */
 	if (!htlc_has(htlc, HTLC_FLAG(!htlc_owner(htlc), HTLC_F_COMMITTED))) {
-		status_trace("channel_fail_htlc: %"PRIu64" in state %s",
+		status_unusual("channel_fail_htlc: %"PRIu64" in state %s",
 			     htlc->id, htlc_state_name(htlc->state));
 		return CHANNEL_ERR_HTLC_UNCOMMITTED;
 	}
@@ -718,12 +749,10 @@ enum channel_remove_err channel_fail_htlc(struct channel *channel,
 	else if (htlc->state == RCVD_ADD_ACK_REVOCATION)
 		htlc->state = SENT_REMOVE_HTLC;
 	else {
-		status_trace("channel_fail_htlc: %"PRIu64" in state %s",
+		status_unusual("channel_fail_htlc: %"PRIu64" in state %s",
 			     htlc->id, htlc_state_name(htlc->state));
 		return CHANNEL_ERR_HTLC_NOT_IRREVOCABLE;
 	}
-	/* The HTLC owner is the recipient of the failure. */
-	channel->changes_pending[owner] = true;
 
 	dump_htlc(htlc, "FAIL:");
 	if (htlcp)
@@ -733,12 +762,13 @@ enum channel_remove_err channel_fail_htlc(struct channel *channel,
 
 static void htlc_incstate(struct channel *channel,
 			  struct htlc *htlc,
-			  enum side sidechanged)
+			  enum side sidechanged,
+			  struct balance owed[NUM_SIDES])
 {
 	int preflags, postflags;
 	const int committed_f = HTLC_FLAG(sidechanged, HTLC_F_COMMITTED);
 
-	status_trace("htlc %"PRIu64": %s->%s", htlc->id,
+	status_debug("htlc %"PRIu64": %s->%s", htlc->id,
 		     htlc_state_name(htlc->state),
 		     htlc_state_name(htlc->state+1));
 
@@ -752,62 +782,53 @@ static void htlc_incstate(struct channel *channel,
 
 	/* If we've added or removed, adjust balances. */
 	if (!(preflags & committed_f) && (postflags & committed_f)) {
-		status_trace("htlc added %s: local %s remote %s",
+		status_debug("htlc added %s: local %"PRId64" remote %"PRId64,
 			     side_to_str(sidechanged),
-			     type_to_string(tmpctx, struct amount_msat,
-					    &channel->view[sidechanged].owed[LOCAL]),
-			     type_to_string(tmpctx, struct amount_msat,
-					    &channel->view[sidechanged].owed[REMOTE]));
-		if (!balance_add_htlc(&channel->view[sidechanged].owed[LOCAL],
-				      htlc, LOCAL))
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Cannot add htlc #%"PRIu64" %s"
-				      " to LOCAL",
-				      htlc->id,
-				      type_to_string(tmpctx, struct amount_msat,
-						     &htlc->amount));
-		if (!balance_add_htlc(&channel->view[sidechanged].owed[REMOTE],
-				      htlc, REMOTE))
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Cannot add htlc #%"PRIu64" %s"
-				      " to REMOTE",
-				      htlc->id,
-				      type_to_string(tmpctx, struct amount_msat,
-						     &htlc->amount));
-		status_trace("-> local %s remote %s",
-			     type_to_string(tmpctx, struct amount_msat,
-					    &channel->view[sidechanged].owed[LOCAL]),
-			     type_to_string(tmpctx, struct amount_msat,
-					    &channel->view[sidechanged].owed[REMOTE]));
+			     owed[LOCAL].msat, owed[REMOTE].msat);
+		balance_add_htlc(&owed[LOCAL], htlc, LOCAL);
+		balance_add_htlc(&owed[REMOTE], htlc, REMOTE);
+		status_debug("-> local %"PRId64" remote %"PRId64,
+			     owed[LOCAL].msat, owed[REMOTE].msat);
 	} else if ((preflags & committed_f) && !(postflags & committed_f)) {
-		status_trace("htlc added %s: local %s remote %s",
+		status_debug("htlc added %s: local %"PRId64" remote %"PRId64,
 			     side_to_str(sidechanged),
-			     type_to_string(tmpctx, struct amount_msat,
-					    &channel->view[sidechanged].owed[LOCAL]),
-			     type_to_string(tmpctx, struct amount_msat,
-					    &channel->view[sidechanged].owed[REMOTE]));
-		if (!balance_remove_htlc(&channel->view[sidechanged].owed[LOCAL],
-					 htlc, LOCAL))
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Cannot remove htlc #%"PRIu64" %s"
-				      " from LOCAL",
-				      htlc->id,
-				      type_to_string(tmpctx, struct amount_msat,
-						     &htlc->amount));
-		if (!balance_remove_htlc(&channel->view[sidechanged].owed[REMOTE],
-					 htlc, REMOTE))
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Cannot remove htlc #%"PRIu64" %s"
-				      " from REMOTE",
-				      htlc->id,
-				      type_to_string(tmpctx, struct amount_msat,
-						     &htlc->amount));
-		status_trace("-> local %s remote %s",
-			     type_to_string(tmpctx, struct amount_msat,
-					    &channel->view[sidechanged].owed[LOCAL]),
-			     type_to_string(tmpctx, struct amount_msat,
-					    &channel->view[sidechanged].owed[REMOTE]));
+			     owed[LOCAL].msat, owed[REMOTE].msat);
+		balance_remove_htlc(&owed[LOCAL], htlc, LOCAL);
+		balance_remove_htlc(&owed[REMOTE], htlc, REMOTE);
+		status_debug("-> local %"PRId64" remote %"PRId64,
+			     owed[LOCAL].msat, owed[REMOTE].msat);
 	}
+}
+
+/* Returns true if a change was made. */
+static bool fee_incstate(struct channel *channel,
+			 enum side sidechanged,
+			 enum htlc_state hstate)
+{
+	int preflags, postflags;
+	const int committed_f = HTLC_FLAG(sidechanged, HTLC_F_COMMITTED);
+
+	preflags = htlc_state_flags(hstate);
+	postflags = htlc_state_flags(hstate + 1);
+
+	/* You can't change sides. */
+	assert((preflags & (HTLC_LOCAL_F_OWNER|HTLC_REMOTE_F_OWNER))
+	       == (postflags & (HTLC_LOCAL_F_OWNER|HTLC_REMOTE_F_OWNER)));
+
+	/* These only advance through ADDING states. */
+	if (!(htlc_state_flags(hstate) & HTLC_ADDING))
+		return false;
+
+	if (!inc_fee_state(channel->fee_states, hstate))
+		return false;
+
+	if (!(preflags & committed_f) && (postflags & committed_f))
+		status_debug("Feerate: %s->%s %s now %u",
+			     htlc_state_name(hstate),
+			     htlc_state_name(hstate+1),
+			     side_to_str(sidechanged),
+			     *channel->fee_states->feerate[hstate+1]);
+	return true;
 }
 
 /* Returns flags which were changed. */
@@ -822,13 +843,17 @@ static int change_htlcs(struct channel *channel,
 	struct htlc *h;
 	int cflags = 0;
 	size_t i;
+	struct balance owed[NUM_SIDES];
+
+	for (i = 0; i < NUM_SIDES; i++)
+		to_balance(&owed[i], channel->view[sidechanged].owed[i]);
 
 	for (h = htlc_map_first(channel->htlcs, &it);
 	     h;
 	     h = htlc_map_next(channel->htlcs, &it)) {
 		for (i = 0; i < n_hstates; i++) {
 			if (h->state == htlc_states[i]) {
-				htlc_incstate(channel, h, sidechanged);
+				htlc_incstate(channel, h, sidechanged, owed);
 				dump_htlc(h, prefix);
 				htlc_arr_append(htlcs, h);
 				cflags |= (htlc_state_flags(htlc_states[i])
@@ -836,6 +861,26 @@ static int change_htlcs(struct channel *channel,
 			}
 		}
 	}
+
+	for (i = 0; i < NUM_SIDES; i++) {
+		if (!balance_ok(&owed[i], &channel->view[sidechanged].owed[i])) {
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "%s: %s balance underflow: %s -> %"PRId64,
+				      side_to_str(sidechanged),
+				      side_to_str(i),
+				      type_to_string(tmpctx, struct amount_msat,
+						     &channel->view[sidechanged].owed[i]),
+				      owed[i].msat);
+		}
+	}
+
+	/* Update fees. */
+	for (i = 0; i < n_hstates; i++) {
+		if (fee_incstate(channel, sidechanged, htlc_states[i]))
+			cflags |= (htlc_state_flags(htlc_states[i])
+				   ^ htlc_state_flags(htlc_states[i]+1));
+	}
+
 	return cflags;
 }
 
@@ -861,7 +906,28 @@ u32 approx_max_feerate(const struct channel *channel)
 	/* Assume none are trimmed; this gives lower bound on feerate. */
 	num = tal_count(committed) + tal_count(adding) - tal_count(removing);
 
+	/* BOLT #3:
+	 *
+	 * commitment_transaction: 125 + 43 * num-htlc-outputs bytes
+	 *	- version: 4 bytes
+	 *	- witness_header <---- part of the witness data
+	 *	- count_tx_in: 1 byte
+	 *	- tx_in: 41 bytes
+	 *		funding_input
+	 *	- count_tx_out: 1 byte
+	 *	- tx_out: 74 + 43 * num-htlc-outputs bytes
+	 *		output_paying_to_remote,
+	 *		output_paying_to_local,
+	 *		....htlc_output's...
+	 *	- lock_time: 4 bytes
+	 */
+	/* Those 74 bytes static output are effectively 2 outputs, one
+	 * `output_paying_to_local` and one `output_paying_to_remote`. So when
+	 * adding the elements overhead we need to add 2 + num htlcs
+	 * outputs. */
+
 	weight = 724 + 172 * num;
+	weight = elements_add_overhead(weight, 1, num + 2);
 
 	/* We should never go below reserve. */
 	if (!amount_sat_sub(&avail,
@@ -908,7 +974,7 @@ bool can_funder_afford_feerate(const struct channel *channel, u32 feerate_per_kw
 			      type_to_string(tmpctx, struct amount_sat,
 					     &channel->config[!channel->funder].channel_reserve));
 
-	status_trace("We need %s at feerate %u for %zu untrimmed htlcs: we have %s/%s",
+	status_debug("We need %s at feerate %u for %zu untrimmed htlcs: we have %s/%s",
 		     type_to_string(tmpctx, struct amount_sat, &needed),
 		     feerate_per_kw, untrimmed,
 		     type_to_string(tmpctx, struct amount_msat,
@@ -924,37 +990,27 @@ bool channel_update_feerate(struct channel *channel, u32 feerate_per_kw)
 	if (!can_funder_afford_feerate(channel, feerate_per_kw))
 		return false;
 
-	status_trace("Setting %s feerate to %u",
+	status_debug("Setting %s feerate to %u",
 		     side_to_str(!channel->funder), feerate_per_kw);
 
-	channel->view[!channel->funder].feerate_per_kw = feerate_per_kw;
-	channel->changes_pending[!channel->funder] = true;
+	start_fee_update(channel->fee_states, channel->funder, feerate_per_kw);
 	return true;
-}
-
-u32 channel_feerate(const struct channel *channel, enum side side)
-{
-	return channel->view[side].feerate_per_kw;
 }
 
 bool channel_sending_commit(struct channel *channel,
 			    const struct htlc ***htlcs)
 {
+	int change;
 	const enum htlc_state states[] = { SENT_ADD_HTLC,
 					   SENT_REMOVE_REVOCATION,
 					   SENT_ADD_REVOCATION,
 					   SENT_REMOVE_HTLC };
-	status_trace("Trying commit");
+	status_debug("Trying commit");
 
-	if (!channel->changes_pending[REMOTE]) {
-		assert(change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states),
-				    htlcs, "testing sending_commit") == 0);
+	change = change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states),
+			      htlcs, "sending_commit");
+	if (!change)
 		return false;
-	}
-
-	change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states),
-		     htlcs, "sending_commit");
-	channel->changes_pending[REMOTE] = false;
 
 	return true;
 }
@@ -968,47 +1024,28 @@ bool channel_rcvd_revoke_and_ack(struct channel *channel,
 					   SENT_ADD_ACK_COMMIT,
 					   SENT_REMOVE_COMMIT };
 
-	status_trace("Received revoke_and_ack");
+	status_debug("Received revoke_and_ack");
 	change = change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states),
 			      htlcs, "rcvd_revoke_and_ack");
 
 	/* Their ack can queue changes on our side. */
-	if (change & HTLC_LOCAL_F_PENDING)
-		channel->changes_pending[LOCAL] = true;
-
-	/* For funder, ack also means time to apply new feerate locally. */
-	if (channel->funder == LOCAL &&
-	    (channel->view[LOCAL].feerate_per_kw
-	     != channel->view[REMOTE].feerate_per_kw)) {
-		status_trace("Applying feerate %u to LOCAL",
-			     channel->view[REMOTE].feerate_per_kw);
-		channel->view[LOCAL].feerate_per_kw
-			= channel->view[REMOTE].feerate_per_kw;
-		channel->changes_pending[LOCAL] = true;
-	}
-
-	return channel->changes_pending[LOCAL];
+	return (change & HTLC_LOCAL_F_PENDING);
 }
 
 /* FIXME: We can actually merge these two... */
 bool channel_rcvd_commit(struct channel *channel, const struct htlc ***htlcs)
 {
+	int change;
 	const enum htlc_state states[] = { RCVD_ADD_REVOCATION,
 					   RCVD_REMOVE_HTLC,
 					   RCVD_ADD_HTLC,
 					   RCVD_REMOVE_REVOCATION };
 
-	status_trace("Received commit");
-	if (!channel->changes_pending[LOCAL]) {
-		assert(change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states),
-				    htlcs, "testing rcvd_commit") == 0);
+	status_debug("Received commit");
+	change = change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states),
+			      htlcs, "rcvd_commit");
+	if (!change)
 		return false;
-	}
-
-	change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states), htlcs,
-		     "rcvd_commit");
-
-	channel->changes_pending[LOCAL] = false;
 	return true;
 }
 
@@ -1019,26 +1056,12 @@ bool channel_sending_revoke_and_ack(struct channel *channel)
 					   RCVD_REMOVE_COMMIT,
 					   RCVD_ADD_COMMIT,
 					   RCVD_REMOVE_ACK_COMMIT };
-	status_trace("Sending revoke_and_ack");
+	status_debug("Sending revoke_and_ack");
 	change = change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states), NULL,
 			      "sending_revoke_and_ack");
 
 	/* Our ack can queue changes on their side. */
-	if (change & HTLC_REMOTE_F_PENDING)
-		channel->changes_pending[REMOTE] = true;
-
-	/* For non-funder, sending ack means we apply any fund changes to them */
-	if (channel->funder == REMOTE
-	    && (channel->view[LOCAL].feerate_per_kw
-		!= channel->view[REMOTE].feerate_per_kw)) {
-		status_trace("Applying feerate %u to REMOTE",
-			     channel->view[LOCAL].feerate_per_kw);
-		channel->view[REMOTE].feerate_per_kw
-			= channel->view[LOCAL].feerate_per_kw;
-		channel->changes_pending[REMOTE] = true;
-	}
-
-	return channel->changes_pending[REMOTE];
+	return (change & HTLC_REMOTE_F_PENDING);
 }
 
 size_t num_channel_htlcs(const struct channel *channel)
@@ -1057,7 +1080,8 @@ size_t num_channel_htlcs(const struct channel *channel)
 	return n;
 }
 
-static bool adjust_balance(struct channel *channel, struct htlc *htlc)
+static bool adjust_balance(struct balance view_owed[NUM_SIDES][NUM_SIDES],
+			   struct htlc *htlc)
 {
 	enum side side;
 
@@ -1067,24 +1091,8 @@ static bool adjust_balance(struct channel *channel, struct htlc *htlc)
 			continue;
 
 		/* Add it. */
-		if (!balance_add_htlc(&channel->view[side].owed[LOCAL],
-				      htlc, LOCAL)) {
-			status_broken("Cannot add htlc #%"PRIu64" %s"
-				      " to LOCAL",
-				      htlc->id,
-				      type_to_string(tmpctx, struct amount_msat,
-						     &htlc->amount));
-			return false;
-		}
-		if (!balance_add_htlc(&channel->view[side].owed[REMOTE],
-				      htlc, REMOTE)) {
-			status_broken("Cannot add htlc #%"PRIu64" %s"
-				      " to REMOTE",
-				      htlc->id,
-				      type_to_string(tmpctx, struct amount_msat,
-						     &htlc->amount));
-			return false;
-		}
+		balance_add_htlc(&view_owed[side][LOCAL], htlc, LOCAL);
+		balance_add_htlc(&view_owed[side][REMOTE], htlc, REMOTE);
 
 		/* If it is no longer committed, remove it (depending
 		 * on fail || fulfill). */
@@ -1100,24 +1108,8 @@ static bool adjust_balance(struct channel *channel, struct htlc *htlc)
 				      htlc_state_name(htlc->state));
 			return false;
 		}
-		if (!balance_remove_htlc(&channel->view[side].owed[LOCAL],
-					 htlc, LOCAL)) {
-			status_broken("Cannot remove htlc #%"PRIu64" %s"
-				      " from LOCAL",
-				      htlc->id,
-				      type_to_string(tmpctx, struct amount_msat,
-						     &htlc->amount));
-			return false;
-		}
-		if (!balance_remove_htlc(&channel->view[side].owed[REMOTE],
-					 htlc, REMOTE)) {
-			status_broken("Cannot remove htlc #%"PRIu64" %s"
-				      " from REMOTE",
-				      htlc->id,
-				      type_to_string(tmpctx, struct amount_msat,
-						     &htlc->amount));
-			return false;
-		}
+		balance_remove_htlc(&view_owed[side][LOCAL], htlc, LOCAL);
+		balance_remove_htlc(&view_owed[side][REMOTE], htlc, REMOTE);
 	}
 	return true;
 }
@@ -1128,34 +1120,37 @@ bool channel_force_htlcs(struct channel *channel,
 			 const struct fulfilled_htlc *fulfilled,
 			 const enum side *fulfilled_sides,
 			 const struct failed_htlc **failed,
-			 const enum side *failed_sides)
+			 const enum side *failed_sides,
+			 u32 failheight)
 {
 	size_t i;
 	struct htlc *htlc;
 	struct htlc_map_iter it;
+	struct balance view_owed[NUM_SIDES][NUM_SIDES];
 
 	if (tal_count(hstates) != tal_count(htlcs)) {
-		status_trace("#hstates %zu != #htlcs %zu",
+		status_broken("#hstates %zu != #htlcs %zu",
 			     tal_count(hstates), tal_count(htlcs));
 		return false;
 	}
 
 	if (tal_count(fulfilled) != tal_count(fulfilled_sides)) {
-		status_trace("#fulfilled sides %zu != #fulfilled %zu",
+		status_broken("#fulfilled sides %zu != #fulfilled %zu",
 			     tal_count(fulfilled_sides), tal_count(fulfilled));
 		return false;
 	}
 
 	if (tal_count(failed) != tal_count(failed_sides)) {
-		status_trace("#failed sides %zu != #failed %zu",
+		status_broken("#failed sides %zu != #failed %zu",
 			     tal_count(failed_sides), tal_count(failed));
 		return false;
 	}
+
 	for (i = 0; i < tal_count(htlcs); i++) {
 		enum channel_add_err e;
 		struct htlc *htlc;
 
-		status_trace("Restoring HTLC %zu/%zu:"
+		status_debug("Restoring HTLC %zu/%zu:"
 			     " id=%"PRIu64" amount=%s cltv=%u"
 			     " payment_hash=%s",
 			     i, tal_count(htlcs),
@@ -1172,7 +1167,7 @@ bool channel_force_htlcs(struct channel *channel,
 			     &htlcs[i].payment_hash,
 			     htlcs[i].onion_routing_packet, &htlc, false, NULL);
 		if (e != CHANNEL_ERR_ADD_OK) {
-			status_trace("%s HTLC %"PRIu64" failed error %u",
+			status_broken("%s HTLC %"PRIu64" failed error %u",
 				     htlc_state_owner(hstates[i]) == LOCAL
 				     ? "out" : "in", htlcs[i].id, e);
 			return false;
@@ -1184,31 +1179,31 @@ bool channel_force_htlcs(struct channel *channel,
 						     fulfilled_sides[i],
 						     fulfilled[i].id);
 		if (!htlc) {
-			status_trace("Fulfill %s HTLC %"PRIu64" not found",
+			status_broken("Fulfill %s HTLC %"PRIu64" not found",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id);
 			return false;
 		}
 		if (htlc->r) {
-			status_trace("Fulfill %s HTLC %"PRIu64" already fulfilled",
+			status_broken("Fulfill %s HTLC %"PRIu64" already fulfilled",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id);
 			return false;
 		}
 		if (htlc->fail) {
-			status_trace("Fulfill %s HTLC %"PRIu64" already failed",
+			status_broken("Fulfill %s HTLC %"PRIu64" already failed",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id);
 			return false;
 		}
 		if (htlc->failcode) {
-			status_trace("Fulfill %s HTLC %"PRIu64" already fail %u",
+			status_broken("Fulfill %s HTLC %"PRIu64" already fail %u",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id, htlc->failcode);
 			return false;
 		}
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
-			status_trace("Fulfill %s HTLC %"PRIu64" state %s",
+			status_broken("Fulfill %s HTLC %"PRIu64" state %s",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id,
 				     htlc_state_name(htlc->state));
@@ -1223,37 +1218,41 @@ bool channel_force_htlcs(struct channel *channel,
 		htlc = channel_get_htlc(channel, failed_sides[i],
 					failed[i]->id);
 		if (!htlc) {
-			status_trace("Fail %s HTLC %"PRIu64" not found",
+			status_broken("Fail %s HTLC %"PRIu64" not found",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     failed[i]->id);
 			return false;
 		}
 		if (htlc->r) {
-			status_trace("Fail %s HTLC %"PRIu64" already fulfilled",
+			status_broken("Fail %s HTLC %"PRIu64" already fulfilled",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     failed[i]->id);
 			return false;
 		}
 		if (htlc->fail) {
-			status_trace("Fail %s HTLC %"PRIu64" already failed",
+			status_broken("Fail %s HTLC %"PRIu64" already failed",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     failed[i]->id);
 			return false;
 		}
 		if (htlc->failcode) {
-			status_trace("Fail %s HTLC %"PRIu64" already fail %u",
+			status_broken("Fail %s HTLC %"PRIu64" already fail %u",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     failed[i]->id, htlc->failcode);
 			return false;
 		}
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
-			status_trace("Fail %s HTLC %"PRIu64" state %s",
+			status_broken("Fail %s HTLC %"PRIu64" state %s",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id,
 				     htlc_state_name(htlc->state));
 			return false;
 		}
 		htlc->failcode = failed[i]->failcode;
+		/* We assume they all failed at the same height, which is
+		 * not necessarily true in case of restart.  But it's only
+		 * a hint. */
+		htlc->failblock = failheight;
 		if (failed[i]->failreason)
 			htlc->fail = tal_dup_arr(htlc, u8,
 						 failed[i]->failreason,
@@ -1269,13 +1268,37 @@ bool channel_force_htlcs(struct channel *channel,
 			htlc->failed_scid = NULL;
 	}
 
-	/* Now adjust balances.  The balance never goes negative, because
-	 * we do them in id order. */
+	/* You'd think, since we traverse HTLCs in ID order, this would never
+	 * go negative.  But this ignores the fact that HTLCs ids from each
+	 * side have no correlation with each other.  Copy into struct balance,
+	 * to allow transient underflow. */
+	for (int view = 0; view < NUM_SIDES; view++) {
+		for (int side = 0; side < NUM_SIDES; side++) {
+			to_balance(&view_owed[view][side],
+				   channel->view[view].owed[side]);
+		}
+	}
+
 	for (htlc = htlc_map_first(channel->htlcs, &it);
 	     htlc;
 	     htlc = htlc_map_next(channel->htlcs, &it)) {
-		if (!adjust_balance(channel, htlc))
+		if (!adjust_balance(view_owed, htlc))
 			return false;
+	}
+
+	/* Convert back and check */
+	for (int view = 0; view < NUM_SIDES; view++) {
+		for (int side = 0; side < NUM_SIDES; side++) {
+			if (!balance_ok(&view_owed[view][side],
+					&channel->view[view].owed[side])) {
+				status_broken("view %s[%s] balance underflow:"
+					      " %"PRId64,
+					      side_to_str(view),
+					      side_to_str(side),
+					      view_owed[view][side].msat);
+				return false;
+			}
+		}
 	}
 
 	return true;

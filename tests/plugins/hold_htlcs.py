@@ -17,7 +17,7 @@ plugin = Plugin()
 
 
 @plugin.hook("htlc_accepted")
-def on_htlc_accepted(htlc, onion, plugin):
+def on_htlc_accepted(htlc, onion, plugin, **kwargs):
     # Stash the onion so the test can check it
     fname = os.path.join(tempfile.mkdtemp(), "onion.json")
     with open(fname, 'w') as f:
@@ -32,6 +32,11 @@ def on_htlc_accepted(htlc, onion, plugin):
     # Give the tester something to look for
     plugin.log("htlc_accepted hook called")
     return {'result': 'continue'}
+
+
+@plugin.init()
+def init(options, configuration, plugin):
+    plugin.log("hold_htlcs.py initializing")
 
 
 plugin.run()

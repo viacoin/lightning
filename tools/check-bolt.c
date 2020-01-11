@@ -102,9 +102,14 @@ static char *find_bolt_ref(const char *prefix, char **p, size_t *len)
 		size_t preflen;
 
 		/* BOLT #X: */
-		*p = strstr(*p, prefix);
+		*p = strchr(*p, '*');
 		if (!*p)
 			return NULL;
+		*p += 1;
+		while (cisspace(**p))
+			(*p)++;
+		if (strncmp(*p, prefix, strlen(prefix)) != 0)
+			continue;
 		*p += strlen(prefix);
 		while (cisspace(**p))
 			(*p)++;
@@ -165,6 +170,8 @@ static char *code_to_regex(const char *code, size_t len, bool escape)
 		case '^':
 		case '[':
 		case ']':
+		case '{':
+		case '}':
 		case '(':
 		case ')':
 		case '+':

@@ -1,5 +1,6 @@
 #include <ccan/fdpass/fdpass.h>
 #include <common/crypto_sync.h>
+#include <common/gossip_rcvd_filter.h>
 #include <common/gossip_store.h>
 #include <common/peer_failed.h>
 #include <common/per_peer_state.h>
@@ -118,7 +119,6 @@ void handle_gossip_msg(struct per_peer_state *pps, const u8 *msg TAKES)
 
 	/* Gossipd can send us gossip messages, OR errors */
 	if (fromwire_peektype(gossip) == WIRE_ERROR) {
-		status_debug("Gossipd told us to send error");
 		sync_crypto_write(pps, gossip);
 		peer_failed_connection_lost();
 	} else {
@@ -148,15 +148,26 @@ bool handle_timestamp_filter(struct per_peer_state *pps, const u8 *msg TAKES)
 
 bool handle_peer_gossip_or_error(struct per_peer_state *pps,
 				 const struct channel_id *channel_id,
+				 bool soft_error,
 				 const u8 *msg TAKES)
 {
 	char *err;
 	bool all_channels;
 	struct channel_id actual;
 
+	/* BOLT #1:
+	 *
+	 * A receiving node:
+	 *   - upon receiving a message of _odd_, unknown type:
+	 *     - MUST ignore the received message.
+	 */
+	if (is_unknown_msg_discardable(msg))
+		goto handled;
+
 	if (handle_timestamp_filter(pps, msg))
 		return true;
 	else if (is_msg_for_gossipd(msg)) {
+		gossip_rcvd_filter_add(pps->grf, msg);
 		wire_sync_write(pps->gossip_fd, msg);
 		/* wire_sync_write takes, so don't take again. */
 		return true;
@@ -166,7 +177,8 @@ bool handle_peer_gossip_or_error(struct per_peer_state *pps,
 		if (err)
 			peer_failed_received_errmsg(pps, err,
 						    all_channels
-						    ? NULL : channel_id);
+						    ? NULL : channel_id,
+						    soft_error);
 
 		/* Ignore unknown channel errors. */
 		goto handled;
@@ -174,7 +186,7 @@ bool handle_peer_gossip_or_error(struct per_peer_state *pps,
 
 	/* They're talking about a different channel? */
 	if (is_wrong_channel(msg, channel_id, &actual)) {
-		status_trace("Rejecting %s for unknown channel_id %s",
+		status_debug("Rejecting %s for unknown channel_id %s",
 			     wire_type_name(fromwire_peektype(msg)),
 			     type_to_string(tmpctx, struct channel_id, &actual));
 		sync_crypto_write(pps,

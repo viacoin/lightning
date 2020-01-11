@@ -21,8 +21,8 @@ struct gossip_getnodes_entry *fromwire_gossip_getnodes_entry(const tal_t *ctx,
 	}
 
 	flen = fromwire_u16(pptr, max);
-	entry->globalfeatures = tal_arr(entry, u8, flen);
-	fromwire_u8_array(pptr, max, entry->globalfeatures, flen);
+	entry->features = tal_arr(entry, u8, flen);
+	fromwire_u8_array(pptr, max, entry->features, flen);
 
 	numaddresses = fromwire_u8(pptr, max);
 
@@ -49,9 +49,8 @@ void towire_gossip_getnodes_entry(u8 **pptr,
 	if (entry->last_timestamp < 0)
 		return;
 
-	towire_u16(pptr, tal_count(entry->globalfeatures));
-	towire_u8_array(pptr, entry->globalfeatures,
-			tal_count(entry->globalfeatures));
+	towire_u16(pptr, tal_count(entry->features));
+	towire_u8_array(pptr, entry->features, tal_count(entry->features));
 	towire_u8(pptr, tal_count(entry->addresses));
 	for (size_t i = 0; i < tal_count(entry->addresses); i++) {
 		towire_wireaddr(pptr, &entry->addresses[i]);
@@ -67,6 +66,7 @@ void fromwire_route_hop(const u8 **pptr, size_t *max, struct route_hop *entry)
 	entry->direction = fromwire_u8(pptr, max);
 	entry->amount = fromwire_amount_msat(pptr, max);
 	entry->delay = fromwire_u32(pptr, max);
+	entry->style = fromwire_u8(pptr, max);
 }
 
 void towire_route_hop(u8 **pptr, const struct route_hop *entry)
@@ -76,6 +76,7 @@ void towire_route_hop(u8 **pptr, const struct route_hop *entry)
 	towire_u8(pptr, entry->direction);
 	towire_amount_msat(pptr, entry->amount);
 	towire_u32(pptr, entry->delay);
+	towire_u8(pptr, entry->style);
 }
 
 void fromwire_route_info(const u8 **pptr, size_t *max, struct route_info *entry)
@@ -172,26 +173,32 @@ void towire_gossip_getchannels_entry(u8 **pptr,
 		towire_bool(pptr, false);
 }
 
-struct peer_features *
-fromwire_peer_features(const tal_t *ctx, const u8 **pptr, size_t *max)
+struct exclude_entry *fromwire_exclude_entry(const tal_t *ctx,
+					     const u8 **pptr, size_t *max)
 {
-	struct peer_features *pf = tal(ctx, struct peer_features);
-	size_t len;
-
-	len = fromwire_u16(pptr, max);
-	pf->localfeatures = tal_arr(pf, u8, len);
-	fromwire_u8_array(pptr, max, pf->localfeatures, len);
-
-	len = fromwire_u16(pptr, max);
-	pf->globalfeatures = tal_arr(pf, u8, len);
-	fromwire_u8_array(pptr, max, pf->globalfeatures, len);
-	return pf;
+	struct exclude_entry *entry = tal(ctx, struct exclude_entry);
+	entry->type = fromwire_u8(pptr, max);
+	switch (entry->type) {
+		case EXCLUDE_CHANNEL:
+			fromwire_short_channel_id_dir(pptr, max, &entry->u.chan_id);
+			return entry;
+		case EXCLUDE_NODE:
+			fromwire_node_id(pptr, max, &entry->u.node_id);
+			return entry;
+		default:
+			fromwire_fail(pptr, max);
+			return NULL;
+	}
 }
 
-void towire_peer_features(u8 **pptr, const struct peer_features *pf)
+void towire_exclude_entry(u8 **pptr, const struct exclude_entry *entry)
 {
-	towire_u16(pptr, tal_count(pf->localfeatures));
-	towire_u8_array(pptr, pf->localfeatures, tal_count(pf->localfeatures));
-	towire_u16(pptr, tal_count(pf->globalfeatures));
-	towire_u8_array(pptr, pf->globalfeatures, tal_count(pf->globalfeatures));
+	assert(entry->type == EXCLUDE_CHANNEL ||
+	       entry->type == EXCLUDE_NODE);
+
+	towire_u8(pptr, entry->type);
+	if (entry->type == EXCLUDE_CHANNEL)
+		towire_short_channel_id_dir(pptr, &entry->u.chan_id);
+	else
+		towire_node_id(pptr, &entry->u.node_id);
 }

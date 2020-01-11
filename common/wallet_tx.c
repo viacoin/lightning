@@ -3,6 +3,7 @@
 #include <common/json_command.h>
 #include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
+#include <common/utils.h>
 #include <common/wallet_tx.h>
 #include <inttypes.h>
 #include <wallet/wallet.h>
@@ -70,7 +71,7 @@ struct command_result *param_utxos(struct command *cmd,
 								"Could not get a txid out of \"%s\"",
 								json_strdup(tmpctx, buffer, &txid_tok));
 		}
-		if(!json_to_number(buffer, (const jsmntok_t*)&outnum_tok, outnum))
+		if (!json_to_number(buffer, (const jsmntok_t*)&outnum_tok, outnum))
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 								"Could not get a vout out of \"%s\"",
 								json_strdup(tmpctx, buffer, &outnum_tok));
@@ -97,9 +98,9 @@ struct command_result *param_utxos(struct command *cmd,
 							" 'txid:output_index'.");
 	if (tal_count(*utxos) == 0)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-							"No matching utxo was found from the wallet."
+							"No matching utxo was found from the wallet. "
 							"You can get a list of the wallet utxos with"
-							" the `listfunds` RPC call.");
+							" the `listfunds` RPC call.");
 	return NULL;
 }
 
@@ -107,10 +108,17 @@ static struct command_result *check_amount(const struct wallet_tx *wtx,
 					   struct amount_sat amount)
 {
 	if (tal_count(wtx->utxos) == 0) {
+		/* Since it's possible the lack of utxos is because we haven't finished
+		 * syncing yet, report a sync timing error first */
+		if (!topology_synced(wtx->cmd->ld->topology))
+			return command_fail(wtx->cmd, FUNDING_STILL_SYNCING_BITCOIN,
+					    "Still syncing with bitcoin network");
+
 		return command_fail(wtx->cmd, FUND_CANNOT_AFFORD,
 				    "Cannot afford transaction");
 	}
-	if (amount_sat_less(amount, get_chainparams(wtx->cmd->ld)->dust_limit)) {
+
+	if (amount_sat_less(amount, chainparams->dust_limit)) {
 		return command_fail(wtx->cmd, FUND_OUTPUT_IS_DUST,
 				    "Output %s would be dust",
 				    type_to_string(tmpctx, struct amount_sat,
@@ -152,15 +160,25 @@ struct command_result *wtx_select_utxos(struct wallet_tx *tx,
 	}
 
 	tx->utxos = wallet_select_coins(tx, tx->cmd->ld->wallet,
-					tx->amount,
+					true, tx->amount,
 					fee_rate_per_kw, out_len,
 					maxheight,
 					&fee_estimate, &tx->change);
+	if (!tx->utxos) {
+		/* Try again, without change this time */
+		tx->utxos = wallet_select_coins(tx, tx->cmd->ld->wallet,
+						false, tx->amount,
+						fee_rate_per_kw, out_len,
+						maxheight,
+						&fee_estimate, &tx->change);
+
+	}
+
 	res = check_amount(tx, tx->amount);
 	if (res)
 		return res;
 
-	if (amount_sat_less(tx->change, get_chainparams(tx->cmd->ld)->dust_limit)) {
+	if (amount_sat_less(tx->change, chainparams->dust_limit)) {
 		tx->change = AMOUNT_SAT(0);
 		tx->change_key_index = 0;
 	} else {
@@ -184,7 +202,8 @@ struct command_result *wtx_from_utxos(struct wallet_tx *tx,
 
 	/* The transaction has `tal_count(tx.utxos)` inputs and one output */
 	/* (version + in count + out count + locktime)  (index + value + script length) */
-	weight = 4 * (4 + 1 + 1 + 4) + 4 * (8 + 1 + out_len);
+	/* + segwit marker + flag */
+	weight = 4 * (4 + 1 + 1 + 4) + 4 * (8 + 1 + out_len) + 1 + 1;
 	for (size_t i = 0; i < tal_count(utxos); i++) {
 		if (!*utxos[i]->blockheight || *utxos[i]->blockheight > maxheight) {
 			tal_arr_remove(&utxos, i);
@@ -200,13 +219,13 @@ struct command_result *wtx_from_utxos(struct wallet_tx *tx,
 		if (!amount_sat_add(&total_amount, total_amount, utxos[i]->amount))
 			fatal("Overflow when computing input amount");
 	}
-	tx->utxos = utxos;
+	tx->utxos = tal_steal(tx, utxos);
 
 	if (!tx->all_funds && amount_sat_less(tx->amount, total_amount)
 			&& !amount_sat_sub(&tx->change, total_amount, tx->amount))
 		fatal("Overflow when computing change");
-	if (amount_sat_greater_eq(tx->change, get_chainparams(tx->cmd->ld)->dust_limit)) {
-		tx->change_key_index = wallet_get_newindex(tx->cmd->ld);
+
+	if (amount_sat_greater_eq(tx->change, chainparams->dust_limit)) {
 		/* Add the change output's weight */
 		weight += (8 + 1 + out_len) * 4;
 	}
@@ -221,11 +240,20 @@ struct command_result *wtx_from_utxos(struct wallet_tx *tx,
 								type_to_string(tmpctx, struct amount_sat,
 									&fee_estimate));
 	} else {
-		if (!amount_sat_sub(&tx->change, tx->change, fee_estimate))
-			return command_fail(tx->cmd, FUND_CANNOT_AFFORD,
-								"Cannot afford transaction with %s sats of fees",
-								type_to_string(tmpctx, struct amount_sat,
-									&fee_estimate));
+		if (!amount_sat_sub(&tx->change, tx->change, fee_estimate)) {
+			/* Try again without a change output */
+			weight -= (8 + 1 + out_len) * 4;
+			fee_estimate = amount_tx_fee(fee_rate_per_kw, weight);
+			if (!amount_sat_sub(&tx->change, tx->change, fee_estimate))
+				return command_fail(tx->cmd, FUND_CANNOT_AFFORD,
+						    "Cannot afford transaction with %s sats of fees",
+						    type_to_string(tmpctx, struct amount_sat,
+								   &fee_estimate));
+			tx->change = AMOUNT_SAT(0);
+		} else {
+			tx->change_key_index = wallet_get_newindex(tx->cmd->ld);
+		}
 	}
+
 	return check_amount(tx, tx->amount);
 }

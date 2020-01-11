@@ -1,6 +1,7 @@
 #include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
 #include <common/key_derive.h>
+#include <common/utils.h>
 #include <errno.h>
 #include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
@@ -187,6 +188,7 @@ static void handle_onchain_broadcast_tx(struct channel *channel, const u8 *msg)
 		channel_internal_error(channel, "Invalid onchain_broadcast_tx");
 		return;
 	}
+	tx->chainparams = chainparams;
 
 	bitcoin_txid(tx, &txid);
 	wallet_transaction_add(w, tx, 0, 0);
@@ -305,15 +307,29 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 	wallet_add_utxo(channel->peer->ld->wallet, u, p2wpkh);
 }
 
-static void onchain_transaction_annotate(struct channel *channel, const u8 *msg)
+static void onchain_annotate_txout(struct channel *channel, const u8 *msg)
 {
 	struct bitcoin_txid txid;
 	enum wallet_tx_type type;
-	if (!fromwire_onchain_transaction_annotate(msg, &txid, &type))
-		fatal("onchaind gave invalid onchain_transaction_annotate "
+	u32 outnum;
+	if (!fromwire_onchain_annotate_txout(msg, &txid, &outnum, &type))
+		fatal("onchaind gave invalid onchain_annotate_txout "
 		      "message: %s",
 		      tal_hex(msg, msg));
-	wallet_transaction_annotate(channel->peer->ld->wallet, &txid, type,
+	wallet_annotate_txout(channel->peer->ld->wallet, &txid, outnum, type,
+			      channel->dbid);
+}
+
+static void onchain_annotate_txin(struct channel *channel, const u8 *msg)
+{
+	struct bitcoin_txid txid;
+	enum wallet_tx_type type;
+	u32 innum;
+	if (!fromwire_onchain_annotate_txin(msg, &txid, &innum, &type))
+		fatal("onchaind gave invalid onchain_annotate_txin "
+		      "message: %s",
+		      tal_hex(msg, msg));
+	wallet_annotate_txin(channel->peer->ld->wallet, &txid, innum, type,
 				    channel->dbid);
 }
 
@@ -354,8 +370,12 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 		onchain_add_utxo(sd->channel, msg);
 		break;
 
-	case WIRE_ONCHAIN_TRANSACTION_ANNOTATE:
-		onchain_transaction_annotate(sd->channel, msg);
+	case WIRE_ONCHAIN_ANNOTATE_TXIN:
+		onchain_annotate_txin(sd->channel, msg);
+		break;
+
+	case WIRE_ONCHAIN_ANNOTATE_TXOUT:
+		onchain_annotate_txout(sd->channel, msg);
 		break;
 
 	/* We send these, not receive them */
@@ -451,7 +471,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 
 	channel_set_owner(channel, new_channel_subd(ld,
 						    "lightning_onchaind",
-						    channel,
+						    channel, &channel->peer->id,
 						    channel->log, false,
 						    onchain_wire_type_name,
 						    onchain_msg,
@@ -487,10 +507,13 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 	if (!feerate) {
 		/* We have at least one data point: the last tx's feerate. */
 		struct amount_sat fee = channel->funding;
-		for (size_t i = 0; i < channel->last_tx->wtx->num_outputs; i++)
-			if (!amount_sat_sub(&fee, fee,
-					    bitcoin_tx_output_get_amount(
-						channel->last_tx, i))) {
+		for (size_t i = 0; i < channel->last_tx->wtx->num_outputs; i++) {
+			struct amount_asset asset =
+			    bitcoin_tx_output_get_amount(channel->last_tx, i);
+			struct amount_sat amt;
+			assert(amount_asset_is_main(&asset));
+			amt = amount_asset_to_sat(&asset);
+			if (!amount_sat_sub(&fee, fee, amt)) {
 				log_broken(channel->log, "Could not get fee"
 					   " funding %s tx %s",
 					   type_to_string(tmpctx,
@@ -501,14 +524,16 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 							  channel->last_tx));
 				return KEEP_WATCHING;
 			}
+		}
 
-		feerate = fee.satoshis / measure_tx_weight(tx); /* Raw: reverse feerate extraction */
+		feerate = fee.satoshis / bitcoin_tx_weight(tx); /* Raw: reverse feerate extraction */
 		if (feerate < feerate_floor())
 			feerate = feerate_floor();
 	}
 
 	msg = towire_onchain_init(channel,
 				  &channel->their_shachain.chain,
+				  chainparams,
 				  channel->funding,
 				  &channel->channel_info.old_remote_per_commit,
 				  &channel->channel_info.remote_per_commit,
@@ -523,9 +548,8 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  feerate,
 				  channel->our_config.dust_limit,
 				  &our_last_txid,
-				  p2wpkh_for_keyidx(tmpctx, ld,
-						    channel->final_key_idx),
-				  channel->remote_shutdown_scriptpubkey,
+				  channel->shutdown_scriptpubkey[LOCAL],
+				  channel->shutdown_scriptpubkey[REMOTE],
 				  &final_key,
 				  channel->funder,
 				  &channel->local_basepoints,
@@ -538,7 +562,8 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  tal_count(stubs),
 				  channel->min_possible_feerate,
 				  channel->max_possible_feerate,
-				  channel->future_per_commitment_point);
+				  channel->future_per_commitment_point,
+				  channel->option_static_remotekey);
 	subd_send_msg(channel->owner, take(msg));
 
 	/* FIXME: Don't queue all at once, use an empty cb... */

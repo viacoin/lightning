@@ -8,6 +8,7 @@ WALLET_TEST_COMMON_OBJS :=			\
 	common/derive_basepoints.o		\
 	common/htlc_state.o			\
 	common/htlc_wire.o			\
+	common/fee_states.o			\
 	common/type_to_string.o			\
 	common/memleak.o			\
 	common/node_id.o			\
@@ -17,6 +18,7 @@ WALLET_TEST_COMMON_OBJS :=			\
 	common/utils.o				\
 	common/wireaddr.o			\
 	common/version.o			\
+	wallet/db_sqlite3.o			\
 	wire/towire.o				\
 	wire/fromwire.o
 

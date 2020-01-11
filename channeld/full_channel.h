@@ -10,38 +10,37 @@
 /**
  * new_full_channel: Given initial fees and funding, what is initial state?
  * @ctx: tal context to allocate return value from.
- * @chain_hash: Which blockchain are we talking about?
  * @funding_txid: The commitment transaction id.
  * @funding_txout: The commitment transaction output number.
  * @minimum_depth: The minimum confirmations needed for funding transaction.
  * @funding: The commitment transaction amount.
  * @local_msat: The amount for the local side (remainder goes to remote)
- * @feerate_per_kw: feerate per kiloweight (satoshis) for the commitment
- *   transaction and HTLCS for each side.
+ * @fee_states: The fee update states.
  * @local: local channel configuration
  * @remote: remote channel configuration
  * @local_basepoints: local basepoints.
  * @remote_basepoints: remote basepoints.
  * @local_fundingkey: local funding key
  * @remote_fundingkey: remote funding key
+ * @option_static_remotekey: use `option_static_remotekey`.
  * @funder: which side initiated it.
  *
  * Returns state, or NULL if malformed.
  */
 struct channel *new_full_channel(const tal_t *ctx,
-				 const struct bitcoin_blkid *chain_hash,
 				 const struct bitcoin_txid *funding_txid,
 				 unsigned int funding_txout,
 				 u32 minimum_depth,
 				 struct amount_sat funding,
 				 struct amount_msat local_msat,
-				 const u32 feerate_per_kw[NUM_SIDES],
+				 const struct fee_states *fee_states,
 				 const struct channel_config *local,
 				 const struct channel_config *remote,
 				 const struct basepoints *local_basepoints,
 				 const struct basepoints *remote_basepoints,
 				 const struct pubkey *local_funding_pubkey,
 				 const struct pubkey *remote_funding_pubkey,
+				 bool option_static_remotekey,
 				 enum side funder);
 
 /**
@@ -234,6 +233,7 @@ size_t num_channel_htlcs(const struct channel *channel);
  * @fulfilled_sides: sides for ids in @fulfilled
  * @failed: htlcs of those which are failed
  * @failed_sides: sides for ids in @failed
+ * @failheight: block number which htlcs failed at.
  *
  * This is used for restoring a channel state.
  */
@@ -243,14 +243,15 @@ bool channel_force_htlcs(struct channel *channel,
 			 const struct fulfilled_htlc *fulfilled,
 			 const enum side *fulfilled_sides,
 			 const struct failed_htlc **failed,
-			 const enum side *failed_sides);
+			 const enum side *failed_sides,
+			 u32 failheight);
 
 /**
  * dump_htlcs: debugging dump of all HTLCs
  * @channel: the channel
  * @prefix: the prefix to prepend to each line.
  *
- * Uses status_trace() on every HTLC.
+ * Uses status_debug() on every HTLC.
  */
 void dump_htlcs(const struct channel *channel, const char *prefix);
 

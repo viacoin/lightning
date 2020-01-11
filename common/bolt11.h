@@ -64,6 +64,12 @@ struct bolt11 {
 	/* signature of sha256 of entire thing. */
 	secp256k1_ecdsa_signature sig;
 
+	/* payment secret, if any. */
+	struct secret *payment_secret;
+
+	/* Features bitmap, if any. */
+	u8 *features;
+
 	struct list_head extra_fields;
 };
 

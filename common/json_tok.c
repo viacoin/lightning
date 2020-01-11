@@ -4,6 +4,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/amount.h>
 #include <common/json_command.h>
+#include <common/json_helpers.h>
 #include <common/json_tok.h>
 #include <common/jsonrpc_errors.h>
 #include <common/param.h>
@@ -183,7 +184,160 @@ struct command_result *param_sat(struct command *cmd, const char *name,
 		return NULL;
 
 	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			    "'%s' should be a satoshi amount, not '%.*s'",
+			    "%s should be a satoshi amount, not '%.*s'",
+			    name ? name : "amount field",
+			    tok->end - tok->start, buffer + tok->start);
+}
+
+struct command_result *param_sat_or_all(struct command *cmd, const char *name,
+					const char *buffer, const jsmntok_t *tok,
+					struct amount_sat **sat)
+{
+	if (json_tok_streq(buffer, tok, "all")) {
+		*sat = tal(cmd, struct amount_sat);
+		**sat = AMOUNT_SAT(-1ULL);
+		return NULL;
+	}
+	return param_sat(cmd, name, buffer, tok, sat);
+}
+
+struct command_result *param_node_id(struct command *cmd, const char *name,
+		                     const char *buffer, const jsmntok_t *tok,
+				     struct node_id **id)
+{
+	*id = tal(cmd, struct node_id);
+	if (json_to_node_id(buffer, tok, *id))
+		return NULL;
+
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be a node id, not '%.*s'",
+			    name, json_tok_full_len(tok),
+			    json_tok_full(buffer, tok));
+}
+
+struct command_result *param_channel_id(struct command *cmd, const char *name,
+					const char *buffer, const jsmntok_t *tok,
+					struct channel_id **cid)
+{
+	*cid = tal(cmd, struct channel_id);
+	if (json_to_channel_id(buffer, tok, *cid))
+		return NULL;
+
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be a channel id, not '%.*s'",
+			    name, json_tok_full_len(tok),
+			    json_tok_full(buffer, tok));
+}
+
+struct command_result *param_secret(struct command *cmd, const char *name,
+				    const char *buffer, const jsmntok_t *tok,
+				    struct secret **secret)
+{
+	*secret = tal(cmd, struct secret);
+	if (hex_decode(buffer + tok->start,
+		       tok->end - tok->start,
+		       *secret, sizeof(**secret)))
+		return NULL;
+
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be a 32 byte hex value, not '%.*s'",
 			    name, tok->end - tok->start, buffer + tok->start);
 }
 
+struct command_result *param_bin_from_hex(struct command *cmd, const char *name,
+				    const char *buffer, const jsmntok_t *tok,
+				    u8 **bin)
+{
+	*bin = json_tok_bin_from_hex(cmd, buffer, tok);
+	if (bin != NULL)
+		return NULL;
+	else
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "'%s' should be a hex value, not '%.*s'",
+				    name, tok->end - tok->start, buffer + tok->start);
+}
+
+struct command_result *param_hops_array(struct command *cmd, const char *name,
+					const char *buffer, const jsmntok_t *tok,
+					struct sphinx_hop **hops)
+{
+	const jsmntok_t *hop, *payloadtok, *pubkeytok;
+	struct sphinx_hop h;
+	size_t i;
+	if (tok->type != JSMN_ARRAY) {
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "'%s' should be an array of hops, got '%.*s'", name,
+		    tok->end - tok->start, buffer + tok->start);
+	}
+
+	*hops = tal_arr(cmd, struct sphinx_hop, 0);
+
+	json_for_each_arr(i, hop, tok) {
+		payloadtok = json_get_member(buffer, hop, "payload");
+		pubkeytok = json_get_member(buffer, hop, "pubkey");
+
+		if (!pubkeytok)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Hop %zu does not have a pubkey", i);
+
+		if (!payloadtok)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Hop %zu does not have a payload", i);
+
+		h.raw_payload = json_tok_bin_from_hex(*hops, buffer, payloadtok);
+		if (!json_to_pubkey(buffer, pubkeytok, &h.pubkey))
+			return command_fail(
+			    cmd, JSONRPC2_INVALID_PARAMS,
+			    "'pubkey' should be a pubkey, not '%.*s'",
+			    pubkeytok->end - pubkeytok->start,
+			    buffer + pubkeytok->start);
+
+		if (!h.raw_payload)
+			return command_fail(
+			    cmd, JSONRPC2_INVALID_PARAMS,
+			    "'payload' should be a hex encoded binary, not '%.*s'",
+			    pubkeytok->end - pubkeytok->start,
+			    buffer + pubkeytok->start);
+
+		tal_arr_expand(hops, h);
+	}
+
+	if (tal_count(*hops) == 0) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "At least one hop must be specified.");
+	}
+
+	return NULL;
+}
+
+struct command_result *param_secrets_array(struct command *cmd,
+					   const char *name, const char *buffer,
+					   const jsmntok_t *tok,
+					   struct secret **secrets)
+{
+	size_t i;
+	const jsmntok_t *s;
+	struct secret secret;
+
+	if (tok->type != JSMN_ARRAY) {
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "'%s' should be an array of secrets, got '%.*s'", name,
+		    tok->end - tok->start, buffer + tok->start);
+	}
+
+	*secrets = tal_arr(cmd, struct secret, 0);
+	json_for_each_arr(i, s, tok) {
+		if (!hex_decode(buffer + s->start, s->end - s->start, &secret,
+				sizeof(secret)))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "'%s[%zu]' should be a 32 byte hex "
+					    "value, not '%.*s'",
+					    name, i, s->end - s->start,
+					    buffer + s->start);
+
+		tal_arr_expand(secrets, secret);
+	}
+	return NULL;
+}

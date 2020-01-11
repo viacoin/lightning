@@ -39,6 +39,32 @@ bool plugin_hook_register(struct plugin *plugin, const char *method)
 	return true;
 }
 
+bool plugin_hook_unregister(struct plugin *plugin, const char *method)
+{
+	struct plugin_hook *hook = plugin_hook_by_name(method);
+	if (!hook) {
+		/* No such hook name registered */
+		return false;
+	} else if (hook->plugin == NULL) {
+		/* This name is not registered */
+		return false;
+	}
+	hook->plugin = NULL;
+	return true;
+}
+
+void plugin_hook_unregister_all(struct plugin *plugin)
+{
+	static struct plugin_hook **hooks = NULL;
+	static size_t num_hooks;
+	if (!hooks)
+		hooks = autodata_get(hooks, &num_hooks);
+
+	for (size_t i = 0; i < num_hooks; i++)
+		if (hooks[i]->plugin == plugin)
+			hooks[i]->plugin = NULL;
+}
+
 /**
  * Callback to be passed to the jsonrpc_request.
  *
@@ -50,16 +76,21 @@ static void plugin_hook_callback(const char *buffer, const jsmntok_t *toks,
 				 struct plugin_hook_request *r)
 {
 	const jsmntok_t *resulttok = json_get_member(buffer, toks, "result");
+	struct db *db = r->db;
+	struct plugin_destroyed *pd;
 
 	if (!resulttok)
 		fatal("Plugin for %s returned non-result response %.*s",
 		      r->hook->name,
 		      toks->end - toks->start, buffer + toks->start);
 
-	db_begin_transaction(r->db);
+	/* If command is "plugin stop", this can free r! */
+	pd = plugin_detect_destruction(r->hook->plugin);
+	db_begin_transaction(db);
 	r->hook->response_cb(r->cb_arg, buffer, resulttok);
-	db_commit_transaction(r->db);
-	tal_free(r);
+	db_commit_transaction(db);
+	if (!was_plugin_destroyed(pd))
+		tal_free(r);
 }
 
 void plugin_hook_call_(struct lightningd *ld, const struct plugin_hook *hook,
@@ -125,13 +156,14 @@ static void db_hook_response(const char *buffer, const jsmntok_t *toks,
 	io_break(ph_req);
 }
 
-void plugin_hook_db_sync(struct db *db, const char **changes, const char *final)
+void plugin_hook_db_sync(struct db *db)
 {
 	const struct plugin_hook *hook = &db_write_hook;
 	struct jsonrpc_request *req;
 	struct plugin_hook_request *ph_req;
 	void *ret;
 
+	const char **changes = db_changes(db);
 	if (!hook->plugin)
 		return;
 
@@ -143,11 +175,11 @@ void plugin_hook_db_sync(struct db *db, const char **changes, const char *final)
 	ph_req->hook = hook;
 	ph_req->db = db;
 
+	json_add_num(req->stream, "data_version", db_data_version_get(db));
+
 	json_array_start(req->stream, "writes");
 	for (size_t i = 0; i < tal_count(changes); i++)
 		json_add_string(req->stream, NULL, changes[i]);
-	if (final)
-		json_add_string(req->stream, NULL, final);
 	json_array_end(req->stream);
 	jsonrpc_request_end(req);
 

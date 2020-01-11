@@ -110,10 +110,12 @@ int main(void)
 	struct bitcoin_signature sig;
 	struct bitcoin_address addr;
 	struct amount_sat tmpamt;
+	struct amount_asset asset;
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
 						 | SECP256K1_CONTEXT_SIGN);
 	setup_tmpctx();
+	chainparams = chainparams_for_network("bitcoin");
 
 	/* BOLT #3:
 	 *
@@ -122,6 +124,7 @@ int main(void)
 	input = bitcoin_tx_from_hex(tmpctx,
 				    "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff03510101ffffffff0100f2052a010000001976a9143ca33c2e4446f4a305f23c80df8ad1afdcf652f988ac00000000",
 				    strlen("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff03510101ffffffff0100f2052a010000001976a9143ca33c2e4446f4a305f23c80df8ad1afdcf652f988ac00000000"));
+	input->chainparams = chainparams_for_network("bitcoin");
 	assert(input);
 
 	/* BOLT #3:
@@ -172,7 +175,8 @@ int main(void)
 	if (!amount_sat_sub(&change, utxo.amount, funding_sat)
 	    || !amount_sat_sub(&change, change, fee))
 		abort();
-	funding = funding_tx(tmpctx, &funding_outnum, utxomap,
+	funding = funding_tx(tmpctx, chainparams,
+			     &funding_outnum, utxomap,
 			     funding_sat,
 			     &local_funding_pubkey,
 			     &remote_funding_pubkey,
@@ -181,7 +185,9 @@ int main(void)
 	printf("# fee: %s\n",
 	       type_to_string(tmpctx, struct amount_sat, &fee));
 
-	tmpamt = bitcoin_tx_output_get_amount(funding, !funding_outnum);
+	asset = bitcoin_tx_output_get_amount(funding, !funding_outnum);
+	assert(amount_asset_is_main(&asset));
+	tmpamt = amount_asset_to_sat(&asset);
 	printf("change: %s\n",
 	       type_to_string(tmpctx, struct amount_sat,
 			      &tmpamt));

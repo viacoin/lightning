@@ -1,6 +1,10 @@
 #include <bitcoin/script.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/tal/str/str.h>
+#include <common/fee_states.h>
+#include <common/json_command.h>
+#include <common/jsonrpc_errors.h>
+#include <common/utils.h>
 #include <common/wire_error.h>
 #include <connectd/gen_connect_wire.h>
 #include <errno.h>
@@ -97,6 +101,10 @@ static void destroy_channel(struct channel *channel)
 		      channel_state_name(channel),
 		      htlc_state_name(hin->hstate));
 
+	for (size_t i = 0; i < tal_count(channel->forgets); i++)
+		was_pending(command_fail(channel->forgets[i], LIGHTNINGD,
+			    "Channel structure was freed!"));
+
 	/* Free any old owner still hanging around. */
 	channel_set_owner(channel, NULL);
 
@@ -164,6 +172,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const struct channel_info *channel_info,
 			    /* NULL or stolen */
 			    u8 *remote_shutdown_scriptpubkey,
+			    const u8 *local_shutdown_scriptpubkey,
 			    u64 final_key_idx,
 			    bool last_was_revoke,
 			    /* NULL or stolen */
@@ -177,7 +186,8 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const struct pubkey *future_per_commitment_point,
 			    u32 feerate_base,
 			    u32 feerate_ppm,
-			    const u8 *remote_upfront_shutdown_script)
+			    const u8 *remote_upfront_shutdown_script,
+			    bool option_static_remotekey)
 {
 	struct channel *channel = tal(peer->ld, struct channel);
 
@@ -199,15 +209,11 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->billboard.transient = tal_strdup(channel, transient_billboard);
 
 	if (!log) {
-		/* FIXME: update log prefix when we get scid */
-		/* FIXME: Use minimal unique pubkey prefix for logs! */
-		const char *idname = type_to_string(peer,
-						    struct node_id,
-						    &peer->id);
 		channel->log = new_log(channel,
-				       peer->log_book, "%s chan #%"PRIu64":",
-				       idname, dbid);
-		tal_free(idname);
+				       peer->ld->log_book,
+				       &channel->peer->id,
+				       "chan#%"PRIu64,
+				       dbid);
 	} else
 		channel->log = tal_steal(channel, log);
 	channel->channel_flags = channel_flags;
@@ -226,13 +232,23 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->msat_to_us_min = msat_to_us_min;
 	channel->msat_to_us_max = msat_to_us_max;
 	channel->last_tx = tal_steal(channel, last_tx);
+	channel->last_tx->chainparams = chainparams;
 	channel->last_tx_type = TX_UNKNOWN;
 	channel->last_sig = *last_sig;
 	channel->last_htlc_sigs = tal_steal(channel, last_htlc_sigs);
 	channel->channel_info = *channel_info;
-	channel->remote_shutdown_scriptpubkey
+	channel->channel_info.fee_states
+		= dup_fee_states(channel, channel_info->fee_states);
+	channel->shutdown_scriptpubkey[REMOTE]
 		= tal_steal(channel, remote_shutdown_scriptpubkey);
 	channel->final_key_idx = final_key_idx;
+	if (local_shutdown_scriptpubkey)
+		channel->shutdown_scriptpubkey[LOCAL]
+			= tal_steal(channel, local_shutdown_scriptpubkey);
+	else
+		channel->shutdown_scriptpubkey[LOCAL]
+			= p2wpkh_for_keyidx(channel, channel->peer->ld,
+					    channel->final_key_idx);
 	channel->last_was_revoke = last_was_revoke;
 	channel->last_sent_commit = tal_steal(channel, last_sent_commit);
 	channel->first_blocknum = first_blocknum;
@@ -247,6 +263,8 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->feerate_ppm = feerate_ppm;
 	channel->remote_upfront_shutdown_script
 		= tal_steal(channel, remote_upfront_shutdown_script);
+	channel->option_static_remotekey = option_static_remotekey;
+	channel->forgets = tal_arr(channel, struct command *, 0);
 
 	list_add_tail(&peer->channels, &channel->list);
 	tal_add_destructor(channel, destroy_channel);
@@ -328,6 +346,7 @@ void channel_set_last_tx(struct channel *channel,
 			 const struct bitcoin_signature *sig,
 			 enum wallet_tx_type txtypes)
 {
+	assert(tx->chainparams);
 	channel->last_sig = *sig;
 	tal_free(channel->last_tx);
 	channel->last_tx = tal_steal(channel, tx);
@@ -358,7 +377,7 @@ void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
 	struct channel_id cid;
 
 	va_start(ap, fmt);
-	why = tal_vfmt(channel, fmt, ap);
+	why = tal_vfmt(tmpctx, fmt, ap);
 	va_end(ap);
 
 	log_unusual(channel->log, "Peer permanent failure in %s: %s",
@@ -379,6 +398,33 @@ void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
 	if (channel_active(channel))
 		channel_set_state(channel, channel->state, AWAITING_UNILATERAL);
 
+	tal_free(why);
+}
+
+void channel_fail_forget(struct channel *channel, const char *fmt, ...)
+{
+	va_list ap;
+	char *why;
+	struct channel_id cid;
+
+	assert(channel->funder == REMOTE &&
+	       channel->state == CHANNELD_AWAITING_LOCKIN);
+	va_start(ap, fmt);
+	why = tal_vfmt(tmpctx, fmt, ap);
+	va_end(ap);
+
+	log_unusual(channel->log, "Peer permanent failure in %s: %s, "
+		    "forget channel",
+		    channel_state_name(channel), why);
+
+	if (!channel->error) {
+		derive_channel_id(&cid,
+				  &channel->funding_txid,
+				  channel->funding_outnum);
+		channel->error = towire_errorfmt(channel, &cid, "%s", why);
+	}
+
+	delete_channel(channel);
 	tal_free(why);
 }
 

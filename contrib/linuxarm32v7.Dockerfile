@@ -1,6 +1,6 @@
 # This dockerfile is meant to cross compile with a x64 machine for a arm32v7 host
 # It is using multi stage build: 
-# * downloader: Download litecoin/bitcoin and qemu binaries needed for c-lightning
+# * downloader: Download viacoin/bitcoin and qemu binaries needed for c-lightning
 # * builder: Cross compile c-lightning dependencies, then c-lightning itself with static linking
 # * final: Copy the binaries required at runtime
 # The resulting image uploaded to dockerhub will only contain what is needed for runtime.
@@ -10,7 +10,7 @@ FROM debian:stretch-slim as downloader
 RUN set -ex \
 	&& apt-get update \
 	&& apt-get install -qq --no-install-recommends ca-certificates dirmngr wget \
-     qemu qemu-user-static qemu-user binfmt-support
+     qemu-user-static binfmt-support
 
 WORKDIR /opt
 
@@ -18,7 +18,7 @@ RUN wget -qO /opt/tini "https://github.com/krallin/tini/releases/download/v0.18.
     && echo "01b54b934d5f5deb32aa4eb4b0f71d0e76324f4f0237cc262d59376bf2bdc269 /opt/tini" | sha256sum -c - \
     && chmod +x /opt/tini
 
-ARG BITCOIN_VERSION=0.17.0
+ARG BITCOIN_VERSION=0.18.1
 ENV BITCOIN_TARBALL bitcoin-$BITCOIN_VERSION-arm-linux-gnueabihf.tar.gz
 ENV BITCOIN_URL https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/$BITCOIN_TARBALL
 ENV BITCOIN_ASC_URL https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/SHA256SUMS.asc
@@ -33,22 +33,22 @@ RUN mkdir /opt/bitcoin && cd /opt/bitcoin \
     && rm $BITCOIN_TARBALL
 
 ENV LITECOIN_VERSION 0.14.2
-ENV LITECOIN_TARBALL litecoin-$LITECOIN_VERSION-arm-linux-gnueabihf.tar.gz
-ENV LITECOIN_URL https://download.litecoin.org/litecoin-$LITECOIN_VERSION/linux/$LITECOIN_TARBALL
+ENV LITECOIN_TARBALL viacoin-$LITECOIN_VERSION-arm-linux-gnueabihf.tar.gz
+ENV LITECOIN_URL https://download.viacoin.org/viacoin-$LITECOIN_VERSION/linux/$LITECOIN_TARBALL
 ENV LITECOIN_SHA256 e79f2a8e8e1b9920d07cff8482237b56aa4be2623103d3d2825ce09a2cc2f6d7
 
-# install litecoin binaries
-RUN mkdir /opt/litecoin && cd /opt/litecoin \
-    && wget -qO litecoin.tar.gz "$LITECOIN_URL" \
-    && echo "$LITECOIN_SHA256  litecoin.tar.gz" | sha256sum -c - \
-    && BD=litecoin-$LITECOIN_VERSION/bin \
-    && tar -xzvf litecoin.tar.gz $BD/litecoin-cli --strip-components=1 --exclude=*-qt \
-    && rm litecoin.tar.gz
+# install viacoin binaries
+RUN mkdir /opt/viacoin && cd /opt/viacoin \
+    && wget -qO viacoin.tar.gz "$LITECOIN_URL" \
+    && echo "$LITECOIN_SHA256  viacoin.tar.gz" | sha256sum -c - \
+    && BD=viacoin-$LITECOIN_VERSION/bin \
+    && tar -xzvf viacoin.tar.gz $BD/viacoin-cli --strip-components=1 --exclude=*-qt \
+    && rm viacoin.tar.gz
 
 FROM debian:stretch-slim as builder
 
 ENV LIGHTNINGD_VERSION=master
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates autoconf automake build-essential git libtool python python3 wget gnupg dirmngr git \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates autoconf automake build-essential gettext git libtool python python3 python3-mako wget gnupg dirmngr git \
   libc6-armhf-cross gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
 
 ENV target_host=arm-linux-gnueabihf
@@ -100,14 +100,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends socat inotify-t
     && rm -rf /var/lib/apt/lists/* 
 
 ENV LIGHTNINGD_DATA=/root/.lightning
-ENV LIGHTNINGD_PORT=9835
+ENV LIGHTNINGD_RPC_PORT=9835
+ENV LIGHTNINGD_PORT=9735
 
 RUN mkdir $LIGHTNINGD_DATA && \
     touch $LIGHTNINGD_DATA/config
 VOLUME [ "/root/.lightning" ]
 COPY --from=builder /tmp/lightning_install/ /usr/local/
 COPY --from=downloader /opt/bitcoin/bin /usr/bin
-COPY --from=downloader /opt/litecoin/bin /usr/bin
+COPY --from=downloader /opt/viacoin/bin /usr/bin
 COPY tools/docker-entrypoint.sh entrypoint.sh
 
 EXPOSE 9735 9835

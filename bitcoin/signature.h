@@ -47,7 +47,21 @@ struct bitcoin_signature {
 };
 
 /**
- * sign_hash - produce a raw secp256k1 signature.
+ * bitcoin_tx_hash_for_sig - produce hash for a transaction
+ *
+ * @tx - tx to hash
+ * @in - index that this 'hash' is for
+ * @script - script for the index that's being 'hashed for'
+ * @sighash_type - sighash_type to hash for
+ * @dest - hash result
+ */
+void bitcoin_tx_hash_for_sig(const struct bitcoin_tx *tx, unsigned int in,
+			     const u8 *script,
+			     enum sighash_type sighash_type,
+			     struct sha256_double *dest);
+
+/**
+ * sign_hash - produce a raw secp256k1 signature (with low R value).
  * @p: secret key
  * @h: hash to sign.
  * @sig: signature to fill in and return.

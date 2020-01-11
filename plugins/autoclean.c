@@ -46,7 +46,7 @@ static struct command_result *json_autocleaninvoice(struct command *cmd,
 		   p_opt_def("cycle_seconds", param_u64, &cycle, 3600),
 		   p_opt_def("expired_by", param_u64, &exby, 86400),
 		   NULL))
-		return NULL;
+		return command_param_failed();
 
 	cycle_seconds = *cycle;
 	expired_by = *exby;
@@ -65,7 +65,8 @@ static struct command_result *json_autocleaninvoice(struct command *cmd,
 					   expired_by, cycle_seconds));
 }
 
-static void init(struct plugin_conn *prpc)
+static void init(struct plugin_conn *prpc,
+		  const char *buf UNUSED, const jsmntok_t *config UNUSED)
 {
 	rpc = prpc;
 
@@ -90,7 +91,8 @@ static const struct plugin_command commands[] = { {
 int main(int argc, char *argv[])
 {
 	setup_locale();
-	plugin_main(argv, init, commands, ARRAY_SIZE(commands),
+	plugin_main(argv, init, PLUGIN_RESTARTABLE, commands, ARRAY_SIZE(commands),
+	            NULL, 0, NULL, 0,
 		    plugin_option("autocleaninvoice-cycle",
 				  "string",
 				  "Perform cleanup of expired invoices every"

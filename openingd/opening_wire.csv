@@ -5,7 +5,7 @@
 
 msgtype,opening_init,6000
 # Which network are we configured for?
-msgdata,opening_init,chain_hash,bitcoin_blkid,
+msgdata,opening_init,chainparams,chainparams,
 # Base configuration we'll offer (channel reserve will vary with amount)
 msgdata,opening_init,our_config,channel_config,
 # Minimum/maximum configuration values we'll accept
@@ -20,9 +20,12 @@ msgdata,opening_init,min_feerate,u32,
 msgdata,opening_init,max_feerate,u32,
 msgdata,opening_init,lfeatures_len,u16,
 msgdata,opening_init,lfeatures,u8,lfeatures_len
+msgdata,opening_init,option_static_remotekey,bool,
 # Optional msg to send.
 msgdata,opening_init,len,u16,
 msgdata,opening_init,msg,u8,len
+msgdata,opening_init,dev_temporary_channel_id,?byte,32
+msgdata,opening_init,dev_fast_gossip,bool,
 
 # Openingd->master: they offered channel, should we continue?
 msgtype,opening_got_offer,6005
@@ -41,21 +44,8 @@ msgdata,opening_got_offer,shutdown_scriptpubkey,u8,shutdown_len
 # master->openingd: optional rejection message
 msgtype,opening_got_offer_reply,6105
 msgdata,opening_got_offer_reply,rejection,?wirestring,
-
-#include <common/bip32.h>
-#include <common/htlc_wire.h>
-# Master->openingd: please fund a channel.
-msgtype,opening_funder,6001
-msgdata,opening_funder,funding_satoshis,amount_sat,
-msgdata,opening_funder,push_msat,amount_msat,
-msgdata,opening_funder,feerate_per_kw,u32,
-msgdata,opening_funder,change_satoshis,amount_sat,
-msgdata,opening_funder,change_keyindex,u32,
-msgdata,opening_funder,channel_flags,u8,
-#include <common/utxo.h>
-msgdata,opening_funder,num_inputs,u16,
-msgdata,opening_funder,inputs,utxo,num_inputs
-msgdata,opening_funder,bip32,ext_key,
+msgdata,opening_got_offer_reply,shutdown_len,u16,
+msgdata,opening_got_offer_reply,our_shutdown_scriptpubkey,?u8,shutdown_len
 
 # Openingd->master: we've successfully offered channel.
 # This gives their sig, means we can broadcast tx: we're done.
@@ -78,11 +68,12 @@ msgdata,opening_funder_reply,our_channel_reserve_satoshis,amount_sat,
 msgdata,opening_funder_reply,shutdown_len,u16,
 msgdata,opening_funder_reply,shutdown_scriptpubkey,u8,shutdown_len
 
-# master->openingd: start channel establishment for a funding
-# tx that will be paid for by an external wallet
+# master->openingd: start channel establishment for a funding tx
 msgtype,opening_funder_start,6002
 msgdata,opening_funder_start,funding_satoshis,amount_sat,
 msgdata,opening_funder_start,push_msat,amount_msat,
+msgdata,opening_funder_start,len_upfront,u16,
+msgdata,opening_funder_start,upfront_shutdown_script,u8,len_upfront
 msgdata,opening_funder_start,feerate_per_kw,u32,
 msgdata,opening_funder_start,channel_flags,u8,
 
@@ -90,6 +81,7 @@ msgdata,opening_funder_start,channel_flags,u8,
 msgtype,opening_funder_start_reply,6102
 msgdata,opening_funder_start_reply,script_len,u8,
 msgdata,opening_funder_start_reply,scriptpubkey,u8,script_len
+msgdata,opening_funder_start_reply,upfront_shutdown_negotiated,bool,
 
 # master->openingd: complete channel establishment for a funding
 # tx that will be paid for by an external wallet
@@ -128,8 +120,10 @@ msgdata,opening_fundee,feerate_per_kw,u32,
 msgdata,opening_fundee,msglen,u16,
 msgdata,opening_fundee,funding_signed_msg,u8,msglen
 msgdata,opening_fundee,our_channel_reserve_satoshis,amount_sat,
-msgdata,opening_fundee,shutdown_len,u16,
-msgdata,opening_fundee,shutdown_scriptpubkey,u8,shutdown_len
+msgdata,opening_fundee,local_shutdown_len,u16,
+msgdata,opening_fundee,local_shutdown_scriptpubkey,u8,local_shutdown_len
+msgdata,opening_fundee,remote_shutdown_len,u16,
+msgdata,opening_fundee,remote_shutdown_scriptpubkey,u8,remote_shutdown_len
 
 # master -> openingd: do you have a memleak?
 msgtype,opening_dev_memleak,6033

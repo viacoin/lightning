@@ -1,103 +1,34 @@
-#include "lightningd/plugin.h"
-
 #include <ccan/array_size/array_size.h>
-#include <ccan/intmap/intmap.h>
-#include <ccan/io/io.h>
 #include <ccan/list/list.h>
 #include <ccan/opt/opt.h>
-#include <ccan/pipecmd/pipecmd.h>
-#include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <ccan/utf8/utf8.h>
-#include <common/json_command.h>
-#include <common/jsonrpc_errors.h>
-#include <common/memleak.h>
-#include <common/param.h>
-#include <common/timeout.h>
-#include <dirent.h>
-#include <errno.h>
-#include <lightningd/io_loop_with_timers.h>
+#include <common/utils.h>
+#include <common/version.h>
 #include <lightningd/json.h>
-#include <lightningd/lightningd.h>
 #include <lightningd/notification.h>
 #include <lightningd/options.h>
+#include <lightningd/plugin.h>
 #include <lightningd/plugin_hook.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
 
-/* How many seconds may the plugin take to reply to the `getmanifest
- * call`? This is the maximum delay to `lightningd --help` and until
+/* How many seconds may the plugin take to reply to the `getmanifest`
+ * call? This is the maximum delay to `lightningd --help` and until
  * we can start the main `io_loop` to communicate with peers. If this
  * hangs we can't do much, so we put an upper bound on the time we're
  * willing to wait. Plugins shouldn't do any initialization in the
- * `getmanifest` call anyway, that's what `init `is for. */
+ * `getmanifest` call anyway, that's what `init` is for. */
 #define PLUGIN_MANIFEST_TIMEOUT 60
 
-struct plugin {
-	struct list_node list;
-
-	pid_t pid;
-	char *cmd;
-	struct io_conn *stdin_conn, *stdout_conn;
-	bool stop;
-	struct plugins *plugins;
-	const char **plugin_path;
-
-	/* Stuff we read */
-	char *buffer;
-	size_t used, len_read;
-
-	/* Our json_streams. Since multiple streams could start
-	 * returning data at once, we always service these in order,
-	 * freeing once empty. */
-	struct json_stream **js_arr;
-
-	struct log *log;
-
-	/* List of options that this plugin registered */
-	struct list_head plugin_opts;
-
-	const char **methods;
-
-	/* Timer to add a timeout to some plugin RPC calls. Used to
-	 * guarantee that `getmanifest` doesn't block indefinitely. */
-	const struct oneshot *timeout_timer;
-
-	/* An array of subscribed topics */
-	char **subscriptions;
-};
-
-struct plugins {
-	struct list_head plugins;
-	size_t pending_manifests;
-
-	/* Currently pending requests by their request ID */
-	UINTMAP(struct jsonrpc_request *) pending_requests;
-	struct log *log;
-	struct log_book *log_book;
-
-	struct lightningd *ld;
-};
-
-/* The value of a plugin option, which can have different types.
- * The presence of the integer and boolean values will depend of
- * the option type, but the string value will always be filled.
- */
-struct plugin_opt_value {
-	char *as_str;
-	int *as_int;
-	bool *as_bool;
-};
-
-struct plugin_opt {
-	struct list_node list;
-	const char *name;
-	const char *type;
-	const char *description;
-	struct plugin_opt_value *value;
-};
+#if DEVELOPER
+static void memleak_help_pending_requests(struct htable *memtable,
+					  struct plugins *plugins)
+{
+	memleak_remove_uintmap(memtable, &plugins->pending_requests);
+}
+#endif /* DEVELOPER */
 
 struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
 			    struct lightningd *ld)
@@ -106,34 +37,71 @@ struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
 	p = tal(ctx, struct plugins);
 	list_head_init(&p->plugins);
 	p->log_book = log_book;
-	p->log = new_log(p, log_book, "plugin-manager");
+	p->log = new_log(p, log_book, NULL, "plugin-manager");
 	p->ld = ld;
+	p->startup = true;
+	uintmap_init(&p->pending_requests);
+	memleak_add_helper(p, memleak_help_pending_requests);
+
 	return p;
 }
 
 static void destroy_plugin(struct plugin *p)
 {
+	plugin_hook_unregister_all(p);
 	list_del(&p->list);
 }
 
-void plugin_register(struct plugins *plugins, const char* path TAKES)
+struct plugin *plugin_register(struct plugins *plugins, const char* path TAKES)
 {
-	struct plugin *p;
+	struct plugin *p, *p_temp;
+
+	/* Don't register an already registered plugin */
+	list_for_each(&plugins->plugins, p_temp, list) {
+		if (streq(path, p_temp->cmd)) {
+			if (taken(path))
+				tal_free(path);
+			return NULL;
+		}
+	}
+
 	p = tal(plugins, struct plugin);
-	list_add_tail(&plugins->plugins, &p->list);
 	p->plugins = plugins;
 	p->cmd = tal_strdup(p, path);
+
+	/* Fix up old-style relative paths */
+	if (deprecated_apis
+	    && !path_is_abs(p->cmd)
+	    && access(p->cmd, X_OK) != 0) {
+		char *oldpath = path_join(tmpctx,
+					  plugins->ld->original_directory,
+					  p->cmd);
+		if (access(oldpath, X_OK) == 0) {
+			log_unusual(plugins->log, "DEPRECATED WARNING:"
+				    " plugin is now relative to"
+				    " lightning-dir, please change to"
+				    " plugin=%s",
+				    oldpath);
+			tal_free(p->cmd);
+			p->cmd = tal_steal(p, oldpath);
+		}
+	}
+	p->plugin_state = UNCONFIGURED;
 	p->js_arr = tal_arr(p, struct json_stream *, 0);
 	p->used = 0;
+	p->subscriptions = NULL;
 
-	p->log = new_log(p, plugins->log_book, "plugin-%s",
+	p->log = new_log(p, plugins->log_book, NULL, "plugin-%s",
 			 path_basename(tmpctx, p->cmd));
 	p->methods = tal_arr(p, const char *, 0);
 	list_head_init(&p->plugin_opts);
+
+	list_add_tail(&plugins->plugins, &p->list);
 	tal_add_destructor(p, destroy_plugin);
+	return p;
 }
 
-static bool paths_match(const char *cmd, const char *name)
+bool plugin_paths_match(const char *cmd, const char *name)
 {
 	if (strchr(name, PATH_SEP)) {
 		const char *cmd_canon, *name_canon;
@@ -159,7 +127,7 @@ bool plugin_remove(struct plugins *plugins, const char *name)
 	bool removed = false;
 
 	list_for_each_safe(&plugins->plugins, p, next, list) {
-		if (paths_match(p->cmd, name)) {
+		if (plugin_paths_match(p->cmd, name)) {
 			list_del_from(&plugins->plugins, &p->list);
 			tal_free(p);
 			removed = true;
@@ -168,10 +136,7 @@ bool plugin_remove(struct plugins *plugins, const char *name)
 	return removed;
 }
 
-/**
- * Kill a plugin process, with an error message.
- */
-static void PRINTF_FMT(2,3) plugin_kill(struct plugin *plugin, char *fmt, ...)
+void plugin_kill(struct plugin *plugin, char *fmt, ...)
 {
 	char *msg;
 	va_list ap;
@@ -180,7 +145,7 @@ static void PRINTF_FMT(2,3) plugin_kill(struct plugin *plugin, char *fmt, ...)
 	msg = tal_vfmt(plugin, fmt, ap);
 	va_end(ap);
 
-	log_broken(plugin->log, "Killing plugin: %s", msg);
+	log_info(plugin->log, "Killing plugin: %s", msg);
 	plugin->stop = true;
 	io_wake(plugin);
 	kill(plugin->pid, SIGKILL);
@@ -229,7 +194,8 @@ static void plugin_log_handle(struct plugin *plugin, const jsmntok_t *paramstok)
 	}
 
 	call_notifier = (level == LOG_BROKEN || level == LOG_UNUSUAL)? true : false;
-	log_(plugin->log, level, call_notifier, "%.*s", msgtok->end - msgtok->start,
+	/* FIXME: Let plugin specify node_id? */
+	log_(plugin->log, level, NULL, call_notifier, "%.*s", msgtok->end - msgtok->start,
 	     plugin->buffer + msgtok->start);
 }
 
@@ -267,6 +233,7 @@ static void plugin_response_handle(struct plugin *plugin,
 				   const jsmntok_t *toks,
 				   const jsmntok_t *idtok)
 {
+	struct plugin_destroyed *pd;
 	struct jsonrpc_request *request;
 	u64 id;
 	/* We only send u64 ids, so if this fails it's a critical error (note
@@ -287,10 +254,13 @@ static void plugin_response_handle(struct plugin *plugin,
 	}
 
 	/* We expect the request->cb to copy if needed */
+	pd = plugin_detect_destruction(plugin);
 	request->response_cb(plugin->buffer, toks, idtok, request->response_cb_arg);
 
-	uintmap_del(&plugin->plugins->pending_requests, id);
-	tal_free(request);
+	/* Note that in the case of 'plugin stop' this can free request (since
+	 * plugin is parent), so detect that case */
+	if (!was_plugin_destroyed(pd))
+		tal_free(request);
 }
 
 /**
@@ -299,10 +269,15 @@ static void plugin_response_handle(struct plugin *plugin,
  * Internally calls the handler if it was able to fully parse a JSON message,
  * and returns true in that case.
  */
-static bool plugin_read_json_one(struct plugin *plugin)
+static bool plugin_read_json_one(struct plugin *plugin, bool *destroyed)
 {
 	bool valid;
 	const jsmntok_t *toks, *jrtok, *idtok;
+	struct plugin_destroyed *pd;
+
+	*destroyed = false;
+	/* Note that in the case of 'plugin stop' this can free request (since
+	 * plugin is parent), so detect that case */
 
 	/* FIXME: This could be done more efficiently by storing the
 	 * toks and doing an incremental parse, like lightning-cli
@@ -335,6 +310,7 @@ static bool plugin_read_json_one(struct plugin *plugin)
 		return false;
 	}
 
+	pd = plugin_detect_destruction(plugin);
 	if (!idtok) {
 		/* A Notification is a Request object without an "id"
 		 * member. A Request object that is a Notification
@@ -380,20 +356,26 @@ static bool plugin_read_json_one(struct plugin *plugin)
 		plugin_response_handle(plugin, toks, idtok);
 	}
 
-	/* Move this object out of the buffer */
-	memmove(plugin->buffer, plugin->buffer + toks[0].end,
-		tal_count(plugin->buffer) - toks[0].end);
-	plugin->used -= toks[0].end;
-	tal_free(toks);
+	/* Corner case: rpc_command hook can destroy plugin for 'plugin
+	 * stop'! */
+	if (was_plugin_destroyed(pd)) {
+		*destroyed = true;
+	} else {
+		/* Move this object out of the buffer */
+		memmove(plugin->buffer, plugin->buffer + toks[0].end,
+			tal_count(plugin->buffer) - toks[0].end);
+		plugin->used -= toks[0].end;
+		tal_free(toks);
+	}
 	return true;
 }
 
-static struct io_plan *plugin_read_json(struct io_conn *conn UNUSED,
+static struct io_plan *plugin_read_json(struct io_conn *conn,
 					struct plugin *plugin)
 {
 	bool success;
 
-	log_io(plugin->log, LOG_IO_IN, "",
+	log_io(plugin->log, LOG_IO_IN, NULL, "",
 	       plugin->buffer + plugin->used, plugin->len_read);
 
 	plugin->used += plugin->len_read;
@@ -402,7 +384,12 @@ static struct io_plan *plugin_read_json(struct io_conn *conn UNUSED,
 
 	/* Read and process all messages from the connection */
 	do {
-		success = plugin_read_json_one(plugin);
+		bool destroyed;
+		success = plugin_read_json_one(plugin, &destroyed);
+
+		/* If it's destroyed, conn is already freed! */
+		if (destroyed)
+			return io_close(NULL);
 
 		/* Processing the message from the plugin might have
 		 * resulted in it stopping, so let's check. */
@@ -462,8 +449,8 @@ static void plugin_conn_finish(struct io_conn *conn, struct plugin *plugin)
 		tal_free(plugin);
 }
 
-static struct io_plan *plugin_stdin_conn_init(struct io_conn *conn,
-					      struct plugin *plugin)
+struct io_plan *plugin_stdin_conn_init(struct io_conn *conn,
+                                       struct plugin *plugin)
 {
 	/* We write to their stdin */
 	/* We don't have anything queued yet, wait for notification */
@@ -472,8 +459,8 @@ static struct io_plan *plugin_stdin_conn_init(struct io_conn *conn,
 	return io_wait(plugin->stdin_conn, plugin, plugin_write_json, plugin);
 }
 
-static struct io_plan *plugin_stdout_conn_init(struct io_conn *conn,
-					       struct plugin *plugin)
+struct io_plan *plugin_stdout_conn_init(struct io_conn *conn,
+                                        struct plugin *plugin)
 {
 	/* We read from their stdout */
 	plugin->stdout_conn = conn;
@@ -840,6 +827,32 @@ static void plugin_manifest_timeout(struct plugin *plugin)
 	fatal("Can't recover from plugin failure, terminating.");
 }
 
+
+bool plugin_parse_getmanifest_response(const char *buffer,
+                                       const jsmntok_t *toks,
+                                       const jsmntok_t *idtok,
+                                       struct plugin *plugin)
+{
+	const jsmntok_t *resulttok, *dynamictok;
+	bool dynamic_plugin;
+
+	resulttok = json_get_member(buffer, toks, "result");
+	if (!resulttok || resulttok->type != JSMN_OBJECT)
+		return false;
+
+	dynamictok = json_get_member(buffer, resulttok, "dynamic");
+	if (dynamictok && json_to_bool(buffer, dynamictok, &dynamic_plugin))
+		plugin->dynamic = dynamic_plugin;
+
+	if (!plugin_opts_add(plugin, buffer, resulttok) ||
+	    !plugin_rpcmethods_add(plugin, buffer, resulttok) ||
+	    !plugin_subscriptions_add(plugin, buffer, resulttok) ||
+	    !plugin_hooks_add(plugin, buffer, resulttok))
+		return false;
+
+	return true;
+}
+
 /**
  * Callback for the plugin_manifest request.
  */
@@ -848,30 +861,15 @@ static void plugin_manifest_cb(const char *buffer,
 			       const jsmntok_t *idtok,
 			       struct plugin *plugin)
 {
-	const jsmntok_t *resulttok;
-
 	/* Check if all plugins have replied to getmanifest, and break
-	 * if they are */
+	 * if they have */
 	plugin->plugins->pending_manifests--;
 	if (plugin->plugins->pending_manifests == 0)
 		io_break(plugin->plugins);
 
-	resulttok = json_get_member(buffer, toks, "result");
-	if (!resulttok || resulttok->type != JSMN_OBJECT) {
-		plugin_kill(plugin,
-			    "\"getmanifest\" result is not an object: %.*s",
-			    toks[0].end - toks[0].start,
-			    buffer + toks[0].start);
-		return;
-	}
+	if (!plugin_parse_getmanifest_response(buffer, toks, idtok, plugin))
+		plugin_kill(plugin, "%s: Bad response to getmanifest.", plugin->cmd);
 
-	if (!plugin_opts_add(plugin, buffer, resulttok) ||
-	    !plugin_rpcmethods_add(plugin, buffer, resulttok) ||
-	    !plugin_subscriptions_add(plugin, buffer, resulttok) ||
-	    !plugin_hooks_add(plugin, buffer, resulttok))
-		plugin_kill(
-		    plugin,
-		    "Failed to register options, methods, hooks, or subscriptions.");
 	/* Reset timer, it'd kill us otherwise. */
 	tal_free(plugin->timeout_timer);
 }
@@ -916,15 +914,31 @@ static const char *plugin_fullpath(const tal_t *ctx, const char *dir,
 	return fullname;
 }
 
-char *add_plugin_dir(struct plugins *plugins, const char *dir, bool nonexist_ok)
+char *add_plugin_dir(struct plugins *plugins, const char *dir, bool error_ok)
 {
 	struct dirent *di;
 	DIR *d = opendir(dir);
+	struct plugin *p;
+
 	if (!d) {
-		if (nonexist_ok && errno == ENOENT)
-			return NULL;
-		return tal_fmt(NULL, "Failed to open plugin-dir %s: %s",
-			       dir, strerror(errno));
+		if (deprecated_apis && !path_is_abs(dir)) {
+			dir = path_join(tmpctx,
+					plugins->ld->original_directory, dir);
+			d = opendir(dir);
+			if (d) {
+				log_unusual(plugins->log, "DEPRECATED WARNING:"
+					    " plugin-dir is now relative to"
+					    " lightning-dir, please change to"
+					    " plugin-dir=%s",
+					    dir);
+			}
+		}
+		if (!d) {
+			if (!error_ok && errno == ENOENT)
+				return NULL;
+			return tal_fmt(NULL, "Failed to open plugin-dir %s: %s",
+				       dir, strerror(errno));
+		}
 	}
 
 	while ((di = readdir(d)) != NULL) {
@@ -932,9 +946,13 @@ char *add_plugin_dir(struct plugins *plugins, const char *dir, bool nonexist_ok)
 
 		if (streq(di->d_name, ".") || streq(di->d_name, ".."))
 			continue;
-		fullpath = plugin_fullpath(NULL, dir, di->d_name);
-		if (fullpath)
-			plugin_register(plugins, take(fullpath));
+		fullpath = plugin_fullpath(tmpctx, dir, di->d_name);
+		if (fullpath) {
+			p = plugin_register(plugins, fullpath);
+			if (!p && !error_ok)
+				return tal_fmt(NULL, "Failed to register %s: %s",
+				               fullpath, strerror(errno));
+		}
 	}
 	closedir(d);
 	return NULL;
@@ -949,15 +967,19 @@ void clear_plugins(struct plugins *plugins)
 		tal_free(p);
 }
 
-void plugins_add_default_dir(struct plugins *plugins, const char *default_dir)
+void plugins_add_default_dir(struct plugins *plugins)
 {
-	DIR *d = opendir(default_dir);
+	DIR *d = opendir(plugins->default_dir);
 	if (d) {
 		struct dirent *di;
+
+		/* Add this directory itself, and recurse down once. */
+		add_plugin_dir(plugins, plugins->default_dir, true);
 		while ((di = readdir(d)) != NULL) {
 			if (streq(di->d_name, ".") || streq(di->d_name, ".."))
 				continue;
-			add_plugin_dir(plugins, path_join(tmpctx, default_dir, di->d_name), true);
+			add_plugin_dir(plugins, path_join(tmpctx, plugins->default_dir,
+			                                  di->d_name), true);
 		}
 		closedir(d);
 	}
@@ -969,12 +991,13 @@ void plugins_init(struct plugins *plugins, const char *dev_plugin_debug)
 	char **cmd;
 	int stdin, stdout;
 	struct jsonrpc_request *req;
-	plugins->pending_manifests = 0;
-	uintmap_init(&plugins->pending_requests);
 
-	plugins_add_default_dir(plugins, path_join(tmpctx, plugins->ld->config_dir, "plugins"));
+	plugins->pending_manifests = 0;
+	plugins->default_dir = path_join(plugins, plugins->ld->config_basedir, "plugins");
+	plugins_add_default_dir(plugins);
 
 	setenv("LIGHTNINGD_PLUGIN", "1", 1);
+	setenv("LIGHTNINGD_VERSION", version(), 1);
 	/* Spawn the plugin processes before entering the io_loop */
 	list_for_each(&plugins->plugins, p, list) {
 		bool debug;
@@ -989,6 +1012,8 @@ void plugins_init(struct plugins *plugins, const char *dev_plugin_debug)
 		if (p->pid == -1)
 			fatal("error starting plugin '%s': %s", p->cmd,
 			      strerror(errno));
+		else
+			log_debug(plugins->log, "started(%u) %s", p->pid, p->cmd);
 		p->buffer = tal_arr(p, char, 64);
 		p->stop = false;
 
@@ -1023,20 +1048,15 @@ static void plugin_config_cb(const char *buffer,
 			     const jsmntok_t *idtok,
 			     struct plugin *plugin)
 {
-	/* Nothing to be done here, this is just a report */
+	plugin->plugin_state = CONFIGURED;
 }
 
-/* FIXME(cdecker) This just builds a string for the request because
- * the json_stream is tightly bound to the command interface. It
- * should probably be generalized and fixed up. */
-static void plugin_config(struct plugin *plugin)
+void
+plugin_populate_init_request(struct plugin *plugin, struct jsonrpc_request *req)
 {
-	struct plugin_opt *opt;
 	const char *name;
-	struct jsonrpc_request *req;
+	struct plugin_opt *opt;
 	struct lightningd *ld = plugin->plugins->ld;
-	req = jsonrpc_request_start(plugin, "init", plugin->log,
-				    plugin_config_cb, plugin);
 
 	/* Add .params.options */
 	json_object_start(req->stream, "options");
@@ -1051,10 +1071,24 @@ static void plugin_config(struct plugin *plugin)
 
 	/* Add .params.configuration */
 	json_object_start(req->stream, "configuration");
-	json_add_string(req->stream, "lightning-dir", ld->config_dir);
+	json_add_string(req->stream, "lightning-dir", ld->config_netdir);
 	json_add_string(req->stream, "rpc-file", ld->rpc_filename);
+	json_add_bool(req->stream, "startup", plugin->plugins->startup);
+	json_add_string(req->stream, "network", chainparams->network_name);
 	json_object_end(req->stream);
+}
 
+/* FIXME(cdecker) This just builds a string for the request because
+ * the json_stream is tightly bound to the command interface. It
+ * should probably be generalized and fixed up. */
+static void
+plugin_config(struct plugin *plugin)
+{
+	struct jsonrpc_request *req;
+
+	req = jsonrpc_request_start(plugin, "init", plugin->log,
+	                            plugin_config_cb, plugin);
+	plugin_populate_init_request(plugin, req);
 	jsonrpc_request_end(req);
 	plugin_request_send(plugin, req);
 }
@@ -1063,17 +1097,60 @@ void plugins_config(struct plugins *plugins)
 {
 	struct plugin *p;
 	list_for_each(&plugins->plugins, p, list) {
-		plugin_config(p);
+		if (p->plugin_state == UNCONFIGURED)
+			plugin_config(p);
 	}
+
+	plugins->startup = false;
 }
 
 void json_add_opt_plugins(struct json_stream *response,
 			  const struct plugins *plugins)
 {
 	struct plugin *p;
-	list_for_each(&plugins->plugins, p, list) {
-		json_add_string(response, "plugin", p->cmd);
+	struct plugin_opt *opt;
+	const char *plugin_name;
+	const char *opt_name;
+
+	/* DEPRECATED: duplicated JSON "plugin" entries */
+	if (deprecated_apis) {
+		list_for_each(&plugins->plugins, p, list) {
+			json_add_string(response, "plugin", p->cmd);
+		}
 	}
+
+	/* we output 'plugins' and their options as an array of substructures */
+	json_array_start(response, "plugins");
+	list_for_each(&plugins->plugins, p, list) {
+		json_object_start(response, NULL);
+		json_add_string(response, "path", p->cmd);
+
+		/* FIXME: use executables basename until plugins can define their names */
+		plugin_name = path_basename(NULL, p->cmd);
+		json_add_string(response, "name", plugin_name); // basename(p->cmd));
+		tal_free(plugin_name);
+
+		if (!list_empty(&p->plugin_opts)) {
+			json_object_start(response, "options");
+			list_for_each(&p->plugin_opts, opt, list)
+			{
+				/* Trim the `--` that we added before */
+				opt_name = opt->name + 2;
+				if (opt->value->as_bool) {
+					json_add_bool(response, opt_name, opt->value->as_bool);
+				} else if (opt->value->as_int) {
+					json_add_bool(response, opt_name, opt->value->as_int);
+				} else if (opt->value->as_str) {
+					json_add_string(response, opt_name, opt->value->as_str);
+				} else {
+					json_add_null(response, opt_name);
+				}
+			}
+			json_object_end(response);
+		}
+		json_object_end(response);
+	}
+	json_array_end(response);
 }
 
 /**
@@ -1106,12 +1183,20 @@ void plugins_notify(struct plugins *plugins,
 		tal_free(n);
 }
 
+static void destroy_request(struct jsonrpc_request *req,
+                            struct plugin *plugin)
+{
+	uintmap_del(&plugin->plugins->pending_requests, req->id);
+}
+
 void plugin_request_send(struct plugin *plugin,
 			 struct jsonrpc_request *req TAKES)
 {
 	/* Add to map so we can find it later when routing the response */
 	tal_steal(plugin, req);
 	uintmap_add(&plugin->plugins->pending_requests, req->id, req);
+	/* Add destructor in case plugin dies. */
+	tal_add_destructor2(req, destroy_request, plugin);
 	plugin_send(plugin, req->stream);
 	/* plugin_send steals the stream, so remove the dangling
 	 * pointer here */
@@ -1139,4 +1224,33 @@ void *plugin_exclusive_loop(struct plugin *plugin)
 struct log *plugin_get_log(struct plugin *plugin)
 {
 	return plugin->log;
+}
+
+struct plugin_destroyed {
+	const struct plugin *plugin;
+};
+
+static void mark_plugin_destroyed(const struct plugin *unused,
+				  struct plugin_destroyed *pd)
+{
+	pd->plugin = NULL;
+}
+
+struct plugin_destroyed *plugin_detect_destruction(const struct plugin *plugin)
+{
+	struct plugin_destroyed *pd = tal(NULL, struct plugin_destroyed);
+	pd->plugin = plugin;
+	tal_add_destructor2(plugin, mark_plugin_destroyed, pd);
+	return pd;
+}
+
+bool was_plugin_destroyed(struct plugin_destroyed *pd)
+{
+	if (pd->plugin) {
+		tal_del_destructor2(pd->plugin, mark_plugin_destroyed, pd);
+		tal_free(pd);
+		return false;
+	}
+	tal_free(pd);
+	return true;
 }

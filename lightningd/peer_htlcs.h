@@ -14,6 +14,8 @@ struct htlc_out;
 struct htlc_out_map;
 struct htlc_stub;
 struct lightningd;
+struct forwarding;
+struct json_stream;
 
 /* FIXME: Define serialization primitive for this? */
 struct channel_info {
@@ -23,8 +25,7 @@ struct channel_info {
 	/* The old_remote_per_commit is for the locked-in remote commit_tx,
 	 * and the remote_per_commit is for the commit_tx we're modifying now. */
 	struct pubkey remote_per_commit, old_remote_per_commit;
-	/* In transition, these can be different! */
-	u32 feerate_per_kw[NUM_SIDES];
+	struct fee_states *fee_states;
 };
 
 /* Get all HTLCs for a peer, to send in init message. */
@@ -49,6 +50,7 @@ void update_per_commit_point(struct channel *channel,
 enum onion_type send_htlc_out(struct channel *out,
 			      struct amount_msat amount, u32 cltv,
 			      const struct sha256 *payment_hash,
+			      u64 partid,
 			      const u8 *onion_routing_packet,
 			      struct htlc_in *in,
 			      struct htlc_out **houtp);
@@ -61,12 +63,19 @@ void onchain_fulfilled_htlc(struct channel *channel,
 
 void htlcs_notify_new_block(struct lightningd *ld, u32 height);
 
-void htlcs_reconnect(struct lightningd *ld,
-		     struct htlc_in_map *htlcs_in,
-		     struct htlc_out_map *htlcs_out);
+/* Only defined if COMPAT_V061 */
+void fixup_htlcs_out(struct lightningd *ld);
+
+void htlcs_resubmit(struct lightningd *ld,
+		    struct htlc_in_map *unconnected_htlcs_in);
 
 /* For HTLCs which terminate here, invoice payment calls one of these. */
 void fulfill_htlc(struct htlc_in *hin, const struct preimage *preimage);
 void fail_htlc(struct htlc_in *hin, enum onion_type failcode);
 
+/* This json process will be used as the serialize method for
+ * forward_event_notification_gen and be used in
+ * `listforwardings_add_forwardings()`. */
+void json_format_forwarding_object(struct json_stream *response, const char *fieldname,
+				   const struct forwarding *cur);
 #endif /* LIGHTNING_LIGHTNINGD_PEER_HTLCS_H */

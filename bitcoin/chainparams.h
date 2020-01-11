@@ -23,6 +23,8 @@ struct chainparams {
 	const int rpc_port;
 	const char *cli;
 	const char *cli_args;
+	/* The min numeric version of cli supported */
+	const u64 cli_min_supported_version;
 	const struct amount_sat dust_limit;
 	const struct amount_sat max_funding;
 	const struct amount_msat max_payment;
@@ -35,12 +37,20 @@ struct chainparams {
 
 	/* Version codes for BIP32 extended keys in libwally-core*/
 	const struct bip32_key_version bip32_key_version;
+	const bool is_elements;
+	const u8 *fee_asset_tag;
 };
 
 /**
  * chainparams_for_network - Look up blockchain parameters by its name
  */
 const struct chainparams *chainparams_for_network(const char *network_name);
+
+/**
+ * chainparams_for_networks - Get blockchain parameters for all known networks,
+ *                            as a tal array.
+ */
+const struct chainparams **chainparams_for_networks(const tal_t *ctx);
 
 /**
  * chainparams_by_bip173 - Helper to get a network by its bip173 name

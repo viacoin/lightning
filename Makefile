@@ -1,7 +1,7 @@
 #! /usr/bin/make
 
 # Extract version from git, or if we're from a zipfile, use dirname
-VERSION=$(shell git describe --always --dirty=-modded --abbrev=7 2>/dev/null || pwd | sed -n 's,.*/clightning-\(v[0-9.rc]*\)$$,\1,p')
+VERSION=$(shell git describe --always --dirty=-modded --abbrev=7 2>/dev/null || pwd | sed -n 's|.*/c\{0,1\}lightning-v\{0,1\}\([0-9a-f.rc]*\)$$|\1|gp')
 
 ifeq ($(VERSION),)
 $(error "ERROR: git is required for generating version information")
@@ -15,7 +15,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := ffeece3dab1c52efdb9b53ae476539320fa44938
+BOLTVERSION := 35f6376f2050191081b148fb540f604092be59e1
 
 -include config.vars
 
@@ -47,7 +47,7 @@ endif
 
 ifeq ($(COMPAT),1)
 # We support compatibility with pre-0.6.
-COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1 -DCOMPAT_V061=1 -DCOMPAT_V062=1 -DCOMPAT_V070=1
+COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1 -DCOMPAT_V061=1 -DCOMPAT_V062=1 -DCOMPAT_V070=1 -DCOMPAT_V073=1
 endif
 
 # Timeout shortly before the 600 second travis silence timeout
@@ -70,7 +70,6 @@ CCAN_OBJS :=					\
 	ccan-crypto-sha256.o			\
 	ccan-crypto-shachain.o			\
 	ccan-crypto-siphash24.o			\
-	ccan-daemonize.o			\
 	ccan-err.o				\
 	ccan-fdpass.o				\
 	ccan-htable.o				\
@@ -132,7 +131,6 @@ CCAN_HEADERS :=						\
 	$(CCANDIR)/ccan/crypto/sha256/sha256.h		\
 	$(CCANDIR)/ccan/crypto/shachain/shachain.h	\
 	$(CCANDIR)/ccan/crypto/siphash24/siphash24.h	\
-	$(CCANDIR)/ccan/daemonize/daemonize.h		\
 	$(CCANDIR)/ccan/endian/endian.h			\
 	$(CCANDIR)/ccan/err/err.h			\
 	$(CCANDIR)/ccan/fdpass/fdpass.h			\
@@ -190,17 +188,25 @@ BOLT_DEPS := $(BOLT_GEN)
 
 ALL_PROGRAMS =
 
-CPPFLAGS = -DBINTOPKGLIBEXECDIR="\"$(shell sh tools/rel.sh $(bindir) $(pkglibexecdir))\""
-CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS)
+CPPFLAGS += -DBINTOPKGLIBEXECDIR="\"$(shell sh tools/rel.sh $(bindir) $(pkglibexecdir))\""
+CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS) -DBUILD_ELEMENTS=1
 
 # We can get configurator to run a different compile cmd to cross-configure.
 CONFIGURATOR_CC := $(CC)
 
-LDFLAGS = $(PIE_LDFLAGS) $(SANITIZER_FLAGS) $(COPTFLAGS)
+LDFLAGS += $(PIE_LDFLAGS) $(SANITIZER_FLAGS) $(COPTFLAGS)
 ifeq ($(STATIC),1)
+# For MacOS, Jacob Rapoport <jacob@rumblemonkey.com> changed this to:
+#  -L/usr/local/lib -Wl,-lgmp -lsqlite3 -lz -Wl,-lm -lpthread -ldl $(COVFLAGS)
+# But that doesn't static link.
 LDLIBS = -L/usr/local/lib -Wl,-dn -lgmp -lsqlite3 -lz -Wl,-dy -lm -lpthread -ldl $(COVFLAGS)
 else
 LDLIBS = -L/usr/local/lib -lm -lgmp -lsqlite3 -lz $(COVFLAGS)
+endif
+
+# If we have the postgres client library we need to link against it as well
+ifeq ($(HAVE_POSTGRES),1)
+LDLIBS += -lpq
 endif
 
 default: all-programs all-test-programs
@@ -249,9 +255,7 @@ endif
 
 check-units:
 
-check: check-units
-	$(MAKE) installcheck
-	$(MAKE) pytest
+check: check-units installcheck pytest
 
 pytest: $(ALL_PROGRAMS)
 ifeq ($(PYTEST),)
@@ -259,7 +263,7 @@ ifeq ($(PYTEST),)
 	exit 1
 else
 # Explicitly hand DEVELOPER and VALGRIND so you can override on make cmd line.
-	PYTHONPATH=contrib/pylightning:$$PYTHONPATH TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) VALGRIND=$(VALGRIND) $(PYTEST) tests/ $(PYTEST_OPTS)
+	PYTHONPATH=`pwd`/contrib/pyln-client:`pwd`/contrib/pyln-testing:`pwd`/contrib/pylightning:$$PYTHONPATH TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) VALGRIND=$(VALGRIND) $(PYTEST) tests/ $(PYTEST_OPTS)
 endif
 
 # Keep includes in alpha order.
@@ -274,13 +278,6 @@ check-hdr-include-order/%: %
 # Make sure Makefile includes all headers.
 check-makefile:
 	@if [ x"$(CCANDIR)/config.h `find $(CCANDIR)/ccan -name '*.h' | grep -v /test/ | LC_ALL=C sort | tr '\n' ' '`" != x"$(CCAN_HEADERS) " ]; then echo CCAN_HEADERS incorrect; exit 1; fi
-
-# Check if they've installed 'mako' dependency, useful for
-# keeping your build from clobbering itself
-check-bolt-dependency:
-	@python3 -c "import mako"
-
-BOLT_DEPS += check-bolt-dependency
 
 # Experimental quotes quote the exact version.
 ifeq ($(EXPERIMENTAL_FEATURES),1)
@@ -299,10 +296,6 @@ bolt-precheck:
 	@[ -d $(BOLTDIR) ] || exit 0; set -e; if [ -z "$(BOLTVERSION)" ]; then rm -rf $(LOCAL_BOLTDIR); ln -sf $(BOLTDIR) $(LOCAL_BOLTDIR); exit 0; fi; [ "$$(git -C $(LOCAL_BOLTDIR) rev-list --max-count=1 HEAD 2>/dev/null)" != "$(BOLTVERSION)" ] || exit 0; rm -rf $(LOCAL_BOLTDIR) && git clone -q $(BOLTDIR) $(LOCAL_BOLTDIR) && cd $(LOCAL_BOLTDIR) && git checkout -q $(BOLTVERSION)
 
 check-source-bolt: $(ALL_TEST_PROGRAMS:%=bolt-check/%.c)
-
-tools/check-bolt: tools/check-bolt.o $(CCAN_OBJS) common/utils.o
-
-tools/check-bolt.o: $(CCAN_HEADERS)
 
 check-whitespace/%: %
 	@if grep -Hn '[ 	]$$' $<; then echo Extraneous whitespace found >&2; exit 1; fi
@@ -323,14 +316,14 @@ check-python:
 	@# W503: line break before binary operator
 	@flake8 --ignore=E501,E731,W503 --exclude=contrib/pylightning/lightning/__init__.py ${PYSRC}
 
-	PYTHONPATH=contrib/pylightning:$$PYTHONPATH $(PYTEST) contrib/pylightning/
+	PYTHONPATH=contrib/pyln-client:$$PYTHONPATH $(PYTEST) contrib/pyln-client/
 
 check-includes:
 	@tools/check-includes.sh
 
 # cppcheck gets confused by list_for_each(head, i, list): thinks i is uninit.
 .cppcheck-suppress:
-	@git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs grep -n 'list_for_each' | sed 's/\([^:]*:.*\):.*/uninitvar:\1/' > $@
+	@git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs grep -n '_for_each' | sed 's/\([^:]*:.*\):.*/uninitvar:\1/' > $@
 
 check-cppcheck: .cppcheck-suppress
 	@trap 'rm -f .cppcheck-suppress' 0; git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs cppcheck -q --language=c --std=c11 --error-exitcode=1 --suppressions-list=.cppcheck-suppress --inline-suppr
@@ -367,7 +360,7 @@ coverage: coverage/coverage.info
 # We make libwallycore.la a dependency, so that it gets built normally, without ncc.
 # Ncc can't handle the libwally source code (yet).
 ncc: external/libwally-core/src/libwallycore.la
-	make CC="ncc -ncgcc -ncld -ncfabs" AR=nccar LD=nccld
+	$(MAKE) CC="ncc -ncgcc -ncld -ncfabs" AR=nccar LD=nccld
 
 # Ignore test/ directories.
 TAGS: FORCE
@@ -383,10 +376,6 @@ ccan/ccan/cdump/tools/cdump-enumstr.o: $(CCAN_HEADERS) Makefile
 gen_version.h: FORCE
 	@(echo "#define VERSION \"$(VERSION)\"" && echo "#define BUILD_FEATURES \"$(FEATURES)\"") > $@.new
 	@if cmp $@.new $@ >/dev/null 2>&2; then rm -f $@.new; else mv $@.new $@; echo Version updated; fi
-
-# We force make to relink this every time, to detect version changes.
-tools/headerversions: FORCE tools/headerversions.o $(CCAN_OBJS)
-	@$(LINK.o) tools/headerversions.o $(CCAN_OBJS) $(LOADLIBES) $(LDLIBS) -o $@
 
 # That forces this rule to be run every time, too.
 gen_header_versions.h: tools/headerversions
@@ -439,19 +428,19 @@ maintainer-clean: distclean
 	@echo 'This command is intended for maintainers to use; it'
 	@echo 'deletes files that may need special tools to rebuild.'
 
-clean: wire-clean
+clean:
 	$(RM) $(CCAN_OBJS) $(CDUMP_OBJS) $(ALL_OBJS)
 	$(RM) $(ALL_PROGRAMS) $(ALL_PROGRAMS:=.o)
 	$(RM) $(ALL_TEST_PROGRAMS) $(ALL_TEST_PROGRAMS:=.o)
 	$(RM) gen_*.h ccan/tools/configurator/configurator
 	$(RM) ccan/ccan/cdump/tools/cdump-enumstr.o
-	$(RM) check-bolt tools/check-bolt tools/*.o
 	find . -name '*gcda' -delete
 	find . -name '*gcno' -delete
 	find . -name '*.nccout' -delete
 
+update-mocks: $(ALL_GEN_HEADERS)
 update-mocks/%: %
-	@tools/update-mocks.sh "$*"
+	@MAKE=$(MAKE) tools/update-mocks.sh "$*"
 
 unittest/%: %
 	$(VG) $(VG_TEST_ARGS) $* > /dev/null
@@ -468,6 +457,7 @@ mandir = $(datadir)/man
 man1dir = $(mandir)/man1
 man5dir = $(mandir)/man5
 man7dir = $(mandir)/man7
+man8dir = $(mandir)/man8
 
 # Commands
 MKDIR_P = mkdir -p
@@ -492,6 +482,7 @@ installdirs:
 	$(MKDIR_P) $(DESTDIR)$(man1dir)
 	$(MKDIR_P) $(DESTDIR)$(man5dir)
 	$(MKDIR_P) $(DESTDIR)$(man7dir)
+	$(MKDIR_P) $(DESTDIR)$(man8dir)
 	$(MKDIR_P) $(DESTDIR)$(docdir)
 
 # Programs to install in bindir and pkglibexecdir.
@@ -508,7 +499,7 @@ PKGLIBEXEC_PROGRAMS = \
 	       lightningd/lightning_hsmd \
 	       lightningd/lightning_onchaind \
 	       lightningd/lightning_openingd
-PLUGINS=plugins/pay plugins/autoclean
+PLUGINS=plugins/pay plugins/autoclean plugins/fundchannel
 
 install-program: installdirs $(BIN_PROGRAMS) $(PKGLIBEXEC_PROGRAMS) $(PLUGINS)
 	@$(NORMAL_INSTALL)
@@ -519,13 +510,15 @@ install-program: installdirs $(BIN_PROGRAMS) $(PKGLIBEXEC_PROGRAMS) $(PLUGINS)
 MAN1PAGES = $(filter %.1,$(MANPAGES))
 MAN5PAGES = $(filter %.5,$(MANPAGES))
 MAN7PAGES = $(filter %.7,$(MANPAGES))
+MAN8PAGES = $(filter %.8,$(MANPAGES))
 DOC_DATA = README.md doc/INSTALL.md doc/HACKING.md LICENSE
 
-install-data: installdirs $(MAN1PAGES) $(MAN5PAGES) $(MAN7PAGES) $(DOC_DATA)
+install-data: installdirs $(MAN1PAGES) $(MAN5PAGES) $(MAN7PAGES) $(MAN8PAGES) $(DOC_DATA)
 	@$(NORMAL_INSTALL)
 	$(INSTALL_DATA) $(MAN1PAGES) $(DESTDIR)$(man1dir)
 	$(INSTALL_DATA) $(MAN5PAGES) $(DESTDIR)$(man5dir)
 	$(INSTALL_DATA) $(MAN7PAGES) $(DESTDIR)$(man7dir)
+	$(INSTALL_DATA) $(MAN8PAGES) $(DESTDIR)$(man8dir)
 	$(INSTALL_DATA) $(DOC_DATA) $(DESTDIR)$(docdir)
 
 install: install-program install-data
@@ -556,12 +549,16 @@ uninstall:
 	  echo rm -f $(DESTDIR)$(man7dir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(man7dir)/`basename $$f`; \
 	done
+	@for f in $(MAN8PAGES); do \
+	  echo rm -f $(DESTDIR)$(man8dir)/`basename $$f`; \
+	  rm -f $(DESTDIR)$(man8dir)/`basename $$f`; \
+	done
 	@for f in $(DOC_DATA); do \
 	  echo rm -f $(DESTDIR)$(docdir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(docdir)/`basename $$f`; \
 	done
 
-installcheck:
+installcheck: all-programs
 	@rm -rf testinstall || true
 	$(MAKE) DESTDIR=$$(pwd)/testinstall install
 	testinstall$(bindir)/lightningd --test-daemons-only --lightning-dir=testinstall
@@ -615,8 +612,6 @@ ccan-opt-helpers.o: $(CCANDIR)/ccan/opt/helpers.c
 ccan-opt-parse.o: $(CCANDIR)/ccan/opt/parse.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-opt-usage.o: $(CCANDIR)/ccan/opt/usage.c
-	$(CC) $(CFLAGS) -c -o $@ $<
-ccan-daemonize.o: $(CCANDIR)/ccan/daemonize/daemonize.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-err.o: $(CCANDIR)/ccan/err/err.c
 	$(CC) $(CFLAGS) -c -o $@ $<

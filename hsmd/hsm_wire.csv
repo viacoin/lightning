@@ -9,6 +9,8 @@ msgdata,hsmstatus_client_bad_request,msg,u8,len
 # Start the HSM.
 msgtype,hsm_init,11
 msgdata,hsm_init,bip32_key_version,bip32_key_version,
+msgdata,hsm_init,chainparams,chainparams,
+msgdata,hsm_init,hsm_encryption_key,?secret,
 msgdata,hsm_init,dev_force_privkey,?privkey,
 msgdata,hsm_init,dev_force_bip32_seed,?secret,
 msgdata,hsm_init,dev_force_channel_secrets,?secrets,
@@ -68,8 +70,8 @@ msgtype,hsm_sign_withdrawal,7
 msgdata,hsm_sign_withdrawal,satoshi_out,amount_sat,
 msgdata,hsm_sign_withdrawal,change_out,amount_sat,
 msgdata,hsm_sign_withdrawal,change_keyindex,u32,
-msgdata,hsm_sign_withdrawal,scriptpubkey_len,u16,
-msgdata,hsm_sign_withdrawal,scriptpubkey,u8,scriptpubkey_len
+msgdata,hsm_sign_withdrawal,num_outputs,u16,
+msgdata,hsm_sign_withdrawal,outputs,bitcoin_tx_output,num_outputs
 msgdata,hsm_sign_withdrawal,num_inputs,u16,
 msgdata,hsm_sign_withdrawal,inputs,utxo,num_inputs
 
@@ -196,3 +198,11 @@ msgdata,hsm_check_future_secret,commitment_secret,secret,
 
 msgtype,hsm_check_future_secret_reply,122
 msgdata,hsm_check_future_secret_reply,correct,bool,
+
+# lightningd asks us to sign a string.
+msgtype,hsm_sign_message,23
+msgdata,hsm_sign_message,len,u16,
+msgdata,hsm_sign_message,msg,u8,len
+
+msgtype,hsm_sign_message_reply,123
+msgdata,hsm_sign_message_reply,sig,secp256k1_ecdsa_recoverable_signature,

@@ -6,10 +6,12 @@ plugin = Plugin()
 
 
 @plugin.hook("htlc_accepted")
-def on_htlc_accepted(htlc, onion, plugin):
+def on_htlc_accepted(onion, plugin, **kwargs):
     plugin.log("Failing htlc on purpose")
     plugin.log("onion: %r" % (onion))
-    return {"result": "fail", "failure_code": 16399}
+    # FIXME: Define this!
+    WIRE_TEMPORARY_NODE_FAILURE = 0x2002
+    return {"result": "fail", "failure_code": WIRE_TEMPORARY_NODE_FAILURE}
 
 
 plugin.run()

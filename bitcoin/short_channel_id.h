@@ -4,6 +4,7 @@
 #include <ccan/short_types/short_types.h>
 #include <ccan/structeq/structeq.h>
 #include <ccan/tal/tal.h>
+#include <common/gossip_constants.h>
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -47,20 +48,27 @@ static inline u16 short_channel_id_outnum(const struct short_channel_id *scid)
 	return scid->u64 & 0xFFFF;
 }
 
+/* Subtly, at block N, depth is 1, hence the -1 here. eg. 103x1x0 is announceable
+ * when height is 108. */
+static inline bool
+is_scid_depth_announceable(const struct short_channel_id *scid,
+			  unsigned int height)
+{
+	return short_channel_id_blocknum(scid) + ANNOUNCE_MIN_DEPTH - 1
+		<= height;
+}
+
 /* Returns false if blocknum, txnum or outnum require too many bits */
 bool WARN_UNUSED_RESULT mk_short_channel_id(struct short_channel_id *scid,
 					    u64 blocknum, u64 txnum, u64 outnum);
 
-/* may_be_deprecated_form allows : separators if COMPAT defined */
 bool WARN_UNUSED_RESULT short_channel_id_from_str(const char *str, size_t strlen,
-						  struct short_channel_id *dst,
-						  bool may_be_deprecated_form);
+						  struct short_channel_id *dst);
 
 char *short_channel_id_to_str(const tal_t *ctx, const struct short_channel_id *scid);
 
 bool WARN_UNUSED_RESULT short_channel_id_dir_from_str(const char *str, size_t strlen,
-						      struct short_channel_id_dir *scidd,
-						      bool may_be_deprecated_form);
+						      struct short_channel_id_dir *scidd);
 
 char *short_channel_id_dir_to_str(const tal_t *ctx,
 				  const struct short_channel_id_dir *scidd);

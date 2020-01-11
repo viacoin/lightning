@@ -2,6 +2,7 @@
 #define LIGHTNING_COMMON_JSON_H
 #include "config.h"
 #include <bitcoin/preimage.h>
+#include <bitcoin/privkey.h>
 #include <ccan/tal/tal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -36,6 +37,10 @@ bool json_to_number(const char *buffer, const jsmntok_t *tok,
 bool json_to_u64(const char *buffer, const jsmntok_t *tok,
 		 uint64_t *num);
 
+/* Extract number from this (may be a string, or a number literal) */
+bool json_to_u16(const char *buffer, const jsmntok_t *tok,
+                 uint16_t *num);
+
 /* Extract double from this (must be a number literal) */
 bool json_to_double(const char *buffer, const jsmntok_t *tok, double *num);
 
@@ -44,6 +49,9 @@ bool json_to_int(const char *buffer, const jsmntok_t *tok, int *num);
 
 /* Extract boolean from this */
 bool json_to_bool(const char *buffer, const jsmntok_t *tok, bool *b);
+
+/* Extract a secret from this. */
+bool json_to_secret(const char *buffer, const jsmntok_t *tok, struct secret *dest);
 
 /* Is this a number? [0..9]+ */
 bool json_tok_is_num(const char *buffer, const jsmntok_t *tok);
@@ -75,10 +83,11 @@ void json_tok_print(const char *buffer, const jsmntok_t *params);
 jsmntok_t *json_tok_copy(const tal_t *ctx, const jsmntok_t *tok);
 
 /*
- * Remove @num json values from a json array or object. @tok points
- * to the first value to remove.  The array will be resized.
+ * Remove @num json values from a json array or object @obj. @tok points
+ * to the first value to remove.  The array @tokens will be resized.
  */
-void json_tok_remove(jsmntok_t **tokens, jsmntok_t *tok, size_t num);
+void json_tok_remove(jsmntok_t **tokens,
+		     jsmntok_t *obj_or_array, const jsmntok_t *tok, size_t num);
 
 /* Guide is a string with . for members, [] around indexes. */
 const jsmntok_t *json_delve(const char *buffer,

@@ -20,9 +20,6 @@ struct fulfilled_htlc;
 
 /* View from each side */
 struct channel_view {
-	/* Current feerate in satoshis per 1000 weight. */
-	u32 feerate_per_kw;
-
 	/* How much is owed to each side (includes pending changes) */
 	struct amount_msat owed[NUM_SIDES];
 };
@@ -56,27 +53,25 @@ struct channel {
 	/* All live HTLCs for this channel */
 	struct htlc_map *htlcs;
 
-	/* Do we have changes pending for ourselves/other? */
-	bool changes_pending[NUM_SIDES];
+	/* Fee changes, some which may be in transit */
+	struct fee_states *fee_states;
 
 	/* What it looks like to each side. */
 	struct channel_view view[NUM_SIDES];
 
-	/* Chain params to check against */
-	const struct chainparams *chainparams;
+	/* Is this using option_static_remotekey? */
+	bool option_static_remotekey;
 };
 
 /**
  * new_initial_channel: Given initial fees and funding, what is initial state?
  * @ctx: tal context to allocate return value from.
- * @chain_hash: Which blockchain are we talking about?
  * @funding_txid: The commitment transaction id.
  * @funding_txout: The commitment transaction output number.
  * @minimum_depth: The minimum confirmations needed for funding transaction.
  * @funding_satoshis: The commitment transaction amount.
  * @local_msatoshi: The amount for the local side (remainder goes to remote)
- * @feerate_per_kw: feerate per kiloweight (satoshis) for the commitment
- *   transaction and HTLCS (at this stage, same for both sides)
+ * @fee_states: The fee update states.
  * @local: local channel configuration
  * @remote: remote channel configuration
  * @local_basepoints: local basepoints.
@@ -88,19 +83,19 @@ struct channel {
  * Returns channel, or NULL if malformed.
  */
 struct channel *new_initial_channel(const tal_t *ctx,
-				    const struct bitcoin_blkid *chain_hash,
 				    const struct bitcoin_txid *funding_txid,
 				    unsigned int funding_txout,
 				    u32 minimum_depth,
 				    struct amount_sat funding,
 				    struct amount_msat local_msatoshi,
-				    u32 feerate_per_kw,
+				    const struct fee_states *fee_states TAKES,
 				    const struct channel_config *local,
 				    const struct channel_config *remote,
 				    const struct basepoints *local_basepoints,
 				    const struct basepoints *remote_basepoints,
 				    const struct pubkey *local_funding_pubkey,
 				    const struct pubkey *remote_funding_pubkey,
+				    bool option_static_remotekey,
 				    enum side funder);
 
 
@@ -122,5 +117,12 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				      const struct pubkey *per_commitment_point,
 				      enum side side,
 				      char** err_reason);
+
+/**
+ * channel_feerate: Get fee rate for this side of channel.
+ * @channel: The channel
+ * @side: the side
+ */
+u32 channel_feerate(const struct channel *channel, enum side side);
 
 #endif /* LIGHTNING_COMMON_INITIAL_CHANNEL_H */

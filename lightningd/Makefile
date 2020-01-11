@@ -17,8 +17,10 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/addr.o				\
 	common/amount.o				\
 	common/base32.o				\
+	common/base64.o				\
 	common/bech32.o				\
 	common/bech32_util.o			\
+	common/bigsize.o			\
 	common/bip32.o				\
 	common/bolt11.o				\
 	common/channel_config.o			\
@@ -27,9 +29,11 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/daemon.o				\
 	common/derive_basepoints.o		\
 	common/features.o			\
+	common/fee_states.o			\
 	common/funding_tx.o			\
 	common/gen_peer_status_wire.o		\
 	common/gen_status_wire.o		\
+	common/gossip_rcvd_filter.o		\
 	common/hash_u5.o			\
 	common/htlc_state.o			\
 	common/htlc_trim.o			\
@@ -42,6 +46,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/memleak.o			\
 	common/msg_queue.o			\
 	common/node_id.o			\
+	common/onion.o				\
 	common/param.o				\
 	common/per_peer_state.o			\
 	common/permute_tx.o			\
@@ -71,6 +76,7 @@ LIGHTNINGD_SRC :=				\
 	lightningd/gossip_msg.c			\
 	lightningd/hsm_control.c		\
 	lightningd/htlc_end.c			\
+	lightningd/htlc_set.c			\
 	lightningd/invoice.c			\
 	lightningd/io_loop_with_timers.c	\
 	lightningd/json.c			\
@@ -89,11 +95,15 @@ LIGHTNINGD_SRC :=				\
 	lightningd/peer_htlcs.c			\
 	lightningd/ping.c			\
 	lightningd/plugin.c			\
+	lightningd/plugin_control.c		\
 	lightningd/plugin_hook.c		\
 	lightningd/subd.c			\
 	lightningd/watch.c
 
-LIGHTNINGD_OBJS := $(LIGHTNINGD_SRC:.c=.o)
+LIGHTNINGD_SRC_NOHDR :=				\
+	lightningd/signmessage.c
+
+LIGHTNINGD_OBJS := $(LIGHTNINGD_SRC:.c=.o) $(LIGHTNINGD_SRC_NOHDR:.c=.o)
 
 # Make sure these depend on everything.
 ALL_OBJS += $(LIGHTNINGD_OBJS)
@@ -121,9 +131,9 @@ lightningd/gen_channel_state_names.h: lightningd/channel_state.h ccan/ccan/cdump
 
 check-source: $(LIGHTNINGD_SRC:%=check-src-include-order/%) $(LIGHTNINGD_SRC_NOHDR:%=check-src-include-order/%)
 check-source: $(LIGHTNINGD_HEADERS_NOGEN:%=check-hdr-include-order/%)
-check-source-bolt: $(LIGHTNINGD_SRC:%=bolt-check/%) $(LIGHTNINGD_HEADERS_NOGEN:%=bolt-check/%)
+check-source-bolt: $(LIGHTNINGD_SRC:%=bolt-check/%) $(LIGHTNINGD_SRC_NOHDR:%=bolt-check/%) $(LIGHTNINGD_HEADERS_NOGEN:%=bolt-check/%)
 
-check-whitespace: $(LIGHTNINGD_SRC:%=check-whitespace/%) $(LIGHTNINGD_HEADERS_NOGEN:%=check-whitespace/%)
+check-whitespace: $(LIGHTNINGD_SRC:%=check-whitespace/%) $(LIGHTNINGD_SRC_NOHDR:%=check-whitespace/%) $(LIGHTNINGD_HEADERS_NOGEN:%=check-whitespace/%)
 
 check-makefile: check-lightningd-makefile
 check-lightningd-makefile:

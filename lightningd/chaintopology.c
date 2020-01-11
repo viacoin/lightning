@@ -92,8 +92,6 @@ static void filter_block_txs(struct chain_topology *topo, struct block *b)
 						     tx, &b->height, &owned);
 			wallet_transaction_add(topo->ld->wallet, tx, b->height,
 					       i);
-			wallet_transaction_annotate(topo->ld->wallet, &txid,
-						    TX_WALLET_DEPOSIT, 0);
 		}
 
 		/* We did spends first, in case that tells us to watch tx. */
@@ -231,8 +229,8 @@ void broadcast_tx(struct chain_topology *topo,
 	tal_free(rawtx);
 	tal_add_destructor2(channel, clear_otx_channel, otx);
 
-	log_add(topo->log, " (tx %s)",
-		type_to_string(tmpctx, struct bitcoin_txid, &otx->txid));
+	log_debug(topo->log, "Broadcasting txid %s",
+		  type_to_string(tmpctx, struct bitcoin_txid, &otx->txid));
 
 	wallet_transaction_add(topo->ld->wallet, tx, 0, 0);
 	bitcoind_sendrawtx(topo->bitcoind, otx->hextx, broadcast_done, otx);
@@ -559,6 +557,31 @@ static void next_updatefee_timer(struct chain_topology *topo)
 			     start_fee_estimate, topo));
 }
 
+struct sync_waiter {
+	/* Linked from chain_topology->sync_waiters */
+	struct list_node list;
+	void (*cb)(struct chain_topology *topo, void *arg);
+	void *arg;
+};
+
+static void destroy_sync_waiter(struct sync_waiter *waiter)
+{
+	list_del(&waiter->list);
+}
+
+void topology_add_sync_waiter_(const tal_t *ctx,
+			       struct chain_topology *topo,
+			       void (*cb)(struct chain_topology *topo,
+					  void *arg),
+			       void *arg)
+{
+	struct sync_waiter *w = tal(ctx, struct sync_waiter);
+	w->cb = cb;
+	w->arg = arg;
+	list_add_tail(topo->sync_waiters, &w->list);
+	tal_add_destructor(w, destroy_sync_waiter);
+}
+
 /* Once we're run out of new blocks to add, call this. */
 static void updates_complete(struct chain_topology *topo)
 {
@@ -577,6 +600,23 @@ static void updates_complete(struct chain_topology *topo)
 			      "last_processed_block", topo->tip->height);
 
 		topo->prev_tip = topo->tip;
+	}
+
+	/* If bitcoind is synced, we're now synced. */
+	if (topo->bitcoind->synced && !topology_synced(topo)) {
+		struct sync_waiter *w;
+		struct list_head *list = topo->sync_waiters;
+
+		/* Mark topology_synced() before callbacks. */
+		topo->sync_waiters = NULL;
+
+		while ((w = list_pop(list, struct sync_waiter, list))) {
+			/* In case it doesn't free itself. */
+			tal_del_destructor(w, destroy_sync_waiter);
+			tal_steal(list, w);
+			w->cb(topo, w->arg);
+		}
+		tal_free(list);
 	}
 
 	/* Try again soon. */
@@ -612,13 +652,16 @@ static void topo_add_utxos(struct chain_topology *topo, struct block *b)
 	for (size_t i = 0; i < tal_count(b->full_txs); i++) {
 		const struct bitcoin_tx *tx = b->full_txs[i];
 		for (size_t j = 0; j < tx->wtx->num_outputs; j++) {
-			const u8 *script = bitcoin_tx_output_get_script(tmpctx, tx, j);
-			struct amount_sat amt = bitcoin_tx_output_get_amount(tx, j);
+			if (tx->wtx->outputs[j].features & WALLY_TX_IS_COINBASE)
+				continue;
 
-			if (is_p2wsh(script, NULL)) {
+			const u8 *script = bitcoin_tx_output_get_script(tmpctx, tx, j);
+			struct amount_asset amt = bitcoin_tx_output_get_amount(tx, j);
+
+			if (amount_asset_is_main(&amt) && is_p2wsh(script, NULL)) {
 				wallet_utxoset_add(topo->ld->wallet, tx, j,
 						   b->height, i, script,
-						   amt);
+						   amount_asset_to_sat(&amt));
 			}
 		}
 	}
@@ -649,7 +692,7 @@ static struct block *new_block(struct chain_topology *topo,
 {
 	struct block *b = tal(topo, struct block);
 
-	sha256_double(&b->blkid.shad, &blk->hdr, sizeof(blk->hdr));
+	bitcoin_block_blkid(blk, &b->blkid);
 	log_debug(topo->log, "Adding block %u: %s",
 		  height,
 		  type_to_string(tmpctx, struct bitcoin_blkid, &b->blkid));
@@ -703,6 +746,11 @@ static void have_new_block(struct bitcoind *bitcoind UNUSED,
 			   struct bitcoin_block *blk,
 			   struct chain_topology *topo)
 {
+	/* Annotate all transactions with the chainparams */
+	for (size_t i=0; i<tal_count(blk->tx); i++)
+		blk->tx[i]->chainparams = chainparams;
+
+
 	/* Unexpected predecessor?  Free predecessor, refetch it. */
 	if (!bitcoin_blkid_eq(&topo->tip->blkid, &blk->hdr.prev_hash))
 		remove_tip(topo);
@@ -756,10 +804,11 @@ static void get_init_block(struct bitcoind *bitcoind,
 static void get_init_blockhash(struct bitcoind *bitcoind, u32 blockcount,
 			       struct chain_topology *topo)
 {
-	/* If bitcoind's current blockheight is below the requested height, just
-	 * go back to that height. This might be a new node catching up, or
-	 * bitcoind is processing a reorg. */
+	/* If bitcoind's current blockheight is below the requested
+	 * height, refuse.  You can always explicitly request a reindex from
+	 * that block number using --rescan=. */
 	if (blockcount < topo->max_blockheight) {
+		/* UINT32_MAX == no blocks in database */
 		if (topo->max_blockheight == UINT32_MAX) {
 			/* Relative rescan, but we didn't know the blockheight */
 			/* Protect against underflow in subtraction.
@@ -768,15 +817,9 @@ static void get_init_blockhash(struct bitcoind *bitcoind, u32 blockcount,
 				topo->max_blockheight = 0;
 			else
 				topo->max_blockheight = blockcount - bitcoind->ld->config.rescan;
-		} else {
-			/* Absolute blockheight, but bitcoind's blockheight isn't there yet */
-			/* Protect against underflow in subtraction.
-			 * Possible in regtest mode. */
-			if (blockcount < 1)
-				topo->max_blockheight = 0;
-			else
-				topo->max_blockheight = blockcount - 1;
-		}
+		} else
+			fatal("bitcoind has gone backwards from %u to %u blocks!",
+			      topo->max_blockheight, blockcount);
 	}
 
 	/* Rollback to the given blockheight, so we start track
@@ -896,6 +939,8 @@ struct chain_topology *new_topology(struct lightningd *ld, struct log *log)
 	topo->poll_seconds = 30;
 	topo->feerate_uninitialized = true;
 	topo->root = NULL;
+	topo->sync_waiters = tal(topo, struct list_head);
+	list_head_init(topo->sync_waiters);
 	return topo;
 }
 
@@ -911,6 +956,8 @@ void setup_topology(struct chain_topology *topo,
 
 	/* Make sure bitcoind is started, and ready */
 	wait_for_bitcoind(topo->bitcoind);
+
+	bitcoind_getclientversion(topo->bitcoind);
 
 	bitcoind_getblockcount(topo->bitcoind, get_init_blockhash, topo);
 

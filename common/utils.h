@@ -10,6 +10,12 @@
 
 extern secp256k1_context *secp256k1_ctx;
 
+extern const struct chainparams *chainparams;
+
+/* Simple accessor function for our own dependencies to use, in order to avoid
+ * circular dependencies (should only be used in `bitcoin/y`). */
+bool is_elements(const struct chainparams *chainparams);
+
 /* Allocate and fill in a hex-encoded string of this data. */
 char *tal_hexstr(const tal_t *ctx, const void *data, size_t len);
 
@@ -18,6 +24,20 @@ char *tal_hex(const tal_t *ctx, const tal_t *data);
 
 /* Allocate and fill a buffer with the data of this hex string. */
 u8 *tal_hexdata(const tal_t *ctx, const void *str, size_t len);
+
+/* Macro to set memberptr in tal object outer to point to tal object obj,
+ * if it isn't NULL.
+ * The 0*sizeof() checks that *memberptr = obj is valid */
+#define set_softref(outer, memberptr, obj)				\
+	set_softref_((outer), sizeof(*(outer)) + 0*sizeof(*(memberptr) = obj), \
+		     (void **)(memberptr), (obj))
+
+/* Macro to clear a (set) softref ptr to NULL  */
+#define clear_softref(outer, memberptr)					\
+	clear_softref_((outer), sizeof(*(outer)), (void **)(memberptr))
+
+void set_softref_(const tal_t *outer, size_t outersize, void **ptr, tal_t *obj);
+void clear_softref_(const tal_t *outer, size_t outersize, void **ptr);
 
 /* Note: p is never a complex expression, otherwise this multi-evaluates! */
 #define tal_arr_expand(p, s)						\
@@ -53,5 +73,21 @@ STRUCTEQ_DEF(sha256, 0, u);
 
 /* Define ripemd160_eq. */
 STRUCTEQ_DEF(ripemd160, 0, u);
+
+/* If gcc complains about 'may be uninitialized' even at -O3, and the code is
+ * clear, use this to suppress it.  Argument should be gcc version it
+ * complained on, so we can re-test as gcc evolves. */
+#define COMPILER_WANTS_INIT(compiler_versions) = 0
+
+/* For case where we want one thing if DEVELOPER, another if not, particularly
+ * for function parameters.
+ *
+ * Usefully, you can refer to DEVELOPER-only fields here. */
+#if DEVELOPER
+/* Make sure that nondev is evaluated, and valid */
+#define IFDEV(dev, nondev) ((void)(nondev), (dev))
+#else
+#define IFDEV(dev, nondev) (nondev)
+#endif
 
 #endif /* LIGHTNING_COMMON_UTILS_H */

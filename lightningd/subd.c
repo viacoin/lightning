@@ -137,7 +137,9 @@ static void close_taken_fds(va_list *ap)
 /* We use sockets, not pipes, because fds are bidir. */
 static int subd(const char *dir, const char *name,
 		const char *debug_subdaemon,
-		int *msgfd, int dev_disconnect_fd, va_list *ap)
+		int *msgfd, int dev_disconnect_fd,
+		bool io_logging,
+		va_list *ap)
 {
 	int childmsg[2], execfail[2];
 	pid_t childpid;
@@ -161,7 +163,7 @@ static int subd(const char *dir, const char *name,
 		int fdnum = 3, i, stdin_is_now = STDIN_FILENO;
 		long max;
 		size_t num_args;
-		char *args[] = { NULL, NULL, NULL, NULL };
+		char *args[] = { NULL, NULL, NULL, NULL, NULL };
 
 		close(childmsg[0]);
 		close(execfail[0]);
@@ -200,6 +202,8 @@ static int subd(const char *dir, const char *name,
 
 		num_args = 0;
 		args[num_args++] = path_join(NULL, dir, name);
+		if (io_logging)
+			args[num_args++] = "--log-io";
 #if DEVELOPER
 		if (dev_disconnect_fd != -1)
 			args[num_args++] = tal_fmt(NULL, "--dev-disconnect=%i", dev_disconnect_fd);
@@ -432,7 +436,7 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 	switch ((enum status)type) {
 	case WIRE_STATUS_LOG:
 	case WIRE_STATUS_IO:
-		if (!log_status_msg(sd->log, sd->msg_in))
+		if (!log_status_msg(sd->log, sd->node_id, sd->msg_in))
 			goto malformed;
 		goto next;
 	case WIRE_STATUS_FAIL:
@@ -508,11 +512,9 @@ out:
 static void destroy_subd(struct subd *sd)
 {
 	int status;
-	bool fail_if_subd_fails = false;
+	bool fail_if_subd_fails;
 
-#if DEVELOPER
-	fail_if_subd_fails = sd->ld->dev_subdaemon_fail;
-#endif
+	fail_if_subd_fails = IFDEV(sd->ld->dev_subdaemon_fail, false);
 
 	switch (waitpid(sd->pid, &status, WNOHANG)) {
 	case 0:
@@ -555,7 +557,7 @@ static void destroy_subd(struct subd *sd)
 		sd->channel = NULL;
 
 		/* We can be freed both inside msg handling, or spontaneously. */
-		outer_transaction = db->in_transaction;
+		outer_transaction = db_in_transaction(db);
 		if (!outer_transaction)
 			db_begin_transaction(db);
 		if (sd->errcb)
@@ -603,6 +605,7 @@ static struct io_plan *msg_setup(struct io_conn *conn, struct subd *sd)
 static struct subd *new_subd(struct lightningd *ld,
 			     const char *name,
 			     void *channel,
+			     const struct node_id *node_id,
 			     struct log *base_log,
 			     bool talks_to_peer,
 			     const char *(*msgname)(int msgtype),
@@ -623,8 +626,22 @@ static struct subd *new_subd(struct lightningd *ld,
 	int msg_fd;
 	const char *debug_subd = NULL;
 	int disconnect_fd = -1;
+	const char *shortname;
 
 	assert(name != NULL);
+
+	/* This part of the name is a bit redundant for logging */
+	if (strstarts(name, "lightning_"))
+		shortname = name + strlen("lightning_");
+	else
+		shortname = name;
+
+	if (base_log) {
+		sd->log = new_log(sd, ld->log_book, node_id,
+				  "%s-%s", shortname, log_prefix(base_log));
+	} else {
+		sd->log = new_log(sd, ld->log_book, node_id, "%s", shortname);
+	}
 
 #if DEVELOPER
 	debug_subd = ld->dev_debug_subprocess;
@@ -632,21 +649,19 @@ static struct subd *new_subd(struct lightningd *ld,
 #endif /* DEVELOPER */
 
 	sd->pid = subd(ld->daemon_dir, name, debug_subd,
-		       &msg_fd, disconnect_fd, ap);
+		       &msg_fd, disconnect_fd,
+		       /* We only turn on subdaemon io logging if we're going
+			* to print it: too stressful otherwise! */
+		       log_print_level(sd->log) < LOG_DBG,
+		       ap);
 	if (sd->pid == (pid_t)-1) {
 		log_unusual(ld->log, "subd %s failed: %s",
 			    name, strerror(errno));
 		return tal_free(sd);
 	}
 	sd->ld = ld;
-	if (base_log) {
-		sd->log = new_log(sd, get_log_book(base_log), "%s-%s", name,
-				  log_prefix(base_log));
-	} else {
-		sd->log = new_log(sd, ld->log_book, "%s(%u):", name, sd->pid);
-	}
 
-	sd->name = name;
+	sd->name = shortname;
 	sd->must_not_exit = false;
 	sd->talks_to_peer = talks_to_peer;
 	sd->msgname = msgname;
@@ -660,12 +675,16 @@ static struct subd *new_subd(struct lightningd *ld,
 	tal_add_destructor(sd, destroy_subd);
 	list_head_init(&sd->reqs);
 	sd->channel = channel;
+	if (node_id)
+		sd->node_id = tal_dup(sd, struct node_id, node_id);
+	else
+		sd->node_id = NULL;
 
 	/* conn actually owns daemon: we die when it does. */
 	sd->conn = io_new_conn(ld, msg_fd, msg_setup, sd);
 	tal_steal(sd->conn, sd);
 
-	log_debug(sd->log, "pid %u, msgfd %i", sd->pid, msg_fd);
+	log_peer_debug(sd->log, node_id, "pid %u, msgfd %i", sd->pid, msg_fd);
 
 	/* Clear any old transient message. */
 	if (billboardcb)
@@ -684,7 +703,7 @@ struct subd *new_global_subd(struct lightningd *ld,
 	struct subd *sd;
 
 	va_start(ap, msgcb);
-	sd = new_subd(ld, name, NULL, NULL, false, msgname, msgcb, NULL, NULL, &ap);
+	sd = new_subd(ld, name, NULL, NULL, NULL, false, msgname, msgcb, NULL, NULL, &ap);
 	va_end(ap);
 
 	sd->must_not_exit = true;
@@ -694,6 +713,7 @@ struct subd *new_global_subd(struct lightningd *ld,
 struct subd *new_channel_subd_(struct lightningd *ld,
 			       const char *name,
 			       void *channel,
+			       const struct node_id *node_id,
 			       struct log *base_log,
 			       bool talks_to_peer,
 			       const char *(*msgname)(int msgtype),
@@ -713,8 +733,8 @@ struct subd *new_channel_subd_(struct lightningd *ld,
 	struct subd *sd;
 
 	va_start(ap, billboardcb);
-	sd = new_subd(ld, name, channel, base_log, talks_to_peer, msgname,
-		      msgcb, errcb, billboardcb, &ap);
+	sd = new_subd(ld, name, channel, node_id, base_log, talks_to_peer,
+		      msgname, msgcb, errcb, billboardcb, &ap);
 	va_end(ap);
 	return sd;
 }
@@ -749,8 +769,16 @@ void subd_req_(const tal_t *ctx,
 	add_req(ctx, sd, type, num_fds_in, replycb, replycb_data);
 }
 
+/* SIGALRM terminates by default: we just want it to interrupt waitpid(),
+ * which is implied by "handling" it. */
+static void discard_alarm(int sig UNNEEDED)
+{
+}
+
 struct subd *subd_shutdown(struct subd *sd, unsigned int seconds)
 {
+	struct sigaction sa, old;
+
 	log_debug(sd->log, "Shutting down");
 
 	tal_del_destructor(sd, destroy_subd);
@@ -759,19 +787,24 @@ struct subd *subd_shutdown(struct subd *sd, unsigned int seconds)
 	tal_steal(sd->ld, sd);
 	sd->conn = tal_free(sd->conn);
 
-	/* Wait for a while. */
-	while (seconds) {
-		if (waitpid(sd->pid, NULL, WNOHANG) > 0) {
-			return (struct subd*) tal_free(sd);
-		}
-		sleep(1);
-		seconds--;
+	/* Set up alarm to wake us up if child doesn't exit. */
+	sa.sa_handler = discard_alarm;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGALRM, &sa, &old);
+	alarm(seconds);
+
+	if (waitpid(sd->pid, NULL, 0) > 0) {
+		alarm(0);
+		sigaction(SIGALRM, &old, NULL);
+		return tal_free(sd);
 	}
 
+	sigaction(SIGALRM, &old, NULL);
 	/* Didn't die?  This will kill it harder */
 	sd->must_not_exit = false;
 	destroy_subd(sd);
-	return (struct subd*) tal_free(sd);
+	return tal_free(sd);
 }
 
 void subd_release_channel(struct subd *owner, void *channel)

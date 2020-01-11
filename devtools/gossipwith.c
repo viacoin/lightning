@@ -1,4 +1,6 @@
 /* Simple tool to route gossip from a peer. */
+#include <bitcoin/block.h>
+#include <bitcoin/chainparams.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
 #include <ccan/io/io.h>
@@ -7,6 +9,7 @@
 #include <ccan/str/hex/hex.h>
 #include <common/crypto_sync.h>
 #include <common/dev_disconnect.h>
+#include <common/features.h>
 #include <common/peer_failed.h>
 #include <common/per_peer_state.h>
 #include <common/status.h>
@@ -20,6 +23,9 @@
 #define io_close simple_close
 static bool stream_stdin = false;
 static bool no_init = false;
+static bool hex = false;
+static int timeout_after = -1;
+static u8 *features;
 
 static struct io_plan *simple_write(struct io_conn *conn,
 				    const void *data, size_t len,
@@ -48,11 +54,15 @@ static bool initial_sync = false;
 static unsigned long max_messages = -1UL;
 
 /* Empty stubs to make us compile */
-void status_peer_io(enum log_level iodir, const u8 *p)
+void status_peer_io(enum log_level iodir,
+		    const struct node_id *node_id,
+		    const u8 *p)
 {
 }
 
-void status_fmt(enum log_level level, const char *fmt, ...)
+void status_fmt(enum log_level level,
+		const struct node_id *node_id,
+		const char *fmt, ...)
 {
 }
 
@@ -72,6 +82,22 @@ enum dev_disconnect dev_disconnect(int pkt_type)
 	return DEV_DISCONNECT_NORMAL;
 }
 #endif
+
+static char *opt_set_network(const char *arg, void *unused)
+{
+	assert(arg != NULL);
+
+	/* Set the global chainparams instance */
+	chainparams = chainparams_for_network(arg);
+	if (!chainparams)
+		return tal_fmt(NULL, "Unknown network name '%s'", arg);
+	return NULL;
+}
+
+static void opt_show_network(char buf[OPT_SHOW_LEN], const void *unused)
+{
+	snprintf(buf, OPT_SHOW_LEN, "%s", chainparams->network_name);
+}
 
 void peer_failed_connection_lost(void)
 {
@@ -121,22 +147,27 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 {
 	u8 *msg;
 	struct per_peer_state *pps = new_per_peer_state(conn, orig_cs);
-	u8 *localfeatures;
 	struct pollfd pollfd[2];
 
 	pps->peer_fd = io_conn_fd(conn);
-	if (initial_sync) {
-		localfeatures = tal(conn, u8);
-		localfeatures[0] = (1 << 3);
-	} else
-		localfeatures = NULL;
+	if (initial_sync)
+		set_feature_bit(&features,
+				OPTIONAL_FEATURE(OPT_INITIAL_ROUTING_SYNC));
 
 	if (!no_init) {
-		msg = towire_init(NULL, NULL, localfeatures);
+		struct tlv_init_tlvs *tlvs = NULL;
+		if (chainparams) {
+			tlvs = tlv_init_tlvs_new(NULL);
+			tlvs->networks = tal(tlvs, struct tlv_init_tlvs_networks);
+			tlvs->networks->chains = tal_arr(tlvs->networks, struct bitcoin_blkid, 1);
+			tlvs->networks->chains[0] = chainparams->genesis_blockhash;
+		}
+			msg = towire_init(NULL, NULL, features, tlvs);
 
 		sync_crypto_write(pps, take(msg));
 		/* Ignore their init message. */
 		tal_free(sync_crypto_read(NULL, pps));
+		tal_free(tlvs);
 	}
 
 	if (stream_stdin)
@@ -155,11 +186,13 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 		args++;
 	}
 
-	for (;;) {
+	while (max_messages != 0 || pollfd[0].fd != -1) {
 		beint16_t belen;
 		u8 *msg;
 
-		poll(pollfd, ARRAY_SIZE(pollfd), -1);
+		if (poll(pollfd, ARRAY_SIZE(pollfd),
+			 timeout_after < 0 ? -1 : timeout_after * 1000) == 0)
+			return 0;
 
 		/* We always to stdin first if we can */
 		if (pollfd[0].revents & POLLIN) {
@@ -175,17 +208,20 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 		} else if (pollfd[1].revents & POLLIN) {
 			msg = sync_crypto_read(NULL, pps);
 			if (!msg)
-				break;
-			belen = cpu_to_be16(tal_bytelen(msg));
-			if (!write_all(STDOUT_FILENO, &belen, sizeof(belen))
-			    || !write_all(STDOUT_FILENO, msg, tal_bytelen(msg)))
-				err(1, "Writing out msg");
+				err(1, "Reading msg");
+			if (hex) {
+				printf("%s\n", tal_hex(msg, msg));
+			} else {
+				belen = cpu_to_be16(tal_bytelen(msg));
+				if (!write_all(STDOUT_FILENO, &belen, sizeof(belen))
+				    || !write_all(STDOUT_FILENO, msg, tal_bytelen(msg)))
+					err(1, "Writing out msg");
+			}
 			tal_free(msg);
-			if (--max_messages == 0)
-				exit(0);
+			--max_messages;
 		}
 	}
-	err(1, "Reading msg");
+	exit(0);
 }
 
 static char *opt_set_secret(const char *arg, struct secret *s)
@@ -198,6 +234,14 @@ static char *opt_set_secret(const char *arg, struct secret *s)
 static void opt_show_secret(char buf[OPT_SHOW_LEN], const struct secret *s)
 {
 	hex_encode(s->data, sizeof(s->data), buf, OPT_SHOW_LEN);
+}
+
+static char *opt_set_features(const char *arg, u8 **features)
+{
+	*features = tal_hexdata(tal_parent(*features), arg, strlen(arg));
+	if (!*features)
+		return "features must be valid hex";
+	return NULL;
 }
 
 int main(int argc, char *argv[])
@@ -215,12 +259,13 @@ int main(int argc, char *argv[])
 						 SECP256K1_CONTEXT_SIGN);
 
 	memset(&notsosecret, 0x42, sizeof(notsosecret));
+	features = tal_arr(conn, u8, 0);
 
 	opt_register_noarg("--initial-sync", opt_set_bool, &initial_sync,
 			   "Stream complete gossip history at start");
 	opt_register_arg("--max-messages", opt_set_ulongval, opt_show_ulongval,
 			 &max_messages,
-			 "Terminate after reading this many messages (> 0)");
+			 "Terminate after reading this many messages");
 	opt_register_noarg("--stdin", opt_set_bool, &stream_stdin,
 			   "Stream gossip messages from stdin.");
 	opt_register_noarg("--no-init", opt_set_bool, &no_init,
@@ -228,6 +273,17 @@ int main(int argc, char *argv[])
 	opt_register_arg("--privkey", opt_set_secret, opt_show_secret,
 			 &notsosecret,
 			 "Secret key to use for our identity");
+	opt_register_arg("--timeout-after", opt_set_intval, opt_show_intval,
+			 &timeout_after,
+			 "Exit (success) this many seconds after no msgs rcvd");
+	opt_register_noarg("--hex", opt_set_bool, &hex,
+			   "Print out messages in hex");
+	opt_register_arg("--features=<hex>", opt_set_features, NULL,
+			 &features, "Send these features in init");
+	opt_register_arg("--network", opt_set_network, opt_show_network,
+	                 NULL,
+	                 "Select the network parameters (bitcoin, testnet, regtest"
+	                 " liquid, liquid-regtest, viacoin or viacoin-testnet)");
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "id@addr[:port] [hex-msg-tosend...]\n"
 			   "Connect to a lightning peer and relay gossip messages from it",
@@ -255,6 +311,7 @@ int main(int argc, char *argv[])
 		break;
 	case ADDR_INTERNAL_ALLPROTO:
 	case ADDR_INTERNAL_AUTOTOR:
+	case ADDR_INTERNAL_STATICTOR:
 	case ADDR_INTERNAL_FORPROXY:
 		opt_usage_exit_fail("Don't support proxy use");
 

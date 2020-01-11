@@ -35,6 +35,7 @@ ALL_GEN_HEADERS += $(LIGHTNINGD_CHANNEL_HEADERS_GEN)
 CHANNELD_COMMON_OBJS :=				\
 	common/amount.o				\
 	common/base32.o				\
+	common/bigsize.o			\
 	common/bip32.o				\
 	common/channel_config.o			\
 	common/crypto_state.o			\
@@ -45,8 +46,10 @@ CHANNELD_COMMON_OBJS :=				\
 	common/derive_basepoints.o		\
 	common/dev_disconnect.o			\
 	common/features.o			\
+	common/fee_states.o			\
 	common/gen_status_wire.o		\
 	common/gen_peer_status_wire.o		\
+	common/gossip_rcvd_filter.o		\
 	common/gossip_store.o			\
 	common/htlc_state.o			\
 	common/htlc_trim.o			\
@@ -59,6 +62,7 @@ CHANNELD_COMMON_OBJS :=				\
 	common/memleak.o			\
 	common/msg_queue.o			\
 	common/node_id.o			\
+	common/onion.o				\
 	common/peer_billboard.o			\
 	common/peer_failed.o			\
 	common/per_peer_state.o			\
